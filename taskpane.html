@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Setty PMS</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0d0f1a;
+      color: #e2e8f0;
+      font-size: 13px;
+      padding: 12px;
+      min-height: 100vh;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 2px solid #C00000;
+    }
+    .header-logo {
+      font-size: 16px;
+      font-weight: 800;
+      color: #C00000;
+      letter-spacing: 1px;
+    }
+    .header-sub {
+      font-size: 11px;
+      color: #64748b;
+    }
+    .email-preview {
+      background: #1e2235;
+      border: 1px solid #2d3452;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+    }
+    .email-subject {
+      font-weight: 700;
+      font-size: 13px;
+      color: #e2e8f0;
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .email-meta {
+      font-size: 11px;
+      color: #64748b;
+    }
+    label {
+      display: block;
+      font-size: 11px;
+      color: #94a3b8;
+      margin-bottom: 4px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    select, input[type="text"], textarea {
+      width: 100%;
+      background: #1e2235;
+      border: 1px solid #2d3452;
+      border-radius: 6px;
+      color: #e2e8f0;
+      padding: 7px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      margin-bottom: 10px;
+      outline: none;
+    }
+    select:focus, input:focus, textarea:focus {
+      border-color: #3b5998;
+    }
+    textarea { resize: vertical; min-height: 60px; }
+    .btn {
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 7px;
+      border: none;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 8px;
+      transition: opacity 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: #1F3864; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #2F5496; }
+    .btn-green { background: #14532d; color: #4ade80; border: 1px solid #166534; }
+    .btn-green:hover:not(:disabled) { background: #166534; }
+    .btn-blue { background: #1e3a5f; color: #60b4ff; border: 1px solid #1d4ed8; }
+    .btn-blue:hover:not(:disabled) { background: #1d4ed8; color: #fff; }
+    .btn-purple { background: #2d1b69; color: #a78bfa; border: 1px solid #4c1d95; }
+    .btn-purple:hover:not(:disabled) { background: #4c1d95; color: #fff; }
+    .btn-teal { background: #134e4a; color: #34d399; border: 1px solid #0f766e; }
+    .btn-teal:hover:not(:disabled) { background: #0f766e; }
+    .btn-orange { background: #431407; color: #fb923c; border: 1px solid #7c2d12; }
+    .btn-orange:hover:not(:disabled) { background: #7c2d12; }
+    .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #2d3452; }
+    .btn-ghost:hover:not(:disabled) { background: #1e2235; }
+    .divider {
+      border: none;
+      border-top: 1px solid #2d3452;
+      margin: 12px 0;
+    }
+    .status-msg {
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-bottom: 10px;
+      display: none;
+    }
+    .status-msg.show { display: block; }
+    .status-msg.success { background: #14532d; color: #4ade80; border: 1px solid #166534; }
+    .status-msg.error { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; }
+    .status-msg.info { background: #1e3a5f; color: #60b4ff; border: 1px solid #1d4ed8; }
+    .section-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+    }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView { display: none; }
+    #signInView.active, #mainView.active, #rfiView.active,
+    #subView.active, #noteView.active, #contactView.active { display: block; }
+    .back-btn {
+      background: none;
+      border: none;
+      color: #64748b;
+      cursor: pointer;
+      font-size: 12px;
+      margin-bottom: 12px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .back-btn:hover { color: #94a3b8; }
+    .contact-field {
+      background: #1e2235;
+      border: 1px solid #2d3452;
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 12px;
+      color: #e2e8f0;
+      margin-bottom: 6px;
+      word-break: break-word;
+    }
+    .contact-label {
+      font-size: 10px;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 2px;
+    }
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .project-search-wrapper { position: relative; margin-bottom: 10px; }
+    .project-search-wrapper input { margin-bottom: 0; }
+    #projectDropdown {
+      position: absolute;
+      top: 100%;
+      left: 0; right: 0;
+      background: #1e2235;
+      border: 1px solid #3b5998;
+      border-radius: 0 0 6px 6px;
+      max-height: 180px;
+      overflow-y: auto;
+      z-index: 100;
+      display: none;
+    }
+    .proj-option {
+      padding: 8px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid #2d3452;
+    }
+    .proj-option:last-child { border-bottom: none; }
+    .proj-option:hover { background: #2d3452; }
+    .proj-option .proj-num { font-size: 10px; color: #64748b; font-family: monospace; }
+    .proj-option .proj-name { font-size: 12px; color: #e2e8f0; font-weight: 500; }
+    .pill {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      margin-right: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Sign In View -->
+<div id="signInView">
+  <div class="header">
+    <div>
+      <div class="header-logo">SETTY PMS</div>
+      <div class="header-sub">Project Management System</div>
+    </div>
+  </div>
+  <p style="color:#94a3b8;font-size:12px;margin-bottom:16px;line-height:1.6;">
+    Sign in with your Setty Microsoft 365 account to file emails, log notes, RFIs, and submittals.
+  </p>
+  <button class="btn btn-primary" id="signInBtn">🔐 Sign in with Microsoft</button>
+  <div id="signInStatus" class="status-msg"></div>
+</div>
+
+<!-- Main View -->
+<div id="mainView">
+  <div class="header">
+    <div style="flex:1">
+      <div class="header-logo">SETTY PMS</div>
+    </div>
+    <button class="btn-ghost btn" style="width:auto;padding:4px 10px;font-size:11px;" id="signOutBtn">Sign out</button>
+  </div>
+
+  <div class="email-preview">
+    <div class="email-subject" id="emailSubject">Loading…</div>
+    <div class="email-meta" id="emailMeta"></div>
+  </div>
+
+  <div class="project-search-wrapper">
+    <label>Project</label>
+    <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
+    <div id="projectDropdown"></div>
+  </div>
+  <div id="selectedProjectBadge" style="display:none;margin-bottom:10px;font-size:12px;color:#60b4ff;font-weight:600;"></div>
+
+  <div id="actionStatus" class="status-msg"></div>
+
+  <div class="section-title">Actions</div>
+
+  <button class="btn btn-green" id="saveSpBtn">📁 Save to SharePoint + Project Record</button>
+  <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note (Meeting / Site Visit)</button>
+  <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
+  <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
+  <hr class="divider"/>
+  <button class="btn btn-teal" id="extractContactBtn">👤 Extract Contact from Signature</button>
+</div>
+
+<!-- Note View -->
+<div id="noteView">
+  <button class="back-btn" id="noteBack">← Back</button>
+  <div class="section-title">Log as Note</div>
+  <label>Category</label>
+  <select id="noteCategory">
+    <option value="Meeting">Meeting</option>
+    <option value="Site Visit">Site Visit</option>
+    <option value="Client Communication">Client Communication</option>
+    <option value="Decision">Decision</option>
+    <option value="General">General</option>
+  </select>
+  <label>Note Body</label>
+  <textarea id="noteBody" rows="4" placeholder="Summary, decisions, action items…"></textarea>
+  <div id="noteStatus" class="status-msg"></div>
+  <button class="btn btn-blue" id="saveNoteBtn">💾 Save Note</button>
+</div>
+
+<!-- RFI View -->
+<div id="rfiView">
+  <button class="back-btn" id="rfiBack">← Back</button>
+  <div class="section-title">Log as RFI</div>
+  <label>Title</label>
+  <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
+  <label>Discipline</label>
+  <select id="rfiDiscipline">
+    <option value="">— Select —</option>
+    <option>Mechanical</option>
+    <option>Electrical</option>
+    <option>Plumbing</option>
+    <option>Fire Protection</option>
+    <option>General</option>
+    <option>Architectural</option>
+    <option>Structural</option>
+  </select>
+  <label>From (GC / Prime)</label>
+  <input type="text" id="rfiFrom" placeholder="Contractor name"/>
+  <label>Notes / Question</label>
+  <textarea id="rfiNotes" rows="3" placeholder="RFI question or description…"></textarea>
+  <div id="rfiStatus" class="status-msg"></div>
+  <button class="btn btn-blue" id="saveRfiBtn">💾 Log RFI</button>
+</div>
+
+<!-- Submittal View -->
+<div id="subView">
+  <button class="back-btn" id="subBack">← Back</button>
+  <div class="section-title">Log as Submittal</div>
+  <label>Spec Section</label>
+  <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
+  <label>Description</label>
+  <input type="text" id="subDesc" placeholder="Submittal description"/>
+  <label>Discipline</label>
+  <select id="subDiscipline">
+    <option value="">— Select —</option>
+    <option>Mechanical</option>
+    <option>Electrical</option>
+    <option>Plumbing</option>
+    <option>Fire Protection</option>
+    <option>General</option>
+  </select>
+  <label>From (GC / Prime)</label>
+  <input type="text" id="subFrom" placeholder="Contractor name"/>
+  <label>Notes</label>
+  <textarea id="subNotes" rows="2" placeholder="Notes…"></textarea>
+  <div id="subStatus" class="status-msg"></div>
+  <button class="btn btn-purple" id="saveSubBtn">💾 Log Submittal</button>
+</div>
+
+<!-- Contact View -->
+<div id="contactView">
+  <button class="back-btn" id="contactBack">← Back</button>
+  <div class="section-title">Extracted Contact</div>
+  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
+    Parsed from email signature. Review and edit before saving.
+  </p>
+  <label>Name</label>
+  <input type="text" id="contactName"/>
+  <label>Title</label>
+  <input type="text" id="contactTitle"/>
+  <label>Company</label>
+  <input type="text" id="contactCompany"/>
+  <label>Email</label>
+  <input type="text" id="contactEmail"/>
+  <label>Phone</label>
+  <input type="text" id="contactPhone"/>
+  <label>Type</label>
+  <select id="contactType">
+    <option value="Client">Client</option>
+    <option value="Prime">Prime / GC</option>
+    <option value="Sub">Subconsultant</option>
+    <option value="Other">Other</option>
+  </select>
+  <label>Save to</label>
+  <select id="contactSaveTo">
+    <option value="client">Client / Company Directory</option>
+    <option value="poc">Project POC (selected project)</option>
+  </select>
+  <div id="contactStatus" class="status-msg"></div>
+  <button class="btn btn-teal" id="saveContactBtn">💾 Save Contact</button>
+</div>
+
+<script src="taskpane.js"></script>
+</body>
+</html>
