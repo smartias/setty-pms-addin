@@ -29,23 +29,41 @@ let emailFrom = "";
 let emailFromAddress = "";
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-Office.onReady(async (info) => {
-  if (info.host !== Office.HostType.Outlook) return;
-  msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
-  await msalApp.initialize();
+let _officeReady = false;
 
-  // Try silent sign-in first
-  const accounts = msalApp.getAllAccounts();
-  if (accounts.length > 0) {
-    msalAccount = accounts[0];
-    await onSignedIn();
-  } else {
+async function initApp(isOutlook) {
+  try {
+    msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
+    await msalApp.initialize();
+    const accounts = msalApp.getAllAccounts();
+    if (accounts.length > 0) {
+      msalAccount = accounts[0];
+      await onSignedIn();
+    } else {
+      showView("signInView");
+    }
+    setupEventListeners();
+    if (isOutlook) loadEmailContext();
+  } catch(e) {
     showView("signInView");
+    setupEventListeners();
+    document.getElementById("signInStatus").className = "status-msg show error";
+    document.getElementById("signInStatus").textContent = "Init error: " + e.message;
   }
+}
 
-  setupEventListeners();
-  loadEmailContext();
+Office.onReady(async (info) => {
+  _officeReady = true;
+  const isOutlook = info.host === Office.HostType.Outlook;
+  await initApp(isOutlook);
 });
+
+// Fallback: if Office.js doesn't fire within 3s (plain browser), init anyway
+setTimeout(async () => {
+  if (!_officeReady) {
+    await initApp(false);
+  }
+}, 3000);
 
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
