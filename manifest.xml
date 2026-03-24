@@ -8,17 +8,16 @@
 
   <Id>a1b2c3d4-e5f6-7890-abcd-ef1234567890</Id>
   <Version>1.0.0.0</Version>
-  <ProviderName>Setty &amp; Associates International</ProviderName>
+  <ProviderName>Setty and Associates International</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Setty PMS"/>
-  <Description DefaultValue="File emails, log notes, RFIs, and submittals directly to the Setty Project Management System."/>
+  <Description DefaultValue="File emails, log notes, RFIs, and submittals to the Setty Project Management System."/>
   <IconUrl DefaultValue="https://smartias.github.io/setty-pms-addin/assets/icon-64.png"/>
   <HighResolutionIconUrl DefaultValue="https://smartias.github.io/setty-pms-addin/assets/icon-128.png"/>
   <SupportUrl DefaultValue="https://github.com/smartias/setty-pms-addin"/>
   <AppDomains>
     <AppDomain>https://smartias.github.io</AppDomain>
     <AppDomain>https://login.microsoftonline.com</AppDomain>
-    <AppDomain>https://khxmgjilwhdguuepbhne.supabase.co</AppDomain>
   </AppDomains>
 
   <Hosts>
