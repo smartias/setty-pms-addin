@@ -35,6 +35,17 @@ async function initApp(isOutlook) {
   try {
     msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
     await msalApp.initialize();
+  } catch(e) {
+    // MSAL failed to initialize
+    showView("signInView");
+    setupEventListeners();
+    const el = document.getElementById("signInStatus");
+    el.className = "status-msg show error";
+    el.textContent = "MSAL init error: " + e.message;
+    return;
+  }
+
+  try {
     const accounts = msalApp.getAllAccounts();
     if (accounts.length > 0) {
       msalAccount = accounts[0];
@@ -42,14 +53,12 @@ async function initApp(isOutlook) {
     } else {
       showView("signInView");
     }
-    setupEventListeners();
-    if (isOutlook) loadEmailContext();
   } catch(e) {
     showView("signInView");
-    setupEventListeners();
-    document.getElementById("signInStatus").className = "status-msg show error";
-    document.getElementById("signInStatus").textContent = "Init error: " + e.message;
   }
+
+  setupEventListeners();
+  if (isOutlook) loadEmailContext();
 }
 
 Office.onReady(async (info) => {
@@ -58,12 +67,21 @@ Office.onReady(async (info) => {
   await initApp(isOutlook);
 });
 
-// Fallback: if Office.js doesn't fire within 3s (plain browser), init anyway
+// Fallback: if Office.js doesn't fire within 4s (plain browser), init anyway
 setTimeout(async () => {
   if (!_officeReady) {
+    if (typeof msal === "undefined") {
+      // MSAL still not loaded - show error
+      document.querySelectorAll("#signInView,#mainView,#noteView,#rfiView,#subView,#contactView").forEach(el => el.style.display = "none");
+      document.getElementById("signInView").style.display = "block";
+      const status = document.getElementById("signInStatus");
+      status.className = "status-msg show error";
+      status.textContent = "Could not load Microsoft authentication library. Check your internet connection and refresh.";
+      return;
+    }
     await initApp(false);
   }
-}, 3000);
+}, 4000);
 
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
@@ -145,6 +163,11 @@ function loadEmailContext() {
 async function doSignIn() {
   setStatus("signInStatus", "info", "⏳ Signing in…");
   try {
+    // Ensure MSAL is initialized
+    if (!msalApp) {
+      msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
+      await msalApp.initialize();
+    }
     const result = await msalApp.loginPopup({ scopes: GRAPH_SCOPES });
     msalAccount = result.account;
     await onSignedIn();
