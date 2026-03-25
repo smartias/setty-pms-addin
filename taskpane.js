@@ -8,10 +8,9 @@ const MSAL_CONFIG = {
   cache: { cacheLocation: "sessionStorage" }
 };
 const GRAPH_SCOPES = [
-  "User.Read",
-  "Mail.Read",
-  "Files.ReadWrite",
-  "Sites.ReadWrite.All",
+  "User.Read",       // sign-in only
+  "Mail.Read",       // read the email being filed
+  "Files.ReadWrite", // write files to SharePoint (scoped to user's delegated access)
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
