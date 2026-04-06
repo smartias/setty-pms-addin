@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Setty PMS</title>
-  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" type="text/javascript"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.23.0/lib/msal-browser.min.js"></script>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -175,6 +175,7 @@
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .mode-tab { flex: 1; font-size: 11px; padding: 6px 8px; }
     .project-search-wrapper { position: relative; margin-bottom: 10px; }
     .project-search-wrapper input { margin-bottom: 0; }
     #projectDropdown {
@@ -279,51 +280,87 @@
 <!-- RFI View -->
 <div id="rfiView">
   <button class="back-btn" id="rfiBack">← Back</button>
-  <div class="section-title">Log as RFI</div>
-  <label>Title</label>
-  <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
-  <label>Discipline</label>
-  <select id="rfiDiscipline">
-    <option value="">— Select —</option>
-    <option>Mechanical</option>
-    <option>Electrical</option>
-    <option>Plumbing</option>
-    <option>Fire Protection</option>
-    <option>General</option>
-    <option>Architectural</option>
-    <option>Structural</option>
-  </select>
-  <label>From (GC / Prime)</label>
-  <input type="text" id="rfiFrom" placeholder="Contractor name"/>
-  <label>Notes / Question</label>
-  <textarea id="rfiNotes" rows="3" placeholder="RFI question or description…"></textarea>
-  <div id="rfiStatus" class="status-msg"></div>
-  <button class="btn btn-blue" id="saveRfiBtn">💾 Log RFI</button>
+  <div style="display:flex;gap:6px;margin-bottom:12px;">
+    <button class="btn btn-blue mode-tab" id="rfiModeNew">➕ New RFI</button>
+    <button class="btn btn-ghost mode-tab" id="rfiModeExisting">📂 File to Existing</button>
+  </div>
+
+  <div id="rfiNewForm">
+    <div class="section-title">New RFI</div>
+    <label>Title</label>
+    <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
+    <label>Discipline</label>
+    <select id="rfiDiscipline">
+      <option value="">— Select —</option>
+      <option>Mechanical</option>
+      <option>Electrical</option>
+      <option>Plumbing</option>
+      <option>Fire Protection</option>
+      <option>General</option>
+      <option>Architectural</option>
+      <option>Structural</option>
+    </select>
+    <label>From (GC / Prime)</label>
+    <input type="text" id="rfiFrom" placeholder="Contractor name"/>
+    <label>Notes / Question</label>
+    <textarea id="rfiNotes" rows="3" placeholder="RFI question or description…"></textarea>
+    <div id="rfiStatus" class="status-msg"></div>
+    <button class="btn btn-blue" id="saveRfiBtn">💾 Log New RFI</button>
+  </div>
+
+  <div id="rfiExistingForm" style="display:none;">
+    <div class="section-title">File Email to Existing RFI</div>
+    <p style="font-size:11px;color:#64748b;margin-bottom:10px;line-height:1.5;">
+      Select an RFI to file this email and any attachments into its SharePoint folder.
+    </p>
+    <label>RFI</label>
+    <select id="rfiExistingSelect" style="margin-bottom:10px;"></select>
+    <div id="rfiExistingStatus" class="status-msg"></div>
+    <button class="btn btn-blue" id="fileRfiBtn">📁 File Email to RFI</button>
+  </div>
 </div>
 
 <!-- Submittal View -->
 <div id="subView">
   <button class="back-btn" id="subBack">← Back</button>
-  <div class="section-title">Log as Submittal</div>
-  <label>Spec Section</label>
-  <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
-  <label>Description</label>
-  <input type="text" id="subDesc" placeholder="Submittal description"/>
-  <label>Discipline</label>
-  <select id="subDiscipline">
-    <option value="">— Select —</option>
-    <option>Mechanical</option>
-    <option>Electrical</option>
-    <option>Plumbing</option>
-    <option>Fire Protection</option>
-    <option>General</option>
-  </select>
-  <label>From (GC / Prime)</label>
-  <input type="text" id="subFrom" placeholder="Contractor name"/>
-  <label>Notes</label>
-  <textarea id="subNotes" rows="2" placeholder="Notes…"></textarea>
-  <div id="subStatus" class="status-msg"></div>
-  <button class="btn btn-purple" id="saveSubBtn">💾 Log Submittal</button>
+  <div style="display:flex;gap:6px;margin-bottom:12px;">
+    <button class="btn btn-purple mode-tab" id="subModeNew">➕ New Submittal</button>
+    <button class="btn btn-ghost mode-tab" id="subModeExisting">📂 File to Existing</button>
+  </div>
+
+  <div id="subNewForm">
+    <div class="section-title">New Submittal</div>
+    <label>Spec Section</label>
+    <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
+    <label>Description</label>
+    <input type="text" id="subDesc" placeholder="Submittal description"/>
+    <label>Discipline</label>
+    <select id="subDiscipline">
+      <option value="">— Select —</option>
+      <option>Mechanical</option>
+      <option>Electrical</option>
+      <option>Plumbing</option>
+      <option>Fire Protection</option>
+      <option>General</option>
+    </select>
+    <label>From (GC / Prime)</label>
+    <input type="text" id="subFrom" placeholder="Contractor name"/>
+    <label>Notes</label>
+    <textarea id="subNotes" rows="2" placeholder="Notes…"></textarea>
+    <div id="subStatus" class="status-msg"></div>
+    <button class="btn btn-purple" id="saveSubBtn">💾 Log New Submittal</button>
+  </div>
+
+  <div id="subExistingForm" style="display:none;">
+    <div class="section-title">File Email to Existing Submittal</div>
+    <p style="font-size:11px;color:#64748b;margin-bottom:10px;line-height:1.5;">
+      Select a submittal to file this email and any attachments into its SharePoint folder.
+    </p>
+    <label>Submittal</label>
+    <select id="subExistingSelect" style="margin-bottom:10px;"></select>
+    <div id="subExistingStatus" class="status-msg"></div>
+    <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
+  </div>
 </div>
 
 <!-- Contact View -->
