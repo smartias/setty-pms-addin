@@ -32,21 +32,29 @@ let _spIds = null; // cached per session — avoids repeated site/drive lookups
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
-  if (info.host !== Office.HostType.Outlook) return;
-  msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
-  await msalApp.initialize();
-
-  // Try silent sign-in first
-  const accounts = msalApp.getAllAccounts();
-  if (accounts.length > 0) {
-    msalAccount = accounts[0];
-    await onSignedIn();
-  } else {
-    showView("signInView");
+  if (info.host !== Office.HostType.Outlook) {
+    document.body.innerHTML = '<p style="color:#f87171;padding:16px;font-family:sans-serif;">This add-in only runs in Outlook.</p>';
+    return;
   }
+  try {
+    msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
+    await msalApp.initialize();
 
-  setupEventListeners();
-  loadEmailContext();
+    const accounts = msalApp.getAllAccounts();
+    if (accounts.length > 0) {
+      msalAccount = accounts[0];
+      await onSignedIn();
+    } else {
+      showView("signInView");
+    }
+
+    setupEventListeners();
+    loadEmailContext();
+  } catch (e) {
+    // Show something rather than a black screen if init fails
+    showView("signInView");
+    setStatus("signInStatus", "error", "Startup error: " + e.message);
+  }
 });
 
 function setupEventListeners() {
