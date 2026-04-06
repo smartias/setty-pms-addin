@@ -797,11 +797,23 @@ function addBizDays(date, days) {
 }
 
 function showView(id) {
+  // Hide loading spinner on first real view
+  const loading = document.getElementById("loadingView");
+  if (loading) loading.style.display = "none";
   ["signInView","mainView","noteView","rfiView","subView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
 }
+
+// Fallback: if Office.onReady never fires (browser preview / load failure),
+// replace spinner with a plain message after 5 seconds
+setTimeout(() => {
+  const loading = document.getElementById("loadingView");
+  if (loading && loading.style.display !== "none") {
+    loading.innerHTML = '<p style="color:#94a3b8;font-size:12px;text-align:center;padding:0 16px;">Open this add-in from Outlook.<br/>To sideload, use the manifest.xml file.</p>';
+  }
+}, 5000);
 
 function setStatus(elId, type, msg) {
   const el = document.getElementById(elId);
