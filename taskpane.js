@@ -8,9 +8,10 @@ const MSAL_CONFIG = {
   cache: { cacheLocation: "sessionStorage" }
 };
 const GRAPH_SCOPES = [
-  "User.Read",       // sign-in only
-  "Mail.Read",       // read the email being filed
-  "Files.ReadWrite", // write files to SharePoint (scoped to user's delegated access)
+  "User.Read",
+  "Mail.Read",
+  "Files.ReadWrite",
+  "Sites.ReadWrite.All",
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
@@ -28,59 +29,23 @@ let emailFrom = "";
 let emailFromAddress = "";
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-let _officeReady = false;
+Office.onReady(async (info) => {
+  if (info.host !== Office.HostType.Outlook) return;
+  msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
+  await msalApp.initialize();
 
-async function initApp(isOutlook) {
-  try {
-    msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
-    await msalApp.initialize();
-  } catch(e) {
-    // MSAL failed to initialize
-    showView("signInView");
-    setupEventListeners();
-    const el = document.getElementById("signInStatus");
-    el.className = "status-msg show error";
-    el.textContent = "MSAL init error: " + e.message;
-    return;
-  }
-
-  try {
-    const accounts = msalApp.getAllAccounts();
-    if (accounts.length > 0) {
-      msalAccount = accounts[0];
-      await onSignedIn();
-    } else {
-      showView("signInView");
-    }
-  } catch(e) {
+  // Try silent sign-in first
+  const accounts = msalApp.getAllAccounts();
+  if (accounts.length > 0) {
+    msalAccount = accounts[0];
+    await onSignedIn();
+  } else {
     showView("signInView");
   }
 
   setupEventListeners();
-  if (isOutlook) loadEmailContext();
-}
-
-Office.onReady(async (info) => {
-  _officeReady = true;
-  const isOutlook = info.host === Office.HostType.Outlook;
-  await initApp(isOutlook);
+  loadEmailContext();
 });
-
-// Fallback: if Office.js doesn't fire within 4s (plain browser), init anyway
-setTimeout(async () => {
-  if (!_officeReady) {
-    if (typeof msal === "undefined") {
-      // MSAL still not loaded - show error
-      document.querySelectorAll("#signInView,#mainView,#noteView,#rfiView,#subView,#contactView").forEach(el => el.style.display = "none");
-      document.getElementById("signInView").style.display = "block";
-      const status = document.getElementById("signInStatus");
-      status.className = "status-msg show error";
-      status.textContent = "Could not load Microsoft authentication library. Check your internet connection and refresh.";
-      return;
-    }
-    await initApp(false);
-  }
-}, 4000);
 
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
@@ -162,11 +127,6 @@ function loadEmailContext() {
 async function doSignIn() {
   setStatus("signInStatus", "info", "⏳ Signing in…");
   try {
-    // Ensure MSAL is initialized
-    if (!msalApp) {
-      msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
-      await msalApp.initialize();
-    }
     const result = await msalApp.loginPopup({ scopes: GRAPH_SCOPES });
     msalAccount = result.account;
     await onSignedIn();
@@ -199,40 +159,31 @@ async function getToken() {
 }
 
 // ─── SUPABASE ─────────────────────────────────────────────────────────────────
+const SB_HEADERS = {
+  "apikey": SUPABASE_ANON,
+  "Authorization": "Bearer " + SUPABASE_ANON,
+  "Content-Type": "application/json",
+  "Prefer": "return=minimal",
+};
+
 async function loadProjects() {
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?select=data&limit=1", {
-      headers: {
-        "apikey": SUPABASE_ANON,
-        "Authorization": "Bearer " + SUPABASE_ANON,
-      }
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", {
+      headers: SB_HEADERS,
     });
     const rows = await res.json();
     if (!rows || !rows[0]) return;
-    const data = typeof rows[0].data === "string" ? JSON.parse(rows[0].data) : rows[0].data;
-    allProjects = (data.projects || []).filter(p => !p.archived);
+    allProjects = (rows[0].projects || []).filter(p => !p.archived);
   } catch (e) {
     console.error("Failed to load projects:", e);
   }
 }
 
 async function saveToSupabase(updatedProjects) {
-  // Read full data, merge updated projects, write back
-  const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?select=data&limit=1", {
-    headers: { "apikey": SUPABASE_ANON, "Authorization": "Bearer " + SUPABASE_ANON }
-  });
-  const rows = await res.json();
-  const data = typeof rows[0].data === "string" ? JSON.parse(rows[0].data) : rows[0].data;
-  data.projects = updatedProjects;
-  await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.1", {
+  await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
     method: "PATCH",
-    headers: {
-      "apikey": SUPABASE_ANON,
-      "Authorization": "Bearer " + SUPABASE_ANON,
-      "Content-Type": "application/json",
-      "Prefer": "return=minimal",
-    },
-    body: JSON.stringify({ data })
+    headers: SB_HEADERS,
+    body: JSON.stringify({ projects: updatedProjects, updated_at: new Date().toISOString() }),
   });
 }
 
@@ -295,13 +246,13 @@ async function doSaveToSharePoint() {
     const safeSubject = (emailItem.subject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
     const emailFolderName = yyyy + "_" + mm + "_" + dd + " " + safeSubject;
 
-    // Ensure Emails subfolder
+    // Ensure subfolder exists (idempotent — conflictBehavior:replace is a no-op on existing folders)
     async function ensureFolder(parentPath, name) {
       try {
         await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(parentPath) + ":/children", {
           method: "POST",
           headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
-          body: JSON.stringify({ name, folder: {} }),
+          body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
         });
       } catch {}
       return parentPath + "/" + name;
@@ -391,6 +342,41 @@ async function doSaveNote() {
   }
 }
 
+// ─── SHARED: save source email under a record subfolder ───────────────────────
+async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName) {
+  async function ensureF(parentPath, name) {
+    try {
+      await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(parentPath) + ":/children", {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+        body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
+      });
+    } catch {}
+    return parentPath + "/" + name;
+  }
+  const subPath    = await ensureF(projFolderName, subfolder);
+  const recordPath = await ensureF(subPath, recordFolderName);
+
+  const bodyHtml = await getEmailBodyHtml(token);
+  const from = emailItem.from;
+  const header = `<div style="font-family:sans-serif;font-size:12px;padding:12px 16px;border-bottom:1px solid #ddd;margin-bottom:16px">
+    <strong>Subject:</strong> ${emailItem.subject || ""}<br>
+    <strong>From:</strong> ${from?.displayName || ""} &lt;${from?.emailAddress || ""}&gt;<br>
+    <strong>Date:</strong> ${new Date(emailItem.dateTimeCreated).toLocaleString()}
+  </div>`;
+  const fullHtml = "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + header + (bodyHtml || "(No body)") + "</body></html>";
+
+  const safePath = "/drives/" + driveId + "/root:/" + encodeURIComponent(recordPath) + "/email.html:/content";
+  await fetch("https://graph.microsoft.com/v1.0" + safePath, {
+    method: "PUT",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+    body: fullHtml,
+  });
+
+  const baseSpUrl = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Document%20Library";
+  return baseSpUrl + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
+}
+
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
 function prefillRfi() {
   document.getElementById("rfiTitle").value = emailItem?.subject || "";
@@ -408,6 +394,18 @@ async function doSaveRfi() {
     const received = new Date();
     const dueDate = addBizDays(received, 5);
 
+    // Save source email to SharePoint if a project folder exists
+    let spFolderUrl = "";
+    if (selectedProject.projectFolderUrl) {
+      try {
+        const token = await getToken();
+        const { driveId } = await resolveSpIds();
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName);
+      } catch (e) { console.warn("RFI email SP upload failed:", e.message); }
+    }
+
     const rfi = {
       id: uid(),
       number: nextNum,
@@ -419,13 +417,14 @@ async function doSaveRfi() {
       status: "Open",
       notes: document.getElementById("rfiNotes").value.trim(),
       assignedTo: [],
+      spFolderUrl,
       createdAt: new Date().toISOString(),
     };
     const updated = { ...selectedProject, rfis: [...existingRfis, rfi] };
     updateProjectInList(updated);
     selectedProject = updated;
     await saveToSupabase(allProjects);
-    setStatus("rfiStatus", "success", "✓ " + nextNum + " logged on " + selectedProject.name);
+    setStatus("rfiStatus", "success", "✓ " + nextNum + " logged on " + selectedProject.name + (spFolderUrl ? " · email saved to SharePoint" : ""));
     document.getElementById("rfiTitle").value = "";
     document.getElementById("rfiNotes").value = "";
   } catch (e) {
@@ -446,6 +445,18 @@ async function doSaveSub() {
     const received = new Date();
     const dueDate = addBizDays(received, 10);
 
+    // Save source email to SharePoint if a project folder exists
+    let spFolderUrl = "";
+    if (selectedProject.projectFolderUrl) {
+      try {
+        const token = await getToken();
+        const { driveId } = await resolveSpIds();
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName);
+      } catch (e) { console.warn("Submittal email SP upload failed:", e.message); }
+    }
+
     const sub = {
       id: uid(),
       number: nextNum,
@@ -458,13 +469,14 @@ async function doSaveSub() {
       status: "Received",
       notes: document.getElementById("subNotes").value.trim(),
       assignedTo: [],
+      spFolderUrl,
       createdAt: new Date().toISOString(),
     };
     const updated = { ...selectedProject, submittals: [...existing, sub] };
     updateProjectInList(updated);
     selectedProject = updated;
     await saveToSupabase(allProjects);
-    setStatus("subStatus", "success", "✓ " + nextNum + " logged on " + selectedProject.name);
+    setStatus("subStatus", "success", "✓ " + nextNum + " logged on " + selectedProject.name + (spFolderUrl ? " · email saved to SharePoint" : ""));
     document.getElementById("subDesc").value = "";
     document.getElementById("subSpec").value = "";
     document.getElementById("subNotes").value = "";
@@ -545,50 +557,38 @@ async function doSaveContact() {
   setStatus("contactStatus", "info", "⏳ Saving…");
 
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?select=data&limit=1", {
-      headers: { "apikey": SUPABASE_ANON, "Authorization": "Bearer " + SUPABASE_ANON }
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=clients,projects", {
+      headers: SB_HEADERS,
     });
     const rows = await res.json();
-    const data = typeof rows[0].data === "string" ? JSON.parse(rows[0].data) : rows[0].data;
+    const patchBody = {};
 
     if (saveTo === "client") {
-      // Add or update company in clients list
-      const clients = data.clients || [];
+      const clients = rows[0]?.clients || [];
       const existing = clients.find(c => c.name && c.name.trim().toLowerCase() === (company || name).trim().toLowerCase());
       const contact = { id: uid(), name, title, email, phone, role: type };
       if (existing) {
         existing.contacts = [...(existing.contacts || []), contact];
       } else {
-        clients.push({
-          id: uid(),
-          name: company || name,
-          type,
-          contacts: [contact],
-          address: "",
-        });
+        clients.push({ id: uid(), name: company || name, type, contacts: [contact], address: "" });
       }
-      data.clients = clients;
+      patchBody.clients = clients;
     } else {
-      // Add to project POC
       if (!selectedProject) { setStatus("contactStatus", "error", "Select a project first."); return; }
       const poc = { id: uid(), name, title, email, phone, role: type };
-      const proj = allProjects.find(p => p.id === selectedProject.id);
+      const projects = rows[0]?.projects || allProjects;
+      const proj = projects.find(p => p.id === selectedProject.id);
       if (proj) {
         proj.projectContacts = proj.projectContacts || {};
         proj.projectContacts.pm = [...(proj.projectContacts.pm || []), poc];
       }
-      data.projects = allProjects;
+      patchBody.projects = projects;
     }
 
-    await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.1", {
+    await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
       method: "PATCH",
-      headers: {
-        "apikey": SUPABASE_ANON,
-        "Authorization": "Bearer " + SUPABASE_ANON,
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-      },
-      body: JSON.stringify({ data })
+      headers: SB_HEADERS,
+      body: JSON.stringify({ ...patchBody, updated_at: new Date().toISOString() }),
     });
 
     setStatus("contactStatus", "success", "✓ Contact saved.");
