@@ -35,7 +35,7 @@
     <Form xsi:type="ItemRead">
       <DesktopSettings>
         <SourceLocation DefaultValue="https://smartias.github.io/setty-pms-addin/taskpane.html"/>
-        <RequestedHeight>600</RequestedHeight>
+        <RequestedHeight>450</RequestedHeight>
       </DesktopSettings>
     </Form>
   </FormSettings>
