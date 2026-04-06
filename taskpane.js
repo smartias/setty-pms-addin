@@ -11,8 +11,8 @@ const GRAPH_SCOPES = [
   "User.Read",
   "Mail.Read",
   "Files.ReadWrite.All",
-  "Sites.Read.All",
   "Calendars.ReadWrite.Shared",
+  // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
@@ -29,7 +29,11 @@ let emailBody = "";
 let emailFrom = "";
 let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
-let _spIds = null; // cached per session — avoids repeated site/drive lookups
+// Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
+// Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
+const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
+const SP_DRIVE_ID_HARDCODED = "b!ZARYqukTtE6K1Mpv9bngAehneskb-yNKopp1Ol1X1BBnJPKsNGM-TaGmbGiL3ZaU";
+let _spIds = { siteId: SP_SITE_ID_HARDCODED, driveId: SP_DRIVE_ID_HARDCODED };
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
@@ -246,13 +250,7 @@ async function graphFetch(method, path, body, token) {
 }
 
 async function resolveSpIds() {
-  if (_spIds) return _spIds;
-  const site = await graphFetch("GET", "/sites/" + SP_SITE);
-  const siteId = site.id;
-  const drives = await graphFetch("GET", "/sites/" + siteId + "/drives");
-  const drive = (drives.value || []).find(d => d.name === SP_LIBRARY || d.name.toLowerCase() === SP_LIBRARY.toLowerCase());
-  if (!drive) throw new Error("Document library not found: " + SP_LIBRARY);
-  _spIds = { siteId, driveId: drive.id };
+  // IDs are hardcoded — no Graph API call needed, no Sites.Read.All required.
   return _spIds;
 }
 
