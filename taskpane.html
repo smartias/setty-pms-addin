@@ -133,9 +133,9 @@
       letter-spacing: 1px;
       margin-bottom: 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #contactView.active { display: block; }
+    #subView.active, #noteView.active, #contactView.active, #peopleView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -207,6 +207,19 @@
       border-radius: 4px;
       margin-right: 4px;
     }
+    .participant-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #1e2235;
+      border: 1px solid #2d3452;
+      border-radius: 6px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .participant-row:hover { border-color: #3b5998; background: #252d45; }
   </style>
 </head>
 <body>
@@ -256,7 +269,8 @@
   <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
   <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
   <hr class="divider"/>
-  <button class="btn btn-teal" id="extractContactBtn">👤 Extract Contact from Signature</button>
+  <button class="btn btn-teal" id="addParticipantBtn">👥 Add Participant to Contacts</button>
+  <button class="btn btn-ghost" id="extractContactBtn" style="font-size:12px;">👤 Extract from Signature</button>
 </div>
 
 <!-- Note View -->
@@ -361,6 +375,16 @@
     <div id="subExistingStatus" class="status-msg"></div>
     <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
   </div>
+</div>
+
+<!-- People View -->
+<div id="peopleView">
+  <button class="back-btn" id="peopleBack">← Back</button>
+  <div class="section-title">Email Participants</div>
+  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
+    Select a participant to add them to Clients or a Project POC.
+  </p>
+  <div id="participantList"></div>
 </div>
 
 <!-- Contact View -->
