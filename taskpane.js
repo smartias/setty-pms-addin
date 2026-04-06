@@ -12,6 +12,7 @@ const GRAPH_SCOPES = [
   "Mail.Read",
   "Files.ReadWrite.All",
   "Sites.Read.All",
+  "Calendars.ReadWrite.Shared",
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
@@ -71,8 +72,11 @@ function setupEventListeners() {
   document.getElementById("subBack").onclick     = () => showView("mainView");
   document.getElementById("peopleBack").onclick  = () => showView("mainView");
   document.getElementById("contactBack").onclick = () => showView("mainView");
+  document.getElementById("datesBack").onclick   = () => showView("mainView");
 
+  document.getElementById("findDatesBtn").onclick    = showDatesView;
   document.getElementById("addParticipantBtn").onclick = showPeopleView;
+  document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
 
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
@@ -629,6 +633,243 @@ async function doFileToExistingSub() {
   }
 }
 
+// ─── CALENDAR HELPERS ─────────────────────────────────────────────────────────
+
+let _nycCalendarId = null;
+
+async function getNYCCalendarId() {
+  if (_nycCalendarId) return _nycCalendarId;
+  const cached = sessionStorage.getItem("setty_addin_cal_id");
+  if (cached) { _nycCalendarId = cached; return _nycCalendarId; }
+  try {
+    const token = await getToken();
+    const data  = await graphFetch("GET", "/me/calendars?$top=50", null, token);
+    const nyc   = (data?.value || []).find(c =>
+      c.name.toLowerCase().includes("nyc") || c.name.toLowerCase().includes("shared")
+    );
+    if (nyc) {
+      _nycCalendarId = nyc.id;
+      sessionStorage.setItem("setty_addin_cal_id", nyc.id);
+    }
+  } catch {}
+  return _nycCalendarId || null;
+}
+
+async function createMilestoneCalendarEvent(milestone, project) {
+  // All-day events need exclusive end = start + 1 day
+  const endD = new Date(milestone.dueDate + "T12:00:00");
+  endD.setDate(endD.getDate() + 1);
+  const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
+
+  const prefix  = project.projectNumber ? "[" + project.projectNumber + "] " : "";
+  const subject = prefix + project.name + " — " + milestone.name;
+
+  const event = {
+    subject,
+    isAllDay: true,
+    start: { dateTime: milestone.dueDate + "T00:00:00", timeZone: "Eastern Standard Time" },
+    end:   { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" },
+  };
+
+  try {
+    const token = await getToken();
+    const calId = await getNYCCalendarId();
+    const path  = calId ? "/me/calendars/" + calId + "/events" : "/me/events";
+    const res   = await graphFetch("POST", path, event, token);
+    return { success: true, eventId: res?.id, onShared: !!calId };
+  } catch(e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ─── DUE DATE EXTRACTOR ───────────────────────────────────────────────────────
+
+function extractDueDates(text, emailReceivedDate) {
+  const results = [];
+  const seen    = new Set();
+  const refDate = emailReceivedDate ? new Date(emailReceivedDate) : new Date();
+
+  const MONTHS_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+  const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const DAYS         = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+  function toISO(year, month1, day) {
+    const y = year < 100 ? 2000 + year : year;
+    return y + "-" + String(month1).padStart(2,"0") + "-" + String(day).padStart(2,"0");
+  }
+
+  function addResult(iso, display, idx) {
+    if (seen.has(iso)) return;
+    const d   = new Date(iso + "T12:00:00");
+    const now = new Date(); now.setDate(now.getDate() - 30);
+    const cap = new Date(); cap.setFullYear(cap.getFullYear() + 3);
+    if (d < now || d > cap) return;
+
+    const ctxStart = Math.max(0, idx - 120);
+    const ctxEnd   = Math.min(text.length, idx + display.length + 80);
+    let ctx = text.slice(ctxStart, ctxEnd).replace(/\s+/g, " ").trim();
+    if (ctxStart > 0) ctx = "…" + ctx;
+    if (ctxEnd < text.length) ctx += "…";
+
+    const before     = text.slice(Math.max(0, idx - 150), idx).toLowerCase();
+    const hasKeyword = /\b(due|deadline|by|no later than|nlt|ntp|submit|required|respond|return|need|complete|deliver|before|expected|must have)\b/.test(before);
+
+    seen.add(iso);
+    results.push({ iso, display, ctx, hasKeyword });
+  }
+
+  let m;
+  // Long month name: "March 15, 2026" / "March 15th, 2026"
+  const p1 = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/gi;
+  while ((m = p1.exec(text))) {
+    const mo = MONTHS_LONG.findIndex(x => x.toLowerCase() === m[1].toLowerCase()) + 1;
+    addResult(toISO(+m[3], mo, +m[2]), m[0], m.index);
+  }
+  // Short month name: "Mar 15, 2026" / "Mar. 15 2026"
+  const p2 = /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/gi;
+  while ((m = p2.exec(text))) {
+    const mo = MONTHS_SHORT.findIndex(x => x.toLowerCase() === m[1].toLowerCase()) + 1;
+    addResult(toISO(+m[3], mo, +m[2]), m[0], m.index);
+  }
+  // Day-first: "15 March 2026"
+  const p3 = /\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/gi;
+  while ((m = p3.exec(text))) {
+    const mo = MONTHS_LONG.findIndex(x => x.toLowerCase() === m[2].toLowerCase()) + 1;
+    addResult(toISO(+m[3], mo, +m[1]), m[0], m.index);
+  }
+  // Slash notation: "3/15/2026" or "03/15/26"
+  const p4 = /\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/g;
+  while ((m = p4.exec(text))) {
+    const mo = +m[1], dy = +m[2], yr = +m[3];
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31)
+      addResult(toISO(yr, mo, dy), m[0], m.index);
+  }
+  // ISO: "2026-03-15"
+  const p5 = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
+  while ((m = p5.exec(text))) addResult(m[0], m[0], m.index);
+
+  // Relative weekday: "next Friday" / "this Thursday"
+  const p6 = /\b(next|this)\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/gi;
+  while ((m = p6.exec(text))) {
+    const target = DAYS.findIndex(d => d.toLowerCase() === m[2].toLowerCase());
+    const d      = new Date(refDate);
+    let   delta  = target - d.getDay();
+    if (m[1].toLowerCase() === "next" || delta <= 0) delta += 7;
+    d.setDate(d.getDate() + delta);
+    const iso = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+    addResult(iso, m[0] + "  (" + iso + ")", m.index);
+  }
+
+  // Keyword hits first, then chronological
+  return results.sort((a, b) => {
+    if (a.hasKeyword !== b.hasKeyword) return a.hasKeyword ? -1 : 1;
+    return a.iso.localeCompare(b.iso);
+  });
+}
+
+function escHtml(s) {
+  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+async function showDatesView() {
+  showView("datesView");
+  document.getElementById("milestoneForm").style.display = "none";
+  const list = document.getElementById("datesList");
+  list.innerHTML = '<p style="color:#64748b;font-size:12px;text-align:center;padding:16px 0;">⏳ Scanning email…</p>';
+
+  try {
+    const token = await getToken();
+    const html  = await getEmailBodyHtml(token);
+    const tmp   = document.createElement("div");
+    tmp.innerHTML = html;
+    const text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
+
+    const dates = extractDueDates(text, emailItem?.dateTimeCreated);
+
+    if (!dates.length) {
+      list.innerHTML = '<p style="color:#64748b;font-size:12px;text-align:center;padding:20px 0;">No due dates found in this email.</p>';
+      return;
+    }
+
+    list.innerHTML = dates.map((d, i) => `
+      <div class="date-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+          <span style="font-size:13px;font-weight:700;color:${d.hasKeyword ? "#60b4ff" : "#e2e8f0"};">${escHtml(d.display)}</span>
+          ${d.hasKeyword ? '<span style="font-size:10px;background:#1e3a5f;color:#60b4ff;padding:1px 7px;border-radius:4px;flex-shrink:0;">deadline</span>' : ""}
+        </div>
+        <div style="font-size:11px;color:#64748b;line-height:1.5;margin-bottom:8px;font-style:italic;">${escHtml(d.ctx)}</div>
+        <button class="btn btn-blue" style="padding:5px 12px;font-size:11px;margin-bottom:0;"
+          onclick="prefillMilestone('${d.iso}')">➕ Use this date</button>
+      </div>
+    `).join("");
+  } catch(e) {
+    list.innerHTML = `<p style="color:#f87171;font-size:12px;">Error: ${escHtml(e.message)}</p>`;
+  }
+}
+
+function prefillMilestone(iso) {
+  document.getElementById("milestoneDate").value = iso;
+  document.getElementById("milestoneName").value = (emailItem?.subject || "").slice(0, 80);
+  document.getElementById("milestoneStatus").className = "status-msg";
+  document.getElementById("milestoneStatus").textContent = "";
+  const form = document.getElementById("milestoneForm");
+  form.style.display = "block";
+  form.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function doSaveMilestone() {
+  const name    = document.getElementById("milestoneName").value.trim();
+  const dueDate = document.getElementById("milestoneDate").value;
+  if (!name)    { setStatus("milestoneStatus", "error", "Please enter a milestone name."); return; }
+  if (!dueDate) { setStatus("milestoneStatus", "error", "Please select a date."); return; }
+  if (!selectedProject) { setStatus("milestoneStatus", "error", "Select a project first (go back)."); return; }
+
+  setStatus("milestoneStatus", "info", "⏳ Saving…");
+  try {
+    const res  = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+    const rows = await res.json();
+    const projects = rows[0]?.projects || [];
+    const proj = projects.find(p => p.id === selectedProject.id);
+    if (!proj) { setStatus("milestoneStatus", "error", "Project not found in Supabase."); return; }
+
+    // Create calendar event first so we can store its ID on the milestone
+    const milestone = {
+      id:          "addin-" + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+      name,
+      type:        "non-billable",
+      phase:       "",
+      dueDate,
+      pctComplete: 0,
+      fee:         0,
+      notes:       "From email: " + (emailItem?.subject || ""),
+      cancelled:   false,
+    };
+
+    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
+    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
+    if (calResult.success) milestone.calendarEventId = calResult.eventId;
+
+    proj.milestones = [...(proj.milestones || []), milestone];
+
+    await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
+      method:  "PATCH",
+      headers: SB_HEADERS,
+      body:    JSON.stringify({ projects, updated_at: new Date().toISOString() }),
+    });
+
+    const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
+    if (calResult.success) {
+      const calLabel = calResult.onShared ? "NYC Shared Calendar" : "your personal calendar";
+      setStatus("milestoneStatus", "success", "✓ Saved to " + projLabel + " · synced to " + calLabel);
+    } else {
+      setStatus("milestoneStatus", "success", "✓ Saved to " + projLabel + " (calendar sync failed: " + calResult.error + ")");
+    }
+    document.getElementById("milestoneForm").style.display = "none";
+  } catch(e) {
+    setStatus("milestoneStatus", "error", "✗ " + e.message);
+  }
+}
+
 // ─── PEOPLE PICKER ────────────────────────────────────────────────────────────
 function showPeopleView() {
   const list = document.getElementById("participantList");
@@ -800,7 +1041,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","rfiView","subView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });

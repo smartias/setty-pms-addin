@@ -133,9 +133,9 @@
       letter-spacing: 1px;
       margin-bottom: 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView, #datesView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #contactView.active, #peopleView.active { display: block; }
+    #subView.active, #noteView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -207,6 +207,15 @@
       border-radius: 4px;
       margin-right: 4px;
     }
+    .date-card {
+      padding: 12px;
+      background: #1e2235;
+      border: 1px solid #2d3452;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      transition: border-color 0.15s;
+    }
+    .date-card:hover { border-color: #3b5998; }
     .participant-row {
       display: flex;
       align-items: center;
@@ -275,6 +284,7 @@
   <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
   <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
   <hr class="divider"/>
+  <button class="btn btn-orange" id="findDatesBtn">📅 Find Due Dates → Create Milestone</button>
   <button class="btn btn-teal" id="addParticipantBtn">👥 Add Participant to Contacts</button>
   <button class="btn btn-ghost" id="extractContactBtn" style="font-size:12px;">👤 Extract from Signature</button>
 </div>
@@ -380,6 +390,28 @@
     <select id="subExistingSelect" style="margin-bottom:10px;"></select>
     <div id="subExistingStatus" class="status-msg"></div>
     <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
+  </div>
+</div>
+
+<!-- Dates View -->
+<div id="datesView">
+  <button class="back-btn" id="datesBack">← Back</button>
+  <div class="section-title">Due Dates Found</div>
+  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
+    Dates flagged with <span style="color:#60b4ff;">deadline</span> language appear first.
+    Click one to create a non-billable milestone on the selected project.
+  </p>
+  <div id="datesList"></div>
+
+  <!-- Milestone form — revealed when a date card is clicked -->
+  <div id="milestoneForm" style="display:none;margin-top:16px;padding:14px;background:#151b2e;border:1px solid #2d3452;border-radius:8px;">
+    <div class="section-title" style="margin-bottom:10px;">New Non-Billable Milestone</div>
+    <label>Name</label>
+    <input type="text" id="milestoneName" placeholder="e.g. Submit comments to GC"/>
+    <label>Due Date</label>
+    <input type="date" id="milestoneDate"/>
+    <div id="milestoneStatus" class="status-msg"></div>
+    <button class="btn btn-blue" id="saveMilestoneBtn">💾 Save Milestone to Project</button>
   </div>
 </div>
 
