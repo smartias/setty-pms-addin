@@ -27,6 +27,7 @@ let emailItem = null;
 let emailBody = "";
 let emailFrom = "";
 let emailFromAddress = "";
+let emailParticipants = []; // { label, displayName, emailAddress }
 let _spIds = null; // cached per session — avoids repeated site/drive lookups
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -53,19 +54,32 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
-  document.getElementById("logRfiBtn").onclick     = () => { prefillRfi(); showView("rfiView"); };
-  document.getElementById("logSubBtn").onclick     = () => showView("subView");
+  document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
+  document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
   document.getElementById("extractContactBtn").onclick = doExtractContact;
 
   document.getElementById("noteBack").onclick    = () => showView("mainView");
   document.getElementById("rfiBack").onclick     = () => showView("mainView");
   document.getElementById("subBack").onclick     = () => showView("mainView");
+  document.getElementById("peopleBack").onclick  = () => showView("mainView");
   document.getElementById("contactBack").onclick = () => showView("mainView");
+
+  document.getElementById("addParticipantBtn").onclick = showPeopleView;
 
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
   document.getElementById("saveSubBtn").onclick     = doSaveSub;
   document.getElementById("saveContactBtn").onclick = doSaveContact;
+
+  // RFI mode toggles
+  document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
+  document.getElementById("rfiModeExisting").onclick = () => setRfiMode("existing");
+  document.getElementById("fileRfiBtn").onclick      = doFileToExistingRfi;
+
+  // Submittal mode toggles
+  document.getElementById("subModeNew").onclick      = () => setSubMode("new");
+  document.getElementById("subModeExisting").onclick = () => setSubMode("existing");
+  document.getElementById("fileSubBtn").onclick      = doFileToExistingSub;
 
   // Project search
   const searchInput = document.getElementById("projectSearch");
@@ -115,6 +129,15 @@ function loadEmailContext() {
   }) : "";
   document.getElementById("emailMeta").textContent =
     "From: " + (emailFrom || emailFromAddress) + (date ? "  ·  " + date : "");
+
+  // Build participants list from From / To / CC
+  const toList = emailItem.to || [];
+  const ccList = emailItem.cc || [];
+  emailParticipants = [
+    { label: "From", displayName: emailFrom, emailAddress: emailFromAddress },
+    ...toList.map(r => ({ label: "To", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
+    ...ccList.map(r => ({ label: "CC", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
+  ].filter(p => p.emailAddress);
 
   // Pre-fill note body
   document.getElementById("noteBody").value = emailItem.subject || "";
@@ -598,6 +621,46 @@ async function doFileToExistingSub() {
   }
 }
 
+// ─── PEOPLE PICKER ────────────────────────────────────────────────────────────
+function showPeopleView() {
+  const list = document.getElementById("participantList");
+  if (!emailParticipants.length) {
+    list.innerHTML = '<p style="font-size:12px;color:#64748b;">No participants found.</p>';
+  } else {
+    const labelColor = { From: "#C00000", To: "#1d4ed8", CC: "#0f766e" };
+    const labelBg    = { From: "#450a0a", To: "#1e3a5f", CC: "#134e4a" };
+    list.innerHTML = emailParticipants.map((p, i) => `
+      <div class="participant-row" data-idx="${i}">
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:12px;font-weight:600;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            ${p.displayName || p.emailAddress}
+          </div>
+          <div style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            ${p.emailAddress}
+          </div>
+        </div>
+        <span class="pill" style="background:${labelBg[p.label]||'#1e2235'};color:${labelColor[p.label]||'#94a3b8'};">
+          ${p.label}
+        </span>
+      </div>
+    `).join("");
+    list.querySelectorAll(".participant-row").forEach(el => {
+      el.onclick = () => prefillContactFromParticipant(emailParticipants[+el.dataset.idx]);
+    });
+  }
+  showView("peopleView");
+}
+
+function prefillContactFromParticipant(p) {
+  document.getElementById("contactName").value    = p.displayName || "";
+  document.getElementById("contactTitle").value   = "";
+  document.getElementById("contactCompany").value = "";
+  document.getElementById("contactEmail").value   = p.emailAddress || "";
+  document.getElementById("contactPhone").value   = "";
+  setStatus("contactStatus", "", "");
+  showView("contactView");
+}
+
 // ─── EXTRACT CONTACT ──────────────────────────────────────────────────────────
 async function doExtractContact() {
   setStatus("actionStatus", "info", "⏳ Extracting contact…");
@@ -726,7 +789,7 @@ function addBizDays(date, days) {
 }
 
 function showView(id) {
-  ["signInView","mainView","noteView","rfiView","subView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","rfiView","subView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
