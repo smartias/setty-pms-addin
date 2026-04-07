@@ -14,6 +14,7 @@ const GRAPH_SCOPES = [
   "Calendars.ReadWrite.Shared",
   // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
+const LOGIN_SCOPES = ["User.Read"]; // sign in only — full scopes acquired after
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
@@ -167,8 +168,16 @@ function loadEmailContext() {
 async function doSignIn() {
   setStatus("signInStatus", "info", "⏳ Signing in…");
   try {
-    const result = await msalApp.loginPopup({ scopes: GRAPH_SCOPES });
+    // Sign in with User.Read only — avoids consent popup on login
+    const result = await msalApp.loginPopup({ scopes: LOGIN_SCOPES });
     msalAccount = result.account;
+    // Acquire full scopes silently right after login
+    try {
+      await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
+    } catch(e) {
+      // If silent fails, incremental consent popup (one-time only)
+      await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account: msalAccount });
+    }
     await onSignedIn();
   } catch (e) {
     setStatus("signInStatus", "error", "✗ Sign-in failed: " + e.message);
