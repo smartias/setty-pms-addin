@@ -1,7 +1,7 @@
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const MSAL_CONFIG = {
   auth: {
-    clientId: "c4739c11-e89b-4a04-9580-f2d886356301",
+    clientId: "8e5155fb-6221-4508-97ea-3661438c6688",
     authority: "https://login.microsoftonline.com/f374c024-71c2-48b6-8420-076fff97327c",
     redirectUri: "https://smartias.github.io/setty-pms-addin/taskpane.html",
   },
