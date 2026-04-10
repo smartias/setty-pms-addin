@@ -17,7 +17,8 @@ const GRAPH_SCOPES = [
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
-const PMS_PROJECT_BASE_URL = "https://settypms.com/projects/";
+const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
+const PMS_DASHBOARD_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#dashboard";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
 
@@ -32,6 +33,7 @@ let emailBody = "";
 let emailFrom = "";
 let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
+let lastAttachmentUploadStats = null;
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -199,8 +201,13 @@ function refreshEmailSavedIndicator() {
   if (!existing) return;
 
   const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
-  setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
-  btnSharePoint.disabled = true;
+  if (emailItem?.hasAttachments) {
+    setStatus("actionStatus", "info", "This email was already saved on " + savedDate + ". You can click 'Save to SharePoint + Project Record' again to retry attachment upload.");
+    btnSharePoint.disabled = false;
+  } else {
+    setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
+    btnSharePoint.disabled = true;
+  }
   btnRecordOnly.disabled = true;
 }
 
@@ -381,10 +388,18 @@ async function getEmailBodyHtml(token) {
 
 const SP_BASE_URL = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Document%20Library";
 
+function encodeDrivePath(path) {
+  return String(path || "")
+    .split("/")
+    .filter(Boolean)
+    .map(p => encodeURIComponent(p))
+    .join("/");
+}
+
 // Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders)
 async function ensureSpFolder(driveId, token, parentPath, name) {
   try {
-    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(parentPath) + ":/children", {
+    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
@@ -413,8 +428,9 @@ function buildEmailHtml(bodyHtml) {
 
 // Upload email.html + any attachments into targetPath. Returns attachment count.
 async function uploadEmailAndAttachments(driveId, token, targetPath) {
+  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [] };
   const bodyHtml = await getEmailBodyHtml(token);
-  await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/email.html:/content", {
+  await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath) + "/email.html:/content", {
     method: "PUT",
     headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
     body: buildEmailHtml(bodyHtml),
@@ -422,39 +438,122 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
 
   if (!emailItem.hasAttachments) return 0;
   try {
+    let count = 0;
+    // Prefer Outlook item APIs for attachment bytes; this is the most reliable in add-ins.
+    const officeAtts = await getOfficeFileAttachments();
+    if (officeAtts.length) {
+      for (const att of officeAtts) {
+        lastAttachmentUploadStats.attempted++;
+        const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes);
+        if (uploaded) count++;
+        else lastAttachmentUploadStats.failed.push(att.name || "attachment");
+      }
+      lastAttachmentUploadStats.uploaded = count;
+      return count;
+    }
+
+    // Fallback to Graph attachment APIs when Office APIs are unavailable.
     const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
-    let count = 0;
     for (const att of (attData?.value || [])) {
-      if (!att.contentBytes) continue;
-      const binary = atob(att.contentBytes);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const safeName = (att.name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim();
-      await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
-        method: "PUT",
-        headers: { "Authorization": "Bearer " + token, "Content-Type": att.contentType || "application/octet-stream" },
-        body: bytes,
-      });
-      count++;
+      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+      lastAttachmentUploadStats.attempted++;
+
+      let bytes = null;
+      if (att.contentBytes) {
+        const binary = atob(att.contentBytes);
+        bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      } else if (att.id) {
+        const rawRes = await fetch(
+          "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
+          { headers: { "Authorization": "Bearer " + token } }
+        );
+        if (!rawRes.ok) {
+          console.warn("Attachment download failed:", att.name, rawRes.status);
+          lastAttachmentUploadStats.failed.push((att.name || "attachment") + " (download " + rawRes.status + ")");
+          continue;
+        }
+        bytes = new Uint8Array(await rawRes.arrayBuffer());
+      }
+      if (!bytes) continue;
+      const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
+      if (uploaded) count++;
+      else lastAttachmentUploadStats.failed.push(att.name || "attachment");
     }
+    lastAttachmentUploadStats.uploaded = count;
     return count;
   } catch (e) {
     console.warn("Attachment upload failed:", e.message);
+    lastAttachmentUploadStats.failed.push("Unhandled error: " + e.message);
     return 0;
   }
+}
+
+function toBytesFromBase64(base64) {
+  const binary = atob(base64 || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function getOfficeFileAttachments() {
+  if (!emailItem?.getAttachmentsAsync || !emailItem?.getAttachmentContentAsync) return [];
+
+  const atts = await new Promise((resolve, reject) => {
+    emailItem.getAttachmentsAsync((res) => {
+      if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
+      else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
+    });
+  });
+
+  const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
+  const out = [];
+  for (const att of fileAtts) {
+    const content = await new Promise((resolve, reject) => {
+      emailItem.getAttachmentContentAsync(att.id, (res) => {
+        if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
+        else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
+      });
+    }).catch((e) => {
+      console.warn("Office attachment content failed:", att.name, e.message);
+      return null;
+    });
+    if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
+    out.push({
+      name: att.name || "attachment",
+      contentType: att.contentType || "application/octet-stream",
+      bytes: toBytesFromBase64(content.content),
+    });
+  }
+  return out;
+}
+
+async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
+  const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
+  const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/content", {
+    method: "PUT",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": contentType || "application/octet-stream" },
+    body: bytes,
+  });
+  if (!uploadRes.ok) {
+    console.warn("Attachment upload failed:", safeName, uploadRes.status);
+    return false;
+  }
+  return true;
 }
 
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
 async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
-  if (findSavedEmailRecord(selectedProject, getCurrentMessageRestId())) {
+  const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  if (existingRecord && !emailItem?.hasAttachments) {
     refreshEmailSavedIndicator();
     return;
   }
 
-  setStatus("actionStatus", "info", "⏳ Saving to SharePoint…");
+  setStatus("actionStatus", "info", existingRecord ? "⏳ Re-saving to SharePoint (retrying attachments)…" : "⏳ Saving to SharePoint…");
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -480,13 +579,22 @@ async function doSaveToSharePoint() {
       bodyText: "", spFolderUrl,
       savedAt: new Date().toISOString(),
     };
-    const updatedProject = { ...selectedProject, emails: [...(selectedProject.emails || []), emailRecord] };
+    const updatedEmails = existingRecord
+      ? (selectedProject.emails || []).map(e => e.msgId === msgId ? { ...e, spFolderUrl, savedAt: new Date().toISOString(), savedToSharePoint: true } : e)
+      : [...(selectedProject.emails || []), emailRecord];
+    const updatedProject = { ...selectedProject, emails: updatedEmails };
     updateProjectInList(updatedProject);
     selectedProject = updatedProject;
     await saveToSupabase(allProjects);
 
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
-    setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+    if (emailItem.hasAttachments && attCount === 0) {
+      const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
+      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details."));
+    } else {
+      setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+    }
     refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
@@ -1092,10 +1200,16 @@ async function doExtractContact() {
 
 function projectPmsUrl(project) {
   if (!project) return "";
-  if (project.pmsUrl) return project.pmsUrl;
+  if (project.pmsUrl) {
+    // Normalize legacy links to the current hosted PMS path.
+    return project.pmsUrl
+      .replace("https://settypms.com/projects/", PMS_PROJECT_BASE_URL)
+      .replace("https://smartias.github.io/setty-pms/SettyPMS/projects/", PMS_PROJECT_BASE_URL)
+      .replace("https://settypms.com/", "https://smartias.github.io/setty-pms/SettyPMS/");
+  }
   if (project.slug) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.slug);
   if (project.id) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.id);
-  return "";
+  return PMS_DASHBOARD_URL;
 }
 
 function updateProjectQuickLinks() {
