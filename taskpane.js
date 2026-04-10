@@ -24,6 +24,7 @@ const SP_LIBRARY   = "Project Document Library";
 let msalApp = null;
 let msalAccount = null;
 let allProjects = [];
+let allClients = [];
 let selectedProject = null;
 let emailItem = null;
 let emailBody = "";
@@ -36,6 +37,7 @@ const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6f
 const SP_DRIVE_ID_HARDCODED = "b!ZARYqukTtE6K1Mpv9bngAehneskb-yNKopp1Ol1X1BBnJPKsNGM-TaGmbGiL3ZaU";
 let _spIds = { siteId: SP_SITE_ID_HARDCODED, driveId: SP_DRIVE_ID_HARDCODED };
 const LAST_ACCOUNT_STORAGE_KEY = "settyPms:lastMsalAccountHomeId";
+const EMAIL_PROJECT_MAP_STORAGE_KEY = "settyPms:emailProjectMap";
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
@@ -84,6 +86,7 @@ function setupEventListeners() {
   document.getElementById("datesBack").onclick   = () => showView("mainView");
 
   document.getElementById("findDatesBtn").onclick    = showDatesView;
+  document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
   document.getElementById("addParticipantBtn").onclick = showPeopleView;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
 
@@ -91,6 +94,11 @@ function setupEventListeners() {
   document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
   document.getElementById("saveSubBtn").onclick     = doSaveSub;
   document.getElementById("saveContactBtn").onclick = doSaveContact;
+  document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
+  document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
+  document.getElementById("newProjectBtn").onclick = () => showView("projectCreateView");
+  document.getElementById("projectCreateBack").onclick = () => showView("mainView");
+  document.getElementById("createProjectSaveBtn").onclick = doCreateProject;
 
   // RFI mode toggles
   document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
@@ -122,13 +130,9 @@ function setupEventListeners() {
     dropdown.style.display = "block";
     dropdown.querySelectorAll(".proj-option").forEach(el => {
       el.onclick = () => {
-        selectedProject = allProjects.find(p => p.id === el.dataset.id);
+        setSelectedProject(allProjects.find(p => p.id === el.dataset.id), true);
         searchInput.value = "";
         dropdown.style.display = "none";
-        const badge = document.getElementById("selectedProjectBadge");
-        badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
-        badge.style.display = "block";
-        refreshEmailSavedIndicator();
       };
     });
   });
@@ -167,6 +171,7 @@ function loadEmailContext() {
   // Pre-fill RFI from
   document.getElementById("rfiFrom").value = emailFrom;
   document.getElementById("subFrom").value = emailFrom;
+  restoreProjectSelectionForCurrentEmail();
   refreshEmailSavedIndicator();
 }
 
@@ -219,12 +224,16 @@ async function doSignOut() {
   localStorage.removeItem(LAST_ACCOUNT_STORAGE_KEY);
   selectedProject = null;
   allProjects = [];
+  allClients = [];
   showView("signInView");
+  updateProjectQuickLinks();
 }
 
 async function onSignedIn() {
   showView("mainView");
   await loadProjects();
+  restoreProjectSelectionForCurrentEmail();
+  updateProjectQuickLinks();
 }
 
 async function getToken() {
@@ -250,12 +259,14 @@ const SB_HEADERS = {
 
 async function loadProjects() {
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", {
       headers: SB_HEADERS,
     });
     const rows = await res.json();
     if (!rows || !rows[0]) return;
     allProjects = (rows[0].projects || []).filter(p => !p.archived);
+    allClients = rows[0].clients || [];
+    renderCompanySuggestions();
   } catch (e) {
     console.error("Failed to load projects:", e);
   }
@@ -271,6 +282,66 @@ async function saveToSupabase(updatedProjects) {
 
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
+}
+
+function getEmailProjectMap() {
+  try {
+    return JSON.parse(localStorage.getItem(EMAIL_PROJECT_MAP_STORAGE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function setSelectedProject(project, persistForEmail = false) {
+  selectedProject = project || null;
+  const badge = document.getElementById("selectedProjectBadge");
+  if (badge) {
+    if (selectedProject) {
+      badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
+      badge.style.display = "block";
+    } else {
+      badge.style.display = "none";
+      badge.textContent = "";
+    }
+  }
+  if (persistForEmail && selectedProject) {
+    const msgId = getCurrentMessageRestId();
+    if (msgId) {
+      const map = getEmailProjectMap();
+      map[msgId] = selectedProject.id;
+      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+    }
+  }
+  updateProjectQuickLinks();
+  refreshEmailSavedIndicator();
+}
+
+function restoreProjectSelectionForCurrentEmail() {
+  const msgId = getCurrentMessageRestId();
+  if (!msgId || !allProjects.length) return;
+  const map = getEmailProjectMap();
+  const projectId = map[msgId];
+  if (!projectId) return;
+  const project = allProjects.find(p => p.id === projectId);
+  if (project) setSelectedProject(project, false);
+}
+
+function renderCompanySuggestions() {
+  const list = document.getElementById("companyList");
+  if (!list) return;
+  const companies = [...new Set((allClients || []).map(c => (c.name || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  list.innerHTML = companies.map(name => `<option value="${escHtml(name)}"></option>`).join("");
+}
+
+function getClientByEmail(email) {
+  if (!email) return null;
+  const emailLc = email.toLowerCase();
+  const domain = emailLc.includes("@") ? emailLc.split("@")[1] : "";
+  return (allClients || []).find(c => {
+    const contacts = c.contacts || [];
+    if (contacts.some(ct => (ct.email || "").toLowerCase() === emailLc)) return true;
+    return !!domain && contacts.some(ct => (ct.email || "").toLowerCase().endsWith("@" + domain));
+  }) || null;
 }
 
 // ─── GRAPH HELPERS ────────────────────────────────────────────────────────────
@@ -899,6 +970,15 @@ function prefillMilestone(iso) {
   form.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+function showManualMilestoneForm() {
+  showView("datesView");
+  const list = document.getElementById("datesList");
+  if (list) list.innerHTML = '<p style="color:#64748b;font-size:12px;text-align:center;padding:16px 0;">Manual mode: enter milestone details below.</p>';
+  const defaultDate = new Date();
+  const iso = defaultDate.getFullYear() + "-" + String(defaultDate.getMonth() + 1).padStart(2, "0") + "-" + String(defaultDate.getDate()).padStart(2, "0");
+  prefillMilestone(iso);
+}
+
 async function doSaveMilestone() {
   const name    = document.getElementById("milestoneName").value.trim();
   const dueDate = document.getElementById("milestoneDate").value;
@@ -983,9 +1063,10 @@ function showPeopleView() {
 }
 
 function prefillContactFromParticipant(p) {
+  const matchedClient = getClientByEmail(p.emailAddress || "");
   document.getElementById("contactName").value    = p.displayName || "";
   document.getElementById("contactTitle").value   = "";
-  document.getElementById("contactCompany").value = "";
+  document.getElementById("contactCompany").value = matchedClient?.name || "";
   document.getElementById("contactEmail").value   = p.emailAddress || "";
   document.getElementById("contactPhone").value   = "";
   setStatus("contactStatus", "", "");
@@ -998,13 +1079,81 @@ async function doExtractContact() {
   const token = await getToken();
   const body = await getEmailBodyHtml(token);
   const contact = parseSignature(body, emailFrom, emailFromAddress);
+  const matchedClient = getClientByEmail(contact.email || emailFromAddress);
   document.getElementById("contactName").value    = contact.name;
   document.getElementById("contactTitle").value   = contact.title;
-  document.getElementById("contactCompany").value = contact.company;
+  document.getElementById("contactCompany").value = matchedClient?.name || contact.company;
   document.getElementById("contactEmail").value   = contact.email;
   document.getElementById("contactPhone").value   = contact.phone;
   setStatus("actionStatus", "info", "");
   showView("contactView");
+}
+
+function projectPmsUrl(project) {
+  if (!project) return "";
+  const raw = project.pmsUrl || project.pmsProjectUrl || project.projectUrl || "";
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return "";
+}
+
+function updateProjectQuickLinks() {
+  const pmsBtn = document.getElementById("openPmsBtn");
+  const spBtn = document.getElementById("openSpFolderBtn");
+  if (!pmsBtn || !spBtn) return;
+  pmsBtn.disabled = !projectPmsUrl(selectedProject);
+  spBtn.disabled = !selectedProject?.projectFolderUrl;
+}
+
+function openSelectedProjectInPms() {
+  if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  const url = projectPmsUrl(selectedProject);
+  if (!url) { setStatus("actionStatus", "error", "No valid PMS URL is set on this project. Add one in 'Add New Project' (or in PMS data) first."); return; }
+  window.open(url, "_blank");
+}
+
+function openSelectedProjectSpFolder() {
+  if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
+  window.open(selectedProject.projectFolderUrl, "_blank");
+}
+
+async function doCreateProject() {
+  const projectNumber = document.getElementById("newProjectNumber").value.trim();
+  const name = document.getElementById("newProjectName").value.trim();
+  const projectFolderUrl = document.getElementById("newProjectFolder").value.trim();
+  const pmsUrl = document.getElementById("newProjectPmsUrl").value.trim();
+  if (!name) { setStatus("createProjectStatus", "error", "Project name is required."); return; }
+
+  setStatus("createProjectStatus", "info", "⏳ Creating project…");
+  try {
+    const newProject = {
+      id: uid(),
+      projectNumber,
+      name,
+      projectFolderUrl,
+      pmsUrl: pmsUrl || "",
+      archived: false,
+      createdAt: new Date().toISOString(),
+      emails: [],
+      notes: [],
+      rfis: [],
+      submittals: [],
+      milestones: [],
+    };
+    const updatedProjects = [...allProjects, newProject];
+    await saveToSupabase(updatedProjects);
+    allProjects = updatedProjects;
+    setSelectedProject(newProject, true);
+    document.getElementById("newProjectNumber").value = "";
+    document.getElementById("newProjectName").value = "";
+    document.getElementById("newProjectFolder").value = "";
+    document.getElementById("newProjectPmsUrl").value = "";
+    updateProjectQuickLinks();
+    setStatus("createProjectStatus", "success", "✓ Project created and selected.");
+  } catch (e) {
+    setStatus("createProjectStatus", "error", "✗ " + e.message);
+  }
 }
 
 function parseSignature(html, fromName, fromEmail) {
@@ -1123,7 +1272,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView","projectCreateView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
