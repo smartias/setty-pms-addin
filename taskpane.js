@@ -380,10 +380,18 @@ async function getEmailBodyHtml(token) {
 
 const SP_BASE_URL = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Document%20Library";
 
+function encodeDrivePath(path) {
+  return String(path || "")
+    .split("/")
+    .filter(Boolean)
+    .map(p => encodeURIComponent(p))
+    .join("/");
+}
+
 // Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders)
 async function ensureSpFolder(driveId, token, parentPath, name) {
   try {
-    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(parentPath) + ":/children", {
+    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
@@ -413,7 +421,7 @@ function buildEmailHtml(bodyHtml) {
 // Upload email.html + any attachments into targetPath. Returns attachment count.
 async function uploadEmailAndAttachments(driveId, token, targetPath) {
   const bodyHtml = await getEmailBodyHtml(token);
-  await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/email.html:/content", {
+  await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath) + "/email.html:/content", {
     method: "PUT",
     headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
     body: buildEmailHtml(bodyHtml),
@@ -506,7 +514,7 @@ async function getOfficeFileAttachments() {
 
 async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
   const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
-  const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
+  const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/content", {
     method: "PUT",
     headers: { "Authorization": "Bearer " + token, "Content-Type": contentType || "application/octet-stream" },
     body: bytes,
