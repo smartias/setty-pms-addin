@@ -502,15 +502,15 @@ function toBytesFromBase64(base64) {
 async function getOfficeFileAttachments() {
   if (!emailItem?.getAttachmentsAsync || !emailItem?.getAttachmentContentAsync) return [];
 
-  const atts = await new Promise((resolve, reject) => {
+  const atts = await new Promise((resolve) => {
     emailItem.getAttachmentsAsync((res) => {
       if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
-      else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
+      else {
+        // Never throw here so uploadEmailAndAttachments can always continue to Graph fallback.
+        console.warn("Office attachment listing failed:", res.error?.message || "getAttachmentsAsync failed");
+        resolve([]);
+      }
     });
-  }).catch((e) => {
-    // Allow Graph fallback path in uploadEmailAndAttachments when Outlook listing fails.
-    console.warn("Office attachment listing failed:", e.message);
-    return [];
   });
 
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
