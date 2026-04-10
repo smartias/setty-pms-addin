@@ -99,9 +99,7 @@ function setupEventListeners() {
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
-  document.getElementById("newProjectBtn").onclick = () => showView("projectCreateView");
-  document.getElementById("projectCreateBack").onclick = () => showView("mainView");
-  document.getElementById("createProjectSaveBtn").onclick = doCreateProject;
+  document.getElementById("openDashboardBtn").onclick = openPmsDashboard;
 
   // RFI mode toggles
   document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
@@ -206,8 +204,13 @@ function refreshEmailSavedIndicator() {
   if (!existing) return;
 
   const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
-  setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
-  btnSharePoint.disabled = true;
+  if (emailItem?.hasAttachments) {
+    setStatus("actionStatus", "info", "This email was already saved on " + savedDate + ". You can click 'Save to SharePoint + Project Record' again to retry attachment upload.");
+    btnSharePoint.disabled = false;
+  } else {
+    setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
+    btnSharePoint.disabled = true;
+  }
   btnRecordOnly.disabled = true;
 }
 
@@ -548,13 +551,13 @@ async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
   const currentMsgId = getCurrentMessageRecordId();
-  const existingRecord = findSavedEmailRecord(selectedProject, currentMsgId);
-  if (existingRecord) {
+   const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  if (existingRecord && !emailItem?.hasAttachments) {
     refreshEmailSavedIndicator();
     return;
   }
 
-  setStatus("actionStatus", "info", "⏳ Saving to SharePoint…");
+  setStatus("actionStatus", "info", existingRecord ? "⏳ Re-saving to SharePoint (retrying attachments)…" : "⏳ Saving to SharePoint…");
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -1202,8 +1205,6 @@ function projectPmsUrl(project) {
   if (project.pmsUrl) {
     // Normalize legacy links to the current hosted PMS path.
     return project.pmsUrl
-      .replace("https://settypms.com/projects/", PMS_PROJECT_BASE_URL)
-      .replace("https://smartias.github.io/setty-pms/SettyPMS/projects/", PMS_PROJECT_BASE_URL)
       .replace("https://settypms.com/", "https://smartias.github.io/setty-pms/SettyPMS/");
   }
   if (project.slug) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.slug);
@@ -1223,51 +1224,30 @@ function openSelectedProjectInPms() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   const url = projectPmsUrl(selectedProject);
   if (!url) { setStatus("actionStatus", "error", "No PMS URL is available for this project."); return; }
-  window.open(url, "_blank");
+  openExternalUrl(url);
 }
 
 function openSelectedProjectSpFolder() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
-  window.open(selectedProject.projectFolderUrl, "_blank");
+  openExternalUrl(selectedProject.projectFolderUrl);
 }
 
-async function doCreateProject() {
-  const projectNumber = document.getElementById("newProjectNumber").value.trim();
-  const name = document.getElementById("newProjectName").value.trim();
-  const projectFolderUrl = document.getElementById("newProjectFolder").value.trim();
-  const pmsUrl = document.getElementById("newProjectPmsUrl").value.trim();
-  if (!name) { setStatus("createProjectStatus", "error", "Project name is required."); return; }
+function openPmsDashboard() {
+  openExternalUrl(PMS_DASHBOARD_URL);
+}
 
-  setStatus("createProjectStatus", "info", "⏳ Creating project…");
+function openExternalUrl(url) {
+  if (!url) return;
   try {
-    const newProject = {
-      id: uid(),
-      projectNumber,
-      name,
-      projectFolderUrl,
-      pmsUrl: pmsUrl || "",
-      archived: false,
-      createdAt: new Date().toISOString(),
-      emails: [],
-      notes: [],
-      rfis: [],
-      submittals: [],
-      milestones: [],
-    };
-    const updatedProjects = [...allProjects, newProject];
-    await saveToSupabase(updatedProjects);
-    allProjects = updatedProjects;
-    setSelectedProject(newProject, true);
-    document.getElementById("newProjectNumber").value = "";
-    document.getElementById("newProjectName").value = "";
-    document.getElementById("newProjectFolder").value = "";
-    document.getElementById("newProjectPmsUrl").value = "";
-    updateProjectQuickLinks();
-    setStatus("createProjectStatus", "success", "✓ Project created and selected.");
+    if (Office?.context?.ui?.openBrowserWindow) {
+      Office.context.ui.openBrowserWindow(url);
+      return;
+    }
   } catch (e) {
-    setStatus("createProjectStatus", "error", "✗ " + e.message);
+    console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
+  window.open(url, "_blank");
 }
 
 function parseSignature(html, fromName, fromEmail) {
@@ -1386,7 +1366,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView","projectCreateView"].forEach(v => {
+  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
