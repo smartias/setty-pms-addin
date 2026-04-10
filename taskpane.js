@@ -507,6 +507,10 @@ async function getOfficeFileAttachments() {
       if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
       else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
     });
+  }).catch((e) => {
+    // Allow Graph fallback path in uploadEmailAndAttachments when Outlook listing fails.
+    console.warn("Office attachment listing failed:", e.message);
+    return [];
   });
 
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
