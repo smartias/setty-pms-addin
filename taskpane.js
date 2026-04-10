@@ -426,16 +426,39 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
     let count = 0;
     for (const att of (attData?.value || [])) {
-      if (!att.contentBytes) continue;
-      const binary = atob(att.contentBytes);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      // Only file attachments can be uploaded to SharePoint as files.
+      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+
+      let fileBody = null;
+      if (att.contentBytes) {
+        const binary = atob(att.contentBytes);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        fileBody = bytes;
+      } else if (att.id) {
+        // Some environments do not include contentBytes in list results.
+        const rawRes = await fetch(
+          "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
+          { headers: { "Authorization": "Bearer " + token } }
+        );
+        if (!rawRes.ok) {
+          console.warn("Attachment download failed:", att.name, rawRes.status);
+          continue;
+        }
+        fileBody = await rawRes.arrayBuffer();
+      }
+      if (!fileBody) continue;
+
       const safeName = (att.name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim();
-      await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
+      const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
         method: "PUT",
         headers: { "Authorization": "Bearer " + token, "Content-Type": att.contentType || "application/octet-stream" },
-        body: bytes,
+        body: fileBody,
       });
+      if (!uploadRes.ok) {
+        console.warn("Attachment upload failed:", safeName, uploadRes.status);
+        continue;
+      }
       count++;
     }
     return count;
