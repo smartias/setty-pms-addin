@@ -133,9 +133,9 @@
       letter-spacing: 1px;
       margin-bottom: 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView, #datesView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView, #datesView, #projectCreateView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
+    #subView.active, #noteView.active, #contactView.active, #peopleView.active, #datesView.active, #projectCreateView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -281,11 +281,15 @@
 
   <button class="btn btn-green" id="saveSpBtn">📁 Save to SharePoint + Project Record</button>
   <button class="btn btn-blue" id="saveRecordBtn">🗂️ Save to Project Record Only</button>
+  <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
+  <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
+  <button class="btn btn-ghost" id="newProjectBtn">➕ Add New Project</button>
   <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note (Meeting / Site Visit)</button>
   <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
   <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
   <hr class="divider"/>
   <button class="btn btn-orange" id="findDatesBtn">📅 Find Due Dates → Create Milestone</button>
+  <button class="btn btn-orange" id="manualMilestoneBtn">➕ Create Milestone Manually</button>
   <button class="btn btn-teal" id="addParticipantBtn">👥 Add Participant to Contacts</button>
   <button class="btn btn-ghost" id="extractContactBtn" style="font-size:12px;">👤 Extract from Signature</button>
 </div>
@@ -438,7 +442,8 @@
   <label>Title</label>
   <input type="text" id="contactTitle"/>
   <label>Company</label>
-  <input type="text" id="contactCompany"/>
+  <input type="text" id="contactCompany" list="companyList" placeholder="Select existing or type new…"/>
+  <datalist id="companyList"></datalist>
   <label>Email</label>
   <input type="text" id="contactEmail"/>
   <label>Phone</label>
@@ -457,6 +462,25 @@
   </select>
   <div id="contactStatus" class="status-msg"></div>
   <button class="btn btn-teal" id="saveContactBtn">💾 Save Contact</button>
+</div>
+
+<!-- Create Project View -->
+<div id="projectCreateView">
+  <button class="back-btn" id="projectCreateBack">← Back</button>
+  <div class="section-title">Add New Project</div>
+  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
+    Create a quick project record for new RFP/pipeline tracking.
+  </p>
+  <label>Project Number</label>
+  <input type="text" id="newProjectNumber" placeholder="Optional"/>
+  <label>Project Name</label>
+  <input type="text" id="newProjectName" placeholder="Required"/>
+  <label>PMS Project URL</label>
+  <input type="text" id="newProjectPmsUrl" placeholder="https://settypms.com/projects/..."/>
+  <label>SharePoint Folder URL</label>
+  <input type="text" id="newProjectFolder" placeholder="https://setty.sharepoint.com/..."/>
+  <div id="createProjectStatus" class="status-msg"></div>
+  <button class="btn btn-blue" id="createProjectSaveBtn">💾 Create Project</button>
 </div>
 
 <script src="taskpane.js"></script>
