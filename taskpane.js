@@ -439,7 +439,6 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
     body: buildEmailHtml(bodyHtml),
   });
 
-  if (!emailItem.hasAttachments) return 0;
   try {
     let count = 0;
     // Prefer Outlook item APIs for attachment bytes; this is the most reliable in add-ins.
@@ -550,12 +549,12 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
 async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
-  const currentMsgId = getCurrentMessageRecordId();
-   const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
-  if (existingRecord && !emailItem?.hasAttachments) {
-    refreshEmailSavedIndicator();
-    return;
-  }
+const currentMsgId = getCurrentMessageRecordId();
+const existingRecord = findSavedEmailRecord(selectedProject, currentMsgId);
+if (existingRecord) {
+  refreshEmailSavedIndicator();
+  return;
+}
 
   setStatus("actionStatus", "info", existingRecord ? "⏳ Re-saving to SharePoint (retrying attachments)…" : "⏳ Saving to SharePoint…");
   try {
@@ -590,10 +589,12 @@ async function doSaveToSharePoint() {
     await saveToSupabase(allProjects);
 
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
-    if (emailItem.hasAttachments && attCount === 0) {
-      const attempted = lastAttachmentUploadStats?.attempted || 0;
+    const attempted = lastAttachmentUploadStats?.attempted || 0;
+    if (attempted > 0 && attCount === 0) {
       const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
       setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details."));
+    } else if (attempted === 0) {
+      setStatus("actionStatus", "info", "Email saved to SharePoint, but no attachments were detected by Outlook/Graph for this message.");
     } else {
       setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
     }
