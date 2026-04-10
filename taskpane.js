@@ -181,6 +181,11 @@ function getCurrentMessageRestId() {
   return Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
 }
 
+function getCurrentMessageRecordId() {
+  // Prefer Graph REST id, but fall back so dedupe logic doesn't collapse to empty-string matches.
+  return getCurrentMessageRestId() || emailItem?.internetMessageId || emailItem?.itemId || "";
+}
+
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
   return (project.emails || []).find(e => e.msgId === msgId) || null;
@@ -195,7 +200,7 @@ function refreshEmailSavedIndicator() {
   btnRecordOnly.disabled = false;
 
   if (!selectedProject || !emailItem?.itemId) return;
-  const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
   if (!existing) return;
 
   const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
@@ -545,7 +550,8 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
 async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
-  const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  const currentMsgId = getCurrentMessageRecordId();
+   const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
   if (existingRecord && !emailItem?.hasAttachments) {
     refreshEmailSavedIndicator();
     return;
@@ -567,7 +573,7 @@ async function doSaveToSharePoint() {
 
     const from = emailItem.from;
     const spFolderUrl = SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/Emails/" + encodeURIComponent(emailFolderName);
-    const msgId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+    const msgId = currentMsgId;
     const emailRecord = {
       id: uid(), msgId,
       subject: emailItem.subject || "",
@@ -577,9 +583,7 @@ async function doSaveToSharePoint() {
       bodyText: "", spFolderUrl,
       savedAt: new Date().toISOString(),
     };
-    const updatedEmails = existingRecord
-      ? (selectedProject.emails || []).map(e => e.msgId === msgId ? { ...e, spFolderUrl, savedAt: new Date().toISOString(), savedToSharePoint: true } : e)
-      : [...(selectedProject.emails || []), emailRecord];
+    const updatedEmails = [...(selectedProject.emails || []), emailRecord];
     const updatedProject = { ...selectedProject, emails: updatedEmails };
     updateProjectInList(updatedProject);
     selectedProject = updatedProject;
@@ -605,7 +609,7 @@ async function doSaveToProjectRecordOnly() {
     setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint + Project Record' instead.");
     return;
   }
-  const msgId = getCurrentMessageRestId();
+  const msgId = getCurrentMessageRecordId();
   if (findSavedEmailRecord(selectedProject, msgId)) {
     refreshEmailSavedIndicator();
     return;
