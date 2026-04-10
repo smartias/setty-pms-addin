@@ -5,7 +5,8 @@ const MSAL_CONFIG = {
     authority: "https://login.microsoftonline.com/f374c024-71c2-48b6-8420-076fff97327c",
     redirectUri: "https://smartias.github.io/setty-pms-addin/taskpane.html",
   },
-  cache: { cacheLocation: "sessionStorage" }
+  // Persist login across taskpane reloads while users open different emails.
+  cache: { cacheLocation: "localStorage" }
 };
 const GRAPH_SCOPES = [
   "User.Read",
@@ -34,6 +35,7 @@ let emailParticipants = []; // { label, displayName, emailAddress }
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
 const SP_DRIVE_ID_HARDCODED = "b!ZARYqukTtE6K1Mpv9bngAehneskb-yNKopp1Ol1X1BBnJPKsNGM-TaGmbGiL3ZaU";
 let _spIds = { siteId: SP_SITE_ID_HARDCODED, driveId: SP_DRIVE_ID_HARDCODED };
+const LAST_ACCOUNT_STORAGE_KEY = "settyPms:lastMsalAccountHomeId";
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
@@ -47,7 +49,9 @@ Office.onReady(async (info) => {
 
     const accounts = msalApp.getAllAccounts();
     if (accounts.length > 0) {
-      msalAccount = accounts[0];
+      const lastAccountId = localStorage.getItem(LAST_ACCOUNT_STORAGE_KEY);
+      msalAccount = accounts.find(a => a.homeAccountId === lastAccountId) || accounts[0];
+      msalApp.setActiveAccount(msalAccount);
       await onSignedIn();
     } else {
       showView("signInView");
@@ -169,6 +173,8 @@ async function doSignIn() {
   try {
     const result = await msalApp.loginPopup({ scopes: GRAPH_SCOPES });
     msalAccount = result.account;
+    msalApp.setActiveAccount(msalAccount);
+    localStorage.setItem(LAST_ACCOUNT_STORAGE_KEY, msalAccount?.homeAccountId || "");
     await onSignedIn();
   } catch (e) {
     setStatus("signInStatus", "error", "✗ Sign-in failed: " + e.message);
@@ -178,6 +184,8 @@ async function doSignIn() {
 async function doSignOut() {
   await msalApp.logoutPopup({ account: msalAccount });
   msalAccount = null;
+  msalApp.setActiveAccount(null);
+  localStorage.removeItem(LAST_ACCOUNT_STORAGE_KEY);
   selectedProject = null;
   allProjects = [];
   showView("signInView");
@@ -189,11 +197,14 @@ async function onSignedIn() {
 }
 
 async function getToken() {
+  const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+  if (!account) throw new Error("Not signed in");
+  msalAccount = account;
   try {
-    const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
+    const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account });
     return r.accessToken;
   } catch {
-    const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account: msalAccount });
+    const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
     return r.accessToken;
   }
 }
