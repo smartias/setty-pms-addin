@@ -199,8 +199,13 @@ function refreshEmailSavedIndicator() {
   if (!existing) return;
 
   const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
-  setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
-  btnSharePoint.disabled = true;
+  if (emailItem?.hasAttachments) {
+    setStatus("actionStatus", "info", "This email was already saved on " + savedDate + ". You can click 'Save to SharePoint + Project Record' again to retry attachment upload.");
+    btnSharePoint.disabled = false;
+  } else {
+    setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
+    btnSharePoint.disabled = true;
+  }
   btnRecordOnly.disabled = true;
 }
 
@@ -540,12 +545,13 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
 async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
-  if (findSavedEmailRecord(selectedProject, getCurrentMessageRestId())) {
+  const existingRecord = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  if (existingRecord && !emailItem?.hasAttachments) {
     refreshEmailSavedIndicator();
     return;
   }
 
-  setStatus("actionStatus", "info", "⏳ Saving to SharePoint…");
+  setStatus("actionStatus", "info", existingRecord ? "⏳ Re-saving to SharePoint (retrying attachments)…" : "⏳ Saving to SharePoint…");
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -571,7 +577,10 @@ async function doSaveToSharePoint() {
       bodyText: "", spFolderUrl,
       savedAt: new Date().toISOString(),
     };
-    const updatedProject = { ...selectedProject, emails: [...(selectedProject.emails || []), emailRecord] };
+    const updatedEmails = existingRecord
+      ? (selectedProject.emails || []).map(e => e.msgId === msgId ? { ...e, spFolderUrl, savedAt: new Date().toISOString(), savedToSharePoint: true } : e)
+      : [...(selectedProject.emails || []), emailRecord];
+    const updatedProject = { ...selectedProject, emails: updatedEmails };
     updateProjectInList(updatedProject);
     selectedProject = updatedProject;
     await saveToSupabase(allProjects);
