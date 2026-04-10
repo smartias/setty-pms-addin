@@ -17,7 +17,7 @@ const GRAPH_SCOPES = [
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
-const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS/projects/";
+const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
 const PMS_DASHBOARD_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#dashboard";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
@@ -33,6 +33,7 @@ let emailBody = "";
 let emailFrom = "";
 let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
+let lastAttachmentUploadStats = null;
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -420,6 +421,7 @@ function buildEmailHtml(bodyHtml) {
 
 // Upload email.html + any attachments into targetPath. Returns attachment count.
 async function uploadEmailAndAttachments(driveId, token, targetPath) {
+  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [] };
   const bodyHtml = await getEmailBodyHtml(token);
   await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath) + "/email.html:/content", {
     method: "PUT",
@@ -434,9 +436,12 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
     const officeAtts = await getOfficeFileAttachments();
     if (officeAtts.length) {
       for (const att of officeAtts) {
+        lastAttachmentUploadStats.attempted++;
         const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes);
         if (uploaded) count++;
+        else lastAttachmentUploadStats.failed.push(att.name || "attachment");
       }
+      lastAttachmentUploadStats.uploaded = count;
       return count;
     }
 
@@ -445,6 +450,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
     for (const att of (attData?.value || [])) {
       if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+      lastAttachmentUploadStats.attempted++;
 
       let bytes = null;
       if (att.contentBytes) {
@@ -458,6 +464,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
         );
         if (!rawRes.ok) {
           console.warn("Attachment download failed:", att.name, rawRes.status);
+          lastAttachmentUploadStats.failed.push((att.name || "attachment") + " (download " + rawRes.status + ")");
           continue;
         }
         bytes = new Uint8Array(await rawRes.arrayBuffer());
@@ -465,10 +472,13 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
       if (!bytes) continue;
       const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
       if (uploaded) count++;
+      else lastAttachmentUploadStats.failed.push(att.name || "attachment");
     }
+    lastAttachmentUploadStats.uploaded = count;
     return count;
   } catch (e) {
     console.warn("Attachment upload failed:", e.message);
+    lastAttachmentUploadStats.failed.push("Unhandled error: " + e.message);
     return 0;
   }
 }
@@ -567,7 +577,13 @@ async function doSaveToSharePoint() {
     await saveToSupabase(allProjects);
 
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
-    setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+    if (emailItem.hasAttachments && attCount === 0) {
+      const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
+      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details."));
+    } else {
+      setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+    }
     refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
@@ -1176,12 +1192,11 @@ function projectPmsUrl(project) {
   if (project.pmsUrl) {
     // Normalize legacy links to the current hosted PMS path.
     return project.pmsUrl
-      .replace("https://settypms.com/projects/", PMS_PROJECT_BASE_URL)
       .replace("https://settypms.com/", "https://smartias.github.io/setty-pms/SettyPMS/");
   }
   if (project.slug) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.slug);
   if (project.id) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.id);
-  return "";
+  return PMS_DASHBOARD_URL;
 }
 
 function updateProjectQuickLinks() {
