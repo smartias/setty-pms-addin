@@ -70,6 +70,7 @@ function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
   document.getElementById("signOutBtn").onclick    = doSignOut;
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
+  document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
   document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
@@ -127,6 +128,7 @@ function setupEventListeners() {
         const badge = document.getElementById("selectedProjectBadge");
         badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
         badge.style.display = "block";
+        refreshEmailSavedIndicator();
       };
     });
   });
@@ -165,6 +167,35 @@ function loadEmailContext() {
   // Pre-fill RFI from
   document.getElementById("rfiFrom").value = emailFrom;
   document.getElementById("subFrom").value = emailFrom;
+  refreshEmailSavedIndicator();
+}
+
+function getCurrentMessageRestId() {
+  if (!emailItem?.itemId) return "";
+  return Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+}
+
+function findSavedEmailRecord(project, msgId) {
+  if (!project || !msgId) return null;
+  return (project.emails || []).find(e => e.msgId === msgId) || null;
+}
+
+function refreshEmailSavedIndicator() {
+  const btnSharePoint = document.getElementById("saveSpBtn");
+  const btnRecordOnly = document.getElementById("saveRecordBtn");
+  if (!btnSharePoint || !btnRecordOnly) return;
+
+  btnSharePoint.disabled = false;
+  btnRecordOnly.disabled = false;
+
+  if (!selectedProject || !emailItem?.itemId) return;
+  const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRestId());
+  if (!existing) return;
+
+  const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
+  setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
+  btnSharePoint.disabled = true;
+  btnRecordOnly.disabled = true;
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -346,6 +377,10 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
 async function doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
+  if (findSavedEmailRecord(selectedProject, getCurrentMessageRestId())) {
+    refreshEmailSavedIndicator();
+    return;
+  }
 
   setStatus("actionStatus", "info", "⏳ Saving to SharePoint…");
   try {
@@ -380,6 +415,44 @@ async function doSaveToSharePoint() {
 
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+    refreshEmailSavedIndicator();
+  } catch (e) {
+    setStatus("actionStatus", "error", "✗ " + e.message);
+  }
+}
+
+async function doSaveToProjectRecordOnly() {
+  if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  if (emailItem?.hasAttachments) {
+    setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint + Project Record' instead.");
+    return;
+  }
+  const msgId = getCurrentMessageRestId();
+  if (findSavedEmailRecord(selectedProject, msgId)) {
+    refreshEmailSavedIndicator();
+    return;
+  }
+
+  setStatus("actionStatus", "info", "⏳ Saving to project record…");
+  try {
+    const from = emailItem.from;
+    const emailRecord = {
+      id: uid(), msgId,
+      subject: emailItem.subject || "",
+      from: from?.displayName || "",
+      fromAddress: from?.emailAddress || "",
+      date: emailItem.dateTimeCreated,
+      bodyText: "",
+      spFolderUrl: "",
+      savedAt: new Date().toISOString(),
+      savedToSharePoint: false,
+    };
+    const updatedProject = { ...selectedProject, emails: [...(selectedProject.emails || []), emailRecord] };
+    updateProjectInList(updatedProject);
+    selectedProject = updatedProject;
+    await saveToSupabase(allProjects);
+    setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
+    refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
   }
