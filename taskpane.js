@@ -422,27 +422,101 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
 
   if (!emailItem.hasAttachments) return 0;
   try {
+    let count = 0;
+    // Prefer Outlook item APIs for attachment bytes; this is the most reliable in add-ins.
+    const officeAtts = await getOfficeFileAttachments();
+    if (officeAtts.length) {
+      for (const att of officeAtts) {
+        const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes);
+        if (uploaded) count++;
+      }
+      return count;
+    }
+
+    // Fallback to Graph attachment APIs when Office APIs are unavailable.
     const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
-    let count = 0;
     for (const att of (attData?.value || [])) {
-      if (!att.contentBytes) continue;
-      const binary = atob(att.contentBytes);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const safeName = (att.name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim();
-      await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
-        method: "PUT",
-        headers: { "Authorization": "Bearer " + token, "Content-Type": att.contentType || "application/octet-stream" },
-        body: bytes,
-      });
-      count++;
+      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+
+      let bytes = null;
+      if (att.contentBytes) {
+        const binary = atob(att.contentBytes);
+        bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      } else if (att.id) {
+        const rawRes = await fetch(
+          "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
+          { headers: { "Authorization": "Bearer " + token } }
+        );
+        if (!rawRes.ok) {
+          console.warn("Attachment download failed:", att.name, rawRes.status);
+          continue;
+        }
+        bytes = new Uint8Array(await rawRes.arrayBuffer());
+      }
+      if (!bytes) continue;
+      const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
+      if (uploaded) count++;
     }
     return count;
   } catch (e) {
     console.warn("Attachment upload failed:", e.message);
     return 0;
   }
+}
+
+function toBytesFromBase64(base64) {
+  const binary = atob(base64 || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function getOfficeFileAttachments() {
+  if (!emailItem?.getAttachmentsAsync || !emailItem?.getAttachmentContentAsync) return [];
+
+  const atts = await new Promise((resolve, reject) => {
+    emailItem.getAttachmentsAsync((res) => {
+      if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
+      else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
+    });
+  });
+
+  const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
+  const out = [];
+  for (const att of fileAtts) {
+    const content = await new Promise((resolve, reject) => {
+      emailItem.getAttachmentContentAsync(att.id, (res) => {
+        if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
+        else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
+      });
+    }).catch((e) => {
+      console.warn("Office attachment content failed:", att.name, e.message);
+      return null;
+    });
+    if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
+    out.push({
+      name: att.name || "attachment",
+      contentType: att.contentType || "application/octet-stream",
+      bytes: toBytesFromBase64(content.content),
+    });
+  }
+  return out;
+}
+
+async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
+  const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
+  const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeURIComponent(targetPath) + "/" + encodeURIComponent(safeName) + ":/content", {
+    method: "PUT",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": contentType || "application/octet-stream" },
+    body: bytes,
+  });
+  if (!uploadRes.ok) {
+    console.warn("Attachment upload failed:", safeName, uploadRes.status);
+    return false;
+  }
+  return true;
 }
 
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
