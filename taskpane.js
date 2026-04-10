@@ -17,6 +17,7 @@ const GRAPH_SCOPES = [
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
+const PMS_PROJECT_BASE_URL = "https://settypms.com/projects/";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
 
