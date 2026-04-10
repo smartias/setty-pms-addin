@@ -18,7 +18,7 @@ const GRAPH_SCOPES = [
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const PMS_PROJECT_BASE_URL = "https://settypms.com/projects/";
-const PMS_DASHBOARD_URL = "https://settypms.com/dashboard";
+const PMS_DASHBOARD_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#dashboard";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
 
@@ -1132,17 +1132,30 @@ function openSelectedProjectInPms() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   const url = projectPmsUrl(selectedProject);
   if (!url) { setStatus("actionStatus", "error", "No PMS URL is available for this project."); return; }
-  window.open(url, "_blank");
+  openExternalUrl(url);
 }
 
 function openSelectedProjectSpFolder() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
-  window.open(selectedProject.projectFolderUrl, "_blank");
+  openExternalUrl(selectedProject.projectFolderUrl);
 }
 
 function openPmsDashboard() {
-  window.open(PMS_DASHBOARD_URL, "_blank");
+  openExternalUrl(PMS_DASHBOARD_URL);
+}
+
+function openExternalUrl(url) {
+  if (!url) return;
+  try {
+    if (Office?.context?.ui?.openBrowserWindow) {
+      Office.context.ui.openBrowserWindow(url);
+      return;
+    }
+  } catch (e) {
+    console.warn("openBrowserWindow failed, falling back to window.open:", e);
+  }
+  window.open(url, "_blank");
 }
 
 function parseSignature(html, fromName, fromEmail) {
