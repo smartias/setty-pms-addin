@@ -17,7 +17,7 @@ const GRAPH_SCOPES = [
 ];
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
-const PMS_PROJECT_BASE_URL = "https://settypms.com/projects/";
+const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS/projects/";
 const PMS_DASHBOARD_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#dashboard";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
@@ -1173,7 +1173,12 @@ async function doExtractContact() {
 
 function projectPmsUrl(project) {
   if (!project) return "";
-  if (project.pmsUrl) return project.pmsUrl;
+  if (project.pmsUrl) {
+    // Normalize legacy links to the current hosted PMS path.
+    return project.pmsUrl
+      .replace("https://settypms.com/projects/", PMS_PROJECT_BASE_URL)
+      .replace("https://settypms.com/", "https://smartias.github.io/setty-pms/SettyPMS/");
+  }
   if (project.slug) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.slug);
   if (project.id) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.id);
   return "";
