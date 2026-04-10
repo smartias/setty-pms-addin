@@ -18,6 +18,7 @@ const GRAPH_SCOPES = [
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const PMS_PROJECT_BASE_URL = "https://settypms.com/projects/";
+const PMS_DASHBOARD_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#dashboard";
 const SP_SITE      = "setty.sharepoint.com:/sites/NYCProjects:";
 const SP_LIBRARY   = "Project Document Library";
 
@@ -97,9 +98,7 @@ function setupEventListeners() {
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
-  document.getElementById("newProjectBtn").onclick = () => showView("projectCreateView");
-  document.getElementById("projectCreateBack").onclick = () => showView("mainView");
-  document.getElementById("createProjectSaveBtn").onclick = doCreateProject;
+  document.getElementById("openDashboardBtn").onclick = openPmsDashboard;
 
   // RFI mode toggles
   document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
@@ -1192,51 +1191,30 @@ function openSelectedProjectInPms() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   const url = projectPmsUrl(selectedProject);
   if (!url) { setStatus("actionStatus", "error", "No PMS URL is available for this project."); return; }
-  window.open(url, "_blank");
+  openExternalUrl(url);
 }
 
 function openSelectedProjectSpFolder() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
-  window.open(selectedProject.projectFolderUrl, "_blank");
+  openExternalUrl(selectedProject.projectFolderUrl);
 }
 
-async function doCreateProject() {
-  const projectNumber = document.getElementById("newProjectNumber").value.trim();
-  const name = document.getElementById("newProjectName").value.trim();
-  const projectFolderUrl = document.getElementById("newProjectFolder").value.trim();
-  const pmsUrl = document.getElementById("newProjectPmsUrl").value.trim();
-  if (!name) { setStatus("createProjectStatus", "error", "Project name is required."); return; }
+function openPmsDashboard() {
+  openExternalUrl(PMS_DASHBOARD_URL);
+}
 
-  setStatus("createProjectStatus", "info", "⏳ Creating project…");
+function openExternalUrl(url) {
+  if (!url) return;
   try {
-    const newProject = {
-      id: uid(),
-      projectNumber,
-      name,
-      projectFolderUrl,
-      pmsUrl: pmsUrl || "",
-      archived: false,
-      createdAt: new Date().toISOString(),
-      emails: [],
-      notes: [],
-      rfis: [],
-      submittals: [],
-      milestones: [],
-    };
-    const updatedProjects = [...allProjects, newProject];
-    await saveToSupabase(updatedProjects);
-    allProjects = updatedProjects;
-    setSelectedProject(newProject, true);
-    document.getElementById("newProjectNumber").value = "";
-    document.getElementById("newProjectName").value = "";
-    document.getElementById("newProjectFolder").value = "";
-    document.getElementById("newProjectPmsUrl").value = "";
-    updateProjectQuickLinks();
-    setStatus("createProjectStatus", "success", "✓ Project created and selected.");
+    if (Office?.context?.ui?.openBrowserWindow) {
+      Office.context.ui.openBrowserWindow(url);
+      return;
+    }
   } catch (e) {
-    setStatus("createProjectStatus", "error", "✗ " + e.message);
+    console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
+  window.open(url, "_blank");
 }
 
 function parseSignature(html, fromName, fromEmail) {
@@ -1355,7 +1333,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView","projectCreateView"].forEach(v => {
+  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
