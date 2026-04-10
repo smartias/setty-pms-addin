@@ -1092,9 +1092,9 @@ async function doExtractContact() {
 
 function projectPmsUrl(project) {
   if (!project) return "";
-  if (project.pmsUrl) return project.pmsUrl;
-  if (project.slug) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.slug);
-  if (project.id) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.id);
+  const raw = project.pmsUrl || project.pmsProjectUrl || project.projectUrl || "";
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
   return "";
 }
 
@@ -1109,7 +1109,7 @@ function updateProjectQuickLinks() {
 function openSelectedProjectInPms() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   const url = projectPmsUrl(selectedProject);
-  if (!url) { setStatus("actionStatus", "error", "No PMS URL is available for this project."); return; }
+  if (!url) { setStatus("actionStatus", "error", "No valid PMS URL is set on this project. Add one in 'Add New Project' (or in PMS data) first."); return; }
   window.open(url, "_blank");
 }
 
