@@ -45,6 +45,56 @@ These can be simple SETTY logo PNGs. The add-in will work without them but Outlo
 2. Select `manifest.xml`
 3. Appears immediately in your Outlook only
 
+### 5. Supabase setup for shared thread tagging (required for cross-user chain tags)
+To allow project tags to follow an email conversation across different Outlook accounts, create a small mapping table in Supabase.
+
+Run this SQL in the Supabase SQL editor:
+
+```sql
+create table if not exists public.pms_email_thread_tags (
+  conversation_id text primary key,
+  project_id text not null,
+  tagged_by text,
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_pms_email_thread_tags_project_id
+  on public.pms_email_thread_tags (project_id);
+```
+
+If Row Level Security (RLS) is enabled for your project, make sure your existing add-in role can `select` and `insert`/`upsert` on this table (the add-in uses Supabase REST with the same anon key already configured in `taskpane.js`).
+
+Example RLS policy setup (for current add-in architecture using the anon key from the client):
+
+```sql
+alter table public.pms_email_thread_tags enable row level security;
+
+drop policy if exists pms_email_thread_tags_select_anon on public.pms_email_thread_tags;
+create policy pms_email_thread_tags_select_anon
+on public.pms_email_thread_tags
+for select
+to anon
+using (true);
+
+drop policy if exists pms_email_thread_tags_insert_anon on public.pms_email_thread_tags;
+create policy pms_email_thread_tags_insert_anon
+on public.pms_email_thread_tags
+for insert
+to anon
+with check (true);
+
+drop policy if exists pms_email_thread_tags_update_anon on public.pms_email_thread_tags;
+create policy pms_email_thread_tags_update_anon
+on public.pms_email_thread_tags
+for update
+to anon
+using (true)
+with check (true);
+```
+
+> Security note: this mirrors the current front-end-only model already used by this add-in. If you later move Supabase writes behind a server/edge function, tighten these policies accordingly.
+
 ---
 
 ## How It Works
