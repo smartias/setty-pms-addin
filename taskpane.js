@@ -34,6 +34,7 @@ let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
 let currentItemKind = "message"; // message | appointment
 let lastAttachmentUploadStats = null;
+let currentConversationId = "";
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -41,6 +42,8 @@ const SP_DRIVE_ID_HARDCODED = "b!ZARYqukTtE6K1Mpv9bngAehneskb-yNKopp1Ol1X1BBnJPK
 let _spIds = { siteId: SP_SITE_ID_HARDCODED, driveId: SP_DRIVE_ID_HARDCODED };
 const LAST_ACCOUNT_STORAGE_KEY = "settyPms:lastMsalAccountHomeId";
 const EMAIL_PROJECT_MAP_STORAGE_KEY = "settyPms:emailProjectMap";
+const EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY = "settyPms:conversationProjectMap";
+const EMAIL_THREAD_TAGS_TABLE = "pms_email_thread_tags";
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
   if (info.host !== Office.HostType.Outlook) {
@@ -180,6 +183,7 @@ function buildMeetingNoteBody(item) {
 
 function loadItemContext() {
   emailItem = Office.context.mailbox.item;
+  currentConversationId = "";
   if (!emailItem) return;
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
   document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
@@ -235,7 +239,7 @@ function loadItemContext() {
     // Pre-fill RFI from
     document.getElementById("rfiFrom").value = emailFrom;
     document.getElementById("subFrom").value = emailFrom;
-    restoreProjectSelectionForCurrentEmail();
+    void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
   }
 }
@@ -246,6 +250,18 @@ function getCurrentMessageRestId() {
 function getCurrentMessageRecordId() {
   // Prefer Graph REST id, but fall back so dedupe logic doesn't collapse to empty-string matches.
   return getCurrentMessageRestId() || emailItem?.internetMessageId || emailItem?.itemId || "";
+}
+async function getCurrentConversationId() {
+  if (currentConversationId) return currentConversationId;
+  try {
+    const restId = getCurrentMessageRestId();
+    if (!restId) return "";
+    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=conversationId", null);
+    currentConversationId = data?.conversationId || "";
+    return currentConversationId;
+  } catch {
+    return "";
+  }
 }
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
@@ -297,7 +313,7 @@ async function doSignOut() {
 async function onSignedIn() {
   showView("mainView");
   await loadProjects();
-  restoreProjectSelectionForCurrentEmail();
+  await restoreProjectSelectionForCurrentEmail();
   updateProjectQuickLinks();
 }
 async function getToken() {
@@ -350,6 +366,56 @@ function getEmailProjectMap() {
     return {};
   }
 }
+function getConversationProjectMap() {
+  try {
+    return JSON.parse(localStorage.getItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+function saveConversationProjectMap(map) {
+  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map || {}));
+}
+async function saveSharedConversationProjectTag(conversationId, projectId) {
+  if (!conversationId || !projectId) return;
+  const payload = {
+    conversation_id: conversationId,
+    project_id: projectId,
+    tagged_by: msalAccount?.username || msalAccount?.name || "unknown",
+    updated_at: new Date().toISOString(),
+  };
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_THREAD_TAGS_TABLE + "?on_conflict=conversation_id";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { ...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("Shared conversation tag save failed:", res.status, errText);
+    }
+  } catch (e) {
+    console.warn("Shared conversation tag save failed:", e);
+  }
+}
+async function getSharedConversationProjectId(conversationId) {
+  if (!conversationId) return "";
+  const url =
+    SUPABASE_URL +
+    "/rest/v1/" +
+    EMAIL_THREAD_TAGS_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&select=project_id&limit=1";
+  try {
+    const res = await fetch(url, { headers: SB_HEADERS });
+    if (!res.ok) return "";
+    const rows = await res.json();
+    return rows?.[0]?.project_id || "";
+  } catch {
+    return "";
+  }
+}
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
@@ -369,15 +435,40 @@ function setSelectedProject(project, persistForEmail = false) {
       map[msgId] = selectedProject.id;
       localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
     }
+    void (async () => {
+      const conversationId = await getCurrentConversationId();
+      if (!conversationId) return;
+      const convoMap = getConversationProjectMap();
+      convoMap[conversationId] = selectedProject.id;
+      saveConversationProjectMap(convoMap);
+      await saveSharedConversationProjectTag(conversationId, selectedProject.id);
+    })();
   }
   updateProjectQuickLinks();
   refreshEmailSavedIndicator();
 }
-function restoreProjectSelectionForCurrentEmail() {
+async function restoreProjectSelectionForCurrentEmail() {
   const msgId = getCurrentMessageRestId();
-  if (!msgId || !allProjects.length) return;
-  const map = getEmailProjectMap();
-  const projectId = map[msgId];
+  if (!allProjects.length) return;
+  let projectId = "";
+  if (msgId) {
+    const map = getEmailProjectMap();
+    projectId = map[msgId] || "";
+  }
+  if (!projectId) {
+    const conversationId = await getCurrentConversationId();
+    if (conversationId) {
+      const convoMap = getConversationProjectMap();
+      projectId = convoMap[conversationId] || "";
+      if (!projectId) {
+        projectId = await getSharedConversationProjectId(conversationId);
+        if (projectId) {
+          convoMap[conversationId] = projectId;
+          saveConversationProjectMap(convoMap);
+        }
+      }
+    }
+  }
   if (!projectId) return;
   const project = allProjects.find(p => p.id === projectId);
   if (project) setSelectedProject(project, false);
