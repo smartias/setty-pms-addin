@@ -386,18 +386,18 @@ async function saveSharedConversationProjectTag(conversationId, projectId) {
   };
   const url = SUPABASE_URL + "/rest/v1/" + EMAIL_THREAD_TAGS_TABLE + "?on_conflict=conversation_id";
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { ...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn("Shared conversation tag save failed:", res.status, errText);
-    }
-  } catch (e) {
-    console.warn("Shared conversation tag save failed:", e);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { ...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.warn("Shared conversation tag save failed:", res.status, errText);
   }
+} catch (e) {
+  console.warn("Shared conversation tag save failed:", e);
+}
 }
 async function getSharedConversationProjectId(conversationId) {
   if (!conversationId) return "";
