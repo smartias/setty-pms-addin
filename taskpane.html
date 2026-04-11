@@ -248,7 +248,7 @@
     </div>
   </div>
   <p style="color:#94a3b8;font-size:12px;margin-bottom:16px;line-height:1.6;">
-    Sign in with your Setty Microsoft 365 account to file emails, log notes, RFIs, and submittals.
+    Sign in with your Setty Microsoft 365 account to file emails/calendar items, log notes, RFIs, and submittals.
   </p>
   <button class="btn btn-primary" id="signInBtn">🔐 Sign in with Microsoft</button>
   <div id="signInStatus" class="status-msg"></div>
@@ -423,9 +423,9 @@
 <!-- People View -->
 <div id="peopleView">
   <button class="back-btn" id="peopleBack">← Back</button>
-  <div class="section-title">Email Participants</div>
+  <div class="section-title">Participants</div>
   <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
-    Select a participant to add them to Clients or a Project POC.
+    Select a participant to add them to Clients or a Project POC. Duplicate contacts are skipped automatically.
   </p>
   <div id="participantList"></div>
 </div>
@@ -435,7 +435,7 @@
   <button class="back-btn" id="contactBack">← Back</button>
   <div class="section-title">Extracted Contact</div>
   <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
-    Parsed from email signature. Review and edit before saving.
+    Parsed from email signature when available. Review and edit before saving.
   </p>
   <label>Name</label>
   <input type="text" id="contactName"/>
