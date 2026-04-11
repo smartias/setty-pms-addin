@@ -44,6 +44,7 @@ const LAST_ACCOUNT_STORAGE_KEY = "settyPms:lastMsalAccountHomeId";
 const EMAIL_PROJECT_MAP_STORAGE_KEY = "settyPms:emailProjectMap";
 const EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY = "settyPms:conversationProjectMap";
 const EMAIL_THREAD_TAGS_TABLE = "pms_email_thread_tags";
+const PROJECT_EMAILS_TABLE = "pms_project_emails";
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
   if (info.host !== Office.HostType.Outlook) {
@@ -356,6 +357,35 @@ async function saveToSupabase(updatedProjects) {
     body: JSON.stringify({ projects: updatedProjects, updated_at: new Date().toISOString() }),
   });
 }
+async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
+  if (!projectId || !emailRecord?.msgId) return;
+  const row = {
+    record_id: emailRecord.id,
+    project_id: projectId,
+    msg_id: emailRecord.msgId,
+    conversation_id: currentConversationId || null,
+    subject: emailRecord.subject || "",
+    from_name: emailRecord.from || "",
+    from_address: emailRecord.fromAddress || "",
+    email_date: emailRecord.date || null,
+    saved_at: emailRecord.savedAt || new Date().toISOString(),
+    sp_folder_url: emailRecord.spFolderUrl || "",
+    saved_to_sharepoint: !!savedToSharePoint,
+  };
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE, {
+      method: "POST",
+      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+      body: JSON.stringify(row),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("Normalized email row save failed:", res.status, errText);
+    }
+  } catch (e) {
+    console.warn("Normalized email row save failed:", e);
+  }
+}
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
 }
@@ -386,18 +416,18 @@ async function saveSharedConversationProjectTag(conversationId, projectId) {
   };
   const url = SUPABASE_URL + "/rest/v1/" + EMAIL_THREAD_TAGS_TABLE + "?on_conflict=conversation_id";
   try {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { ...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    console.warn("Shared conversation tag save failed:", res.status, errText);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { ...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("Shared conversation tag save failed:", res.status, errText);
+    }
+  } catch (e) {
+    console.warn("Shared conversation tag save failed:", e);
   }
-} catch (e) {
-  console.warn("Shared conversation tag save failed:", e);
-}
 }
 async function getSharedConversationProjectId(conversationId) {
   if (!conversationId) return "";
@@ -699,6 +729,7 @@ if (existingRecord) {
     updateProjectInList(updatedProject);
     selectedProject = updatedProject;
     await saveToSupabase(allProjects);
+    await saveProjectEmailRow(selectedProject.id, emailRecord, true);
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     const attempted = lastAttachmentUploadStats?.attempted || 0;
     if (attempted > 0 && attCount === 0) {
@@ -743,6 +774,7 @@ async function doSaveToProjectRecordOnly() {
     updateProjectInList(updatedProject);
     selectedProject = updatedProject;
     await saveToSupabase(allProjects);
+    await saveProjectEmailRow(selectedProject.id, emailRecord, false);
     setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
     refreshEmailSavedIndicator();
   } catch (e) {

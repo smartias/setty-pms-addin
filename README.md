@@ -95,6 +95,34 @@ with check (true);
 
 > Security note: this mirrors the current front-end-only model already used by this add-in. If you later move Supabase writes behind a server/edge function, tighten these policies accordingly.
 
+### 6. Supabase setup for high-scale email indexing (recommended)
+The add-in still writes to `projects[].emails` for backward compatibility, but now also supports writing each saved email into a normalized table for scale analytics and future PMS read cutover.
+
+```sql
+create table if not exists public.pms_project_emails (
+  record_id text primary key,
+  project_id text not null,
+  msg_id text not null,
+  conversation_id text,
+  subject text not null default '',
+  from_name text not null default '',
+  from_address text not null default '',
+  email_date timestamptz,
+  saved_at timestamptz not null default now(),
+  sp_folder_url text not null default '',
+  saved_to_sharepoint boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_pms_project_emails_project_id
+  on public.pms_project_emails (project_id);
+
+create index if not exists idx_pms_project_emails_msg_id
+  on public.pms_project_emails (msg_id);
+```
+
+If RLS is enabled, allow at least `insert` for the add-in role (and `select` if you plan to read from this table in PMS soon).
+
 ---
 
 ## How It Works
