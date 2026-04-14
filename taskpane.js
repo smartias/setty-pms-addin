@@ -811,10 +811,11 @@ async function doSaveNote() {
   }
 }
 // ─── SHARED: file email+attachments into a project subfolder ─────────────────
-async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName) {
+async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null) {
   const subPath    = await ensureSpFolder(driveId, token, projFolderName, subfolder);
   const recordPath = await ensureSpFolder(driveId, token, subPath, recordFolderName);
   await uploadEmailAndAttachments(driveId, token, recordPath);
+  if (metadata) await writeSpMetadataSidecar(driveId, token, recordPath, metadata);
   return SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
 }
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
@@ -866,7 +867,7 @@ async function doSaveRfi() {
         const { driveId } = await resolveSpIds();
         const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName);
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(selectedProject, "rfi"));
       } catch (e) { console.warn("RFI SP upload failed:", e.message); }
     }
     const rfi = {
@@ -947,7 +948,7 @@ async function doSaveSub() {
         const { driveId } = await resolveSpIds();
         const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName);
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(selectedProject, "submittal"));
       } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
     }
     const sub = {
