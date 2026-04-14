@@ -64,6 +64,12 @@ Office.onReady(async (info) => {
       showView("signInView");
     }
     setupEventListeners();
+    // When the task pane is pinned, Office swaps mailbox.item silently as the user
+    // clicks different emails. ItemChanged fires each time — reload the pane context.
+    Office.context.mailbox.addHandlerAsync(
+      Office.EventType.ItemChanged,
+      () => { showView("mainView"); loadItemContext(); }
+    );
     loadItemContext();
   } catch (e) {
     // Show something rather than a black screen if init fails
