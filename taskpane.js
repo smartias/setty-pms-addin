@@ -13,8 +13,10 @@ const GRAPH_SCOPES = [
   "Mail.Read",
   "Files.ReadWrite.All",
   "Calendars.ReadWrite.Shared",
+  "Notes.ReadWrite.All",  // needed for OneNote page creation from meeting notes
   // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
+const TEAMS_TEAM_ID = "a4c48361-7991-43db-af83-4c854918a760";
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
@@ -246,6 +248,9 @@ function loadItemContext() {
     // Pre-fill RFI from
     document.getElementById("rfiFrom").value = emailFrom;
     document.getElementById("subFrom").value = emailFrom;
+    // Clear any previously selected project immediately — restoreProjectSelection
+    // will re-populate it if this email/conversation has a saved tag.
+    setSelectedProject(null, false);
     void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
   }
@@ -789,28 +794,116 @@ async function doSaveToProjectRecordOnly() {
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
+function buildAddinMeetingPageHtml(title, category, dateStr, participants, body) {
+  const th = "padding:6px 12px;font-weight:bold;background:#f0f0f0;text-align:left;width:130px";
+  const td = "padding:6px 12px";
+  const dateFmt = dateStr ? new Date(dateStr).toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric", year: "numeric"
+  }) : "";
+  const attendeeStr = (participants || [])
+    .map(p => (p.displayName || p.emailAddress) + (p.label ? " (" + p.label + ")" : ""))
+    .join(", ");
+  return "<h1>" + title + "</h1>"
+    + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
+    + (dateFmt    ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
+    + "<tr><td style='" + th + "'>Type</td><td style='" + td + "'>" + category + "</td></tr>"
+    + (attendeeStr ? "<tr><td style='" + th + "'>Attendees</td><td style='" + td + "'>" + attendeeStr + "</td></tr>" : "")
+    + (body        ? "<tr><td style='" + th + "'>Notes</td><td style='" + td + "'><pre style='font-family:inherit;white-space:pre-wrap'>" + body + "</pre></td></tr>" : "")
+    + "</table>"
+    + "<h2>Discussion</h2><p>&nbsp;</p>"
+    + "<h2>Decisions</h2><p>&nbsp;</p>"
+    + "<h2>Action Items</h2>"
+    + "<table style='border-collapse:collapse;width:100%'>"
+    + "<tr style='background:#f0f0f0'><th style='" + td + ";text-align:left'>Item</th><th style='" + td + ";text-align:left'>Owner</th><th style='" + td + ";text-align:left'>Due</th></tr>"
+    + "<tr><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td></tr>"
+    + "</table>";
+}
+
+async function createAddinOneNotePage(project, title, body, category, dateStr) {
+  const useTeams  = !!project.teamsOneNoteNotebookId;
+  const notebookId = project.teamsOneNoteNotebookId || project.oneNoteNotebookId;
+  const baseUrl   = useTeams
+    ? `/groups/${TEAMS_TEAM_ID}/onenote`
+    : `/sites/${SP_SITE_ID_HARDCODED}/onenote`;
+  const sectionName = { Meeting: "Meetings", "Site Visit": "Site Visits", "Client Communication": "Client Communications" }[category] || "Notes";
+
+  // Find or create the section
+  const sectionsResp = await graphFetch("GET", `${baseUrl}/notebooks/${notebookId}/sections`);
+  let section = (sectionsResp?.value || []).find(s => s.displayName === sectionName);
+  if (!section) {
+    section = await graphFetch("POST", `${baseUrl}/notebooks/${notebookId}/sections`, { displayName: sectionName });
+    if (!section?.id) {
+      const refetch = await graphFetch("GET", `${baseUrl}/notebooks/${notebookId}/sections`);
+      section = (refetch?.value || []).find(s => s.displayName === sectionName);
+    }
+  }
+  if (!section?.id) throw new Error("Could not find or create OneNote section: " + sectionName);
+
+  // Metadata badge header (matches SettyPMS style so pages look consistent)
+  const badge = [
+    project.projectNumber && `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${project.projectNumber}</span>`,
+    category              && `<span style="background:#e8edf2;color:#003865;padding:2px 8px;border-radius:3px;font-size:11px">${category}</span>`,
+  ].filter(Boolean).join("");
+  const header = `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">${badge}</div>`;
+  const pageHtml = `<!DOCTYPE html><html><head><title>${title}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)}</body></html>`;
+
+  // OneNote pages require text/html — can't use graphFetch() which always sends JSON
+  const token = await getToken();
+  const endpoint = useTeams
+    ? `https://graph.microsoft.com/v1.0/groups/${TEAMS_TEAM_ID}/onenote/sections/${section.id}/pages`
+    : `https://graph.microsoft.com/v1.0/sites/${SP_SITE_ID_HARDCODED}/onenote/sections/${section.id}/pages`;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+    body: pageHtml,
+  });
+  if (!res.ok) throw new Error("OneNote " + res.status + ": " + (await res.text()).slice(0, 200));
+  const page = await res.json();
+  return { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
+}
+
 async function doSaveNote() {
   if (!selectedProject) { setStatus("noteStatus", "error", "No project selected."); return; }
   const category = document.getElementById("noteCategory").value;
   const body = document.getElementById("noteBody").value.trim();
   if (!body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
+
+  // Attempt OneNote page creation for meeting-type notes if a notebook is linked
+  let oneNoteUrl = "";
+  const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
+  if (notebookId && ["Meeting", "Site Visit", "Client Communication"].includes(category)) {
+    setStatus("noteStatus", "info", "⏳ Creating OneNote page…");
+    try {
+      const title = emailItem?.subject || body.split("\n")[0].slice(0, 80) || category;
+      const dateStr = currentItemKind === "appointment"
+        ? new Date(emailItem?.start || Date.now()).toISOString()
+        : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
+      const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr);
+      oneNoteUrl = page.webUrl || "";
+    } catch (e) {
+      console.warn("OneNote page creation failed (non-fatal):", e.message);
+    }
+  }
+
   setStatus("noteStatus", "info", "⏳ Saving…");
   try {
     const note = {
-      id: uid(),
-      body,
-      category,
-      actionItem: false,
+      id: uid(), body, category, actionItem: false,
       author: msalAccount?.name || msalAccount?.username || "Unknown",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       importedFromEmail: true, links: [],
+      ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
     const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
     updateProjectInList(updated);
     selectedProject = updated;
     await saveToSupabase(allProjects);
-    setStatus("noteStatus", "success", "✓ Note saved to " + selectedProject.name);
+    setStatus("noteStatus", "success", "✓ Note saved" + (oneNoteUrl ? " · OneNote page created" : ""));
+    // setStatus uses textContent so the link lives in a separate element
+    const linkEl = document.getElementById("noteOneNoteLink");
+    if (linkEl) linkEl.innerHTML = oneNoteUrl
+      ? `<a href="${oneNoteUrl}" target="_blank" style="font-size:12px">📓 Open in OneNote</a>`
+      : "";
     document.getElementById("noteBody").value = "";
   } catch (e) {
     setStatus("noteStatus", "error", "✗ " + e.message);
