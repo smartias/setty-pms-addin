@@ -711,6 +711,7 @@ if (existingRecord) {
     const emailFolderName = d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0") + "_" + String(d.getDate()).padStart(2, "0") + " " + safeSubject;
     const emailsPath  = await ensureSpFolder(driveId, token, projFolderName, "Emails");
     const targetPath  = await ensureSpFolder(driveId, token, emailsPath, emailFolderName);
+    await writeSpMetadataSidecar(driveId, token, targetPath, buildAddinMetadata(selectedProject, "correspondence"));
     const attCount    = await uploadEmailAndAttachments(driveId, token, targetPath);
     const from = emailItem.from;
     const spFolderUrl = SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/Emails/" + encodeURIComponent(emailFolderName);
@@ -721,7 +722,7 @@ if (existingRecord) {
       from: from?.displayName || "",
       fromAddress: from?.emailAddress || "",
       date: emailItem.dateTimeCreated,
-      bodyText: "", spFolderUrl,
+      bodyText: "", spFolderUrl, links: [],
       savedAt: new Date().toISOString(),
     };
     const updatedEmails = [...(selectedProject.emails || []), emailRecord];
@@ -766,7 +767,7 @@ async function doSaveToProjectRecordOnly() {
       fromAddress: from?.emailAddress || "",
       date: emailItem.dateTimeCreated,
       bodyText: "",
-      spFolderUrl: "",
+      spFolderUrl: "", links: [],
       savedAt: new Date().toISOString(),
       savedToSharePoint: false,
     };
@@ -797,7 +798,7 @@ async function doSaveNote() {
       author: msalAccount?.name || msalAccount?.username || "Unknown",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      importedFromEmail: true,
+      importedFromEmail: true, links: [],
     };
     const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
     updateProjectInList(updated);
@@ -876,7 +877,7 @@ async function doSaveRfi() {
       dueDate: addBizDays(received, 5),
       status: "Open",
       notes: document.getElementById("rfiNotes").value.trim(),
-      assignedTo: [], spFolderUrl,
+      assignedTo: [], spFolderUrl, links: [],
       createdAt: new Date().toISOString(),
     };
     const updated = { ...selectedProject, rfis: [...existingRfis, rfi] };
@@ -959,7 +960,7 @@ async function doSaveSub() {
       dueDate: addBizDays(received, 10),
       status: "Received",
       notes: document.getElementById("subNotes").value.trim(),
-      assignedTo: [], spFolderUrl,
+      assignedTo: [], spFolderUrl, links: [],
       createdAt: new Date().toISOString(),
     };
     const updated = { ...selectedProject, submittals: [...existing, sub] };
@@ -1426,6 +1427,32 @@ async function doSaveContact() {
     setStatus("contactStatus", "error", "✗ " + e.message);
   }
 }
+// ─── PMS METADATA HELPERS (mirrors SettyPMS.html metadata schema) ─────────────
+function buildAddinMetadata(project, docType) {
+  return {
+    projectNumber: project.projectNumber || "",
+    projectName:   project.name          || "",
+    client:        project.prime || project.clientName || "",
+    docType,
+    date:          new Date().toISOString().slice(0, 10),
+    createdBy:     msalAccount?.name || msalAccount?.username || "Unknown",
+    source:        "outlook-addin",
+    phase:         "",
+    tags:          [],
+    _schema:       "pms-v1",
+  };
+}
+// Non-fatal — sidecar failure never blocks the primary save
+async function writeSpMetadataSidecar(driveId, token, folderPath, metadata) {
+  try {
+    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(folderPath + "/_pms-metadata.json") + ":/content", {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(metadata, null, 2),
+    });
+  } catch (e) { console.warn("PMS metadata sidecar:", e.message); }
+}
+
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function uid() {
   return "addin-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
