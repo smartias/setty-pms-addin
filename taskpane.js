@@ -13,7 +13,7 @@ const GRAPH_SCOPES = [
   "Mail.Read",
   "Files.ReadWrite.All",
   "Calendars.ReadWrite.Shared",
-  "Notes.ReadWrite.All",  // needed for OneNote page creation from meeting notes
+  "Notes.ReadWrite",      // needed for OneNote page creation — no admin consent required
   // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
 const TEAMS_TEAM_ID = "a4c48361-7991-43db-af83-4c854918a760";
@@ -820,11 +820,10 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
 }
 
 async function createAddinOneNotePage(project, title, body, category, dateStr) {
-  const useTeams  = !!project.teamsOneNoteNotebookId;
   const notebookId = project.teamsOneNoteNotebookId || project.oneNoteNotebookId;
-  const baseUrl   = useTeams
-    ? `/groups/${TEAMS_TEAM_ID}/onenote`
-    : `/sites/${SP_SITE_ID_HARDCODED}/onenote`;
+  // Use /me/onenote — works for group and SharePoint notebooks the user has access to,
+  // and only requires Notes.ReadWrite (no admin consent) instead of Notes.ReadWrite.All.
+  const baseUrl    = `/me/onenote`;
   const sectionName = { Meeting: "Meetings", "Site Visit": "Site Visits", "Client Communication": "Client Communications" }[category] || "Notes";
 
   // Find or create the section
@@ -849,10 +848,7 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
 
   // OneNote pages require text/html — can't use graphFetch() which always sends JSON
   const token = await getToken();
-  const endpoint = useTeams
-    ? `https://graph.microsoft.com/v1.0/groups/${TEAMS_TEAM_ID}/onenote/sections/${section.id}/pages`
-    : `https://graph.microsoft.com/v1.0/sites/${SP_SITE_ID_HARDCODED}/onenote/sections/${section.id}/pages`;
-  const res = await fetch(endpoint, {
+  const res = await fetch(`https://graph.microsoft.com/v1.0/me/onenote/sections/${section.id}/pages`, {
     method: "POST",
     headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
     body: pageHtml,
