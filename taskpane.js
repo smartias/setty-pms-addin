@@ -163,25 +163,29 @@ function getAppointmentDateLabel(item) {
   });
 }
 function buildMeetingNoteBody(item) {
+  // In compose mode (organizer editing their own meeting), properties like subject,
+  // start, attendees are async objects — read them defensively and skip if not plain values.
+  const isComposeMode = typeof item?.subject !== "string";
   const lines = [];
-  lines.push(item?.subject || "(No subject)");
+  lines.push(isComposeMode ? "" : (item?.subject || "(No subject)"));
   lines.push("");
   lines.push("Meeting details:");
-  if (item?.location) lines.push("Location: " + item.location);
-  if (item?.start) lines.push("Start: " + new Date(item.start).toLocaleString("en-US"));
-  if (item?.end) lines.push("End: " + new Date(item.end).toLocaleString("en-US"));
-  const organizer = item?.organizer;
-  if (organizer?.displayName || organizer?.emailAddress) {
-    lines.push("Organizer: " + (organizer.displayName || organizer.emailAddress));
-  }
-  const attendees = dedupeParticipants([
-    ...(item?.requiredAttendees || []).map(a => ({ displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
-    ...(item?.optionalAttendees || []).map(a => ({ displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
-  ]);
-  if (attendees.length) {
-    lines.push("");
-    lines.push("Attendees:");
-    attendees.forEach(a => lines.push("- " + (a.displayName || a.emailAddress) + (a.emailAddress ? " <" + a.emailAddress + ">" : "")));
+  if (!isComposeMode) {
+    if (item?.location && typeof item.location === "string") lines.push("Location: " + item.location);
+    if (item?.start && !(item.start?.getAsync)) lines.push("Start: " + new Date(item.start).toLocaleString("en-US"));
+    if (item?.end   && !(item.end?.getAsync))   lines.push("End: "   + new Date(item.end).toLocaleString("en-US"));
+    const organizer = item?.organizer;
+    if (organizer?.displayName || organizer?.emailAddress)
+      lines.push("Organizer: " + (organizer.displayName || organizer.emailAddress));
+    const attendees = dedupeParticipants([
+      ...(Array.isArray(item?.requiredAttendees) ? item.requiredAttendees : []).map(a => ({ displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
+      ...(Array.isArray(item?.optionalAttendees) ? item.optionalAttendees : []).map(a => ({ displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
+    ]);
+    if (attendees.length) {
+      lines.push("");
+      lines.push("Attendees:");
+      attendees.forEach(a => lines.push("- " + (a.displayName || a.emailAddress) + (a.emailAddress ? " <" + a.emailAddress + ">" : "")));
+    }
   }
   lines.push("");
   lines.push("Summary:");
@@ -195,19 +199,74 @@ function loadItemContext() {
   currentConversationId = "";
   if (!emailItem) return;
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
-  document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
   if (currentItemKind === "appointment") {
-    const organizer = emailItem.organizer;
-    emailFrom = organizer?.displayName || "";
-    emailFromAddress = organizer?.emailAddress || "";
-    const date = getAppointmentDateLabel(emailItem);
-    document.getElementById("emailMeta").textContent =
-      "Organizer: " + (emailFrom || emailFromAddress || "(Unknown)") + (date ? "  ·  " + date : "");
+    // Detect compose vs read mode — subject is a plain string in read mode,
+    // an async Subject object in compose mode (when the user is the organizer editing their own meeting).
+    const isComposeMode = typeof emailItem.subject !== "string";
+
+    // ── Subject ──────────────────────────────────────────────────────────────
+    if (isComposeMode) {
+      document.getElementById("emailSubject").textContent = "(Loading…)";
+      emailItem.subject.getAsync(r => {
+        if (r.status === Office.AsyncResultStatus.Succeeded)
+          document.getElementById("emailSubject").textContent = r.value || "(No subject)";
+      });
+    } else {
+      document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
+    }
+
+    // ── Organizer ────────────────────────────────────────────────────────────
+    // In compose mode item.organizer doesn't exist — the signed-in user IS the organizer.
+    if (isComposeMode) {
+      emailFrom = msalAccount?.name || "";
+      emailFromAddress = msalAccount?.username || "";
+    } else {
+      const organizer = emailItem.organizer;
+      emailFrom = organizer?.displayName || "";
+      emailFromAddress = organizer?.emailAddress || "";
+    }
+
+    // ── Date display ─────────────────────────────────────────────────────────
+    if (isComposeMode) {
+      document.getElementById("emailMeta").textContent = "Organizer: " + (emailFrom || "(You)");
+      emailItem.start.getAsync(r => {
+        if (r.status === Office.AsyncResultStatus.Succeeded) {
+          const d = new Date(r.value);
+          const dateFmt = isNaN(d) ? "" : d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+          if (dateFmt) document.getElementById("emailMeta").textContent += "  ·  " + dateFmt;
+        }
+      });
+    } else {
+      const date = getAppointmentDateLabel(emailItem);
+      document.getElementById("emailMeta").textContent =
+        "Organizer: " + (emailFrom || emailFromAddress || "(Unknown)") + (date ? "  ·  " + date : "");
+    }
+
+    // ── Participants ─────────────────────────────────────────────────────────
     emailParticipants = dedupeParticipants([
       { label: "Organizer", displayName: emailFrom, emailAddress: emailFromAddress },
-      ...(emailItem.requiredAttendees || []).map(r => ({ label: "Required", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
-      ...(emailItem.optionalAttendees || []).map(r => ({ label: "Optional", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
     ]);
+    if (isComposeMode) {
+      // Compose mode — attendees are async Recipients objects
+      const loadAtts = (getter, label) => getter.getAsync(r => {
+        if (r.status === Office.AsyncResultStatus.Succeeded) {
+          emailParticipants = dedupeParticipants([
+            ...emailParticipants,
+            ...(r.value || []).map(a => ({ label, displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
+          ]);
+        }
+      });
+      if (emailItem.requiredAttendees?.getAsync) loadAtts(emailItem.requiredAttendees, "Required");
+      if (emailItem.optionalAttendees?.getAsync) loadAtts(emailItem.optionalAttendees, "Optional");
+    } else {
+      // Read mode — attendees are plain arrays
+      emailParticipants = dedupeParticipants([
+        ...emailParticipants,
+        ...(emailItem.requiredAttendees || []).map(r => ({ label: "Required", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
+        ...(emailItem.optionalAttendees || []).map(r => ({ label: "Optional", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
+      ]);
+    }
+
     document.getElementById("noteCategory").value = "Meeting";
     document.getElementById("noteBody").value = buildMeetingNoteBody(emailItem);
     document.getElementById("saveSpBtn").disabled = true;
