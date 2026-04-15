@@ -925,18 +925,31 @@ async function doSaveNote() {
 
   // Attempt OneNote page creation for meeting-type notes if a notebook is linked
   let oneNoteUrl = "";
+  let oneNoteErr = "";
   const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
-  if (notebookId && ["Meeting", "Site Visit", "Client Communication"].includes(category)) {
-    setStatus("noteStatus", "info", "⏳ Creating OneNote page…");
-    try {
-      const title = emailItem?.subject || body.split("\n")[0].slice(0, 80) || category;
-      const dateStr = currentItemKind === "appointment"
-        ? new Date(emailItem?.start || Date.now()).toISOString()
-        : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
-      const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr);
-      oneNoteUrl = page.webUrl || "";
-    } catch (e) {
-      console.warn("OneNote page creation failed (non-fatal):", e.message);
+  if (["Meeting", "Site Visit", "Client Communication"].includes(category)) {
+    if (!notebookId) {
+      oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
+    } else {
+      setStatus("noteStatus", "info", "⏳ Creating OneNote page…");
+      try {
+        // Use the subject element text as fallback — already resolved even in compose mode
+        const subjectEl = document.getElementById("emailSubject").textContent;
+        const resolvedSubject = (subjectEl && subjectEl !== "(Loading…)") ? subjectEl : null;
+        const title = (typeof emailItem?.subject === "string" ? emailItem.subject : resolvedSubject)
+          || body.split("\n")[0].slice(0, 80) || category;
+
+        // In compose mode emailItem.start is an async Time object — fall back to now
+        const apptStart = emailItem?.start && !emailItem.start?.getAsync ? emailItem.start : null;
+        const dateStr = currentItemKind === "appointment"
+          ? new Date(apptStart || Date.now()).toISOString()
+          : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
+
+        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr);
+        oneNoteUrl = page.webUrl || "";
+      } catch (e) {
+        oneNoteErr = e.message;
+      }
     }
   }
 
@@ -953,12 +966,17 @@ async function doSaveNote() {
     updateProjectInList(updated);
     selectedProject = updated;
     await saveToSupabase(allProjects);
-    setStatus("noteStatus", "success", "✓ Note saved" + (oneNoteUrl ? " · OneNote page created" : ""));
-    // setStatus uses textContent so the link lives in a separate element
     const linkEl = document.getElementById("noteOneNoteLink");
-    if (linkEl) linkEl.innerHTML = oneNoteUrl
-      ? `<a href="${oneNoteUrl}" target="_blank" style="font-size:12px">📓 Open in OneNote</a>`
-      : "";
+    if (oneNoteUrl) {
+      setStatus("noteStatus", "success", "✓ Note saved · OneNote page created");
+      if (linkEl) linkEl.innerHTML = `<a href="${oneNoteUrl}" target="_blank" style="font-size:12px">📓 Open in OneNote</a>`;
+    } else if (oneNoteErr) {
+      setStatus("noteStatus", "error", "Note saved, but OneNote failed: " + oneNoteErr);
+      if (linkEl) linkEl.innerHTML = "";
+    } else {
+      setStatus("noteStatus", "success", "✓ Note saved");
+      if (linkEl) linkEl.innerHTML = "";
+    }
     document.getElementById("noteBody").value = "";
   } catch (e) {
     setStatus("noteStatus", "error", "✗ " + e.message);
