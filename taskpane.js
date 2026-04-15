@@ -342,20 +342,34 @@ function refreshEmailSavedIndicator() {
   const btnSharePoint = document.getElementById("saveSpBtn");
   const btnRecordOnly = document.getElementById("saveRecordBtn");
   if (!btnSharePoint || !btnRecordOnly) return;
+
+  // Reset to default state first
   btnSharePoint.disabled = false;
   btnRecordOnly.disabled = false;
+  btnSharePoint.textContent = "📁 Save to SharePoint + Project Record";
+  btnRecordOnly.textContent = "🗂️ Save to Project Record Only";
+
   if (!selectedProject || !emailItem?.itemId) return;
   const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
   if (!existing) return;
-  const savedDate = existing.savedAt ? new Date(existing.savedAt).toLocaleString("en-US") : "an earlier time";
+
+  const savedDate = existing.savedAt
+    ? new Date(existing.savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+    : "a prior session";
+
   if (emailItem?.hasAttachments) {
-    setStatus("actionStatus", "info", "This email was already saved on " + savedDate + ". You can click 'Save to SharePoint + Project Record' again to retry attachment upload.");
-    btnSharePoint.disabled = false;
+    // Allow re-run to catch attachments, but make it clear it was filed
+    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + ". Re-run to sync any new attachments.");
+    btnSharePoint.textContent = "↺ Re-sync attachments";
+    btnRecordOnly.disabled = true;
+    btnRecordOnly.textContent = "✓ In project record";
   } else {
-    setStatus("actionStatus", "info", "This email was already saved to this project on " + savedDate + ".");
+    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + ".");
     btnSharePoint.disabled = true;
+    btnSharePoint.textContent = "✓ Filed to SharePoint";
+    btnRecordOnly.disabled = true;
+    btnRecordOnly.textContent = "✓ In project record";
   }
-  btnRecordOnly.disabled = true;
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
