@@ -530,6 +530,24 @@ async function getSharedConversationProjectId(conversationId) {
     return "";
   }
 }
+function refreshOneNoteLinkBanner() {
+  const banner = document.getElementById("oneNoteLinkBanner");
+  const anchor = document.getElementById("oneNoteLinkAnchor");
+  if (!banner || !anchor) return;
+  // Find a note for the current item that has a OneNote page linked
+  const itemId = emailItem?.itemId || "";
+  const note = itemId && selectedProject
+    ? (selectedProject.notes || []).find(n => n.sourceItemId === itemId && n.oneNoteUrl)
+    : null;
+  if (note?.oneNoteUrl) {
+    anchor.href = note.oneNoteUrl;
+    anchor.textContent = note.category ? note.category + " notes — Open in OneNote" : "Open in OneNote";
+    banner.style.display = "block";
+  } else {
+    banner.style.display = "none";
+  }
+}
+
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
@@ -560,6 +578,7 @@ function setSelectedProject(project, persistForEmail = false) {
   }
   updateProjectQuickLinks();
   refreshEmailSavedIndicator();
+  refreshOneNoteLinkBanner();
 }
 async function restoreProjectSelectionForCurrentEmail() {
   const msgId = getCurrentMessageRestId();
@@ -979,6 +998,9 @@ async function doSaveNote() {
       author: msalAccount?.name || msalAccount?.username || "Unknown",
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       importedFromEmail: true, links: [],
+      // Store the Outlook item ID so the OneNote link can be surfaced when
+      // this same email or appointment is reloaded in the task pane.
+      ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
     const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
@@ -997,6 +1019,7 @@ async function doSaveNote() {
       if (linkEl) linkEl.innerHTML = "";
     }
     document.getElementById("noteBody").value = "";
+    refreshOneNoteLinkBanner();
   } catch (e) {
     setStatus("noteStatus", "error", "✗ " + e.message);
   }
