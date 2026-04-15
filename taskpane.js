@@ -310,6 +310,7 @@ function loadItemContext() {
     document.getElementById("manualMilestoneBtn").disabled = false;
     document.getElementById("extractContactBtn").disabled = false;
     setStatus("actionStatus", "", "");
+    document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
     const from = emailItem.from;
     emailFrom = from?.displayName || "";
     emailFromAddress = from?.emailAddress || "";
@@ -628,11 +629,14 @@ function refreshCalendarStatus() {
       (icalUId && n.sourceCalendarUId === icalUId)
     )
   );
+  const logNoteBtn = document.getElementById("logNoteBtn");
   if (logged) {
     setStatus("actionStatus", "success", "✓ Meeting notes already logged for this event.");
+    if (logNoteBtn) logNoteBtn.disabled = true;
   } else {
     setStatus("actionStatus", "info",
       "Calendar event detected: use 'Log as Note' for meetings/site visits and 'Add Participant to Contacts' for attendees.");
+    if (logNoteBtn) logNoteBtn.disabled = false;
   }
 }
 async function restoreProjectSelectionForCurrentEmail() {
