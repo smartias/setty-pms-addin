@@ -208,12 +208,18 @@ function loadItemContext() {
         const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
         const ev = await graphFetch("GET", `/me/events/${restId}?$select=iCalUId`);
         currentItemICalUId = ev?.iCalUId || "";
-        refreshOneNoteLinkBanner(); // re-run now that we have the shared ID
+        refreshOneNoteLinkBanner();  // re-run now that we have the shared ID
+        refreshCalendarStatus();     // update "already logged" vs "use Log as Note"
       } catch { /* non-fatal */ }
     })();
   }
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
   if (currentItemKind === "appointment") {
+    // Restore a previously-saved project association for this appointment.
+    // (Same mechanism as emails — keyed on the REST item ID in localStorage.)
+    setSelectedProject(null, false);
+    void restoreProjectSelectionForCurrentEmail();
+
     // Detect compose vs read mode — subject is a plain string in read mode,
     // an async Subject object in compose mode (when the user is the organizer editing their own meeting).
     const isComposeMode = typeof emailItem.subject !== "string";
@@ -290,7 +296,9 @@ function loadItemContext() {
     document.getElementById("findDatesBtn").disabled = true;
     document.getElementById("manualMilestoneBtn").disabled = true;
     document.getElementById("extractContactBtn").disabled = true;
-    setStatus("actionStatus", "info", "Calendar event detected: use 'Log as Note' for meetings/site visits and 'Add Participant to Contacts' for attendees.");
+    // Status depends on whether this event was already logged; refreshCalendarStatus()
+    // is also called from setSelectedProject() so it re-evaluates once the project restores.
+    refreshCalendarStatus();
   } else {
     document.getElementById("saveSpBtn").disabled = false;
     document.getElementById("saveRecordBtn").disabled = false;
@@ -603,6 +611,27 @@ function setSelectedProject(project, persistForEmail = false) {
   updateProjectQuickLinks();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
+  refreshCalendarStatus();
+}
+// Refreshes the "Calendar event detected" / "Already logged" status message.
+// Must be called AFTER selectedProject and currentItemICalUId are both resolved.
+function refreshCalendarStatus() {
+  if (currentItemKind !== "appointment") return;
+  const itemId  = emailItem?.itemId || "";
+  const icalUId = currentItemICalUId || "";
+  const notes   = selectedProject?.notes || [];
+  const logged  = notes.find(n =>
+    n.oneNoteUrl && (
+      (itemId  && n.sourceItemId      === itemId)  ||
+      (icalUId && n.sourceCalendarUId === icalUId)
+    )
+  );
+  if (logged) {
+    setStatus("actionStatus", "success", "✓ Meeting already logged — see OneNote link above.");
+  } else {
+    setStatus("actionStatus", "info",
+      "Calendar event detected: use 'Log as Note' for meetings/site visits and 'Add Participant to Contacts' for attendees.");
+  }
 }
 async function restoreProjectSelectionForCurrentEmail() {
   const msgId = getCurrentMessageRestId();
@@ -985,6 +1014,10 @@ async function doSaveNote() {
   const body = document.getElementById("noteBody").value.trim();
   if (!body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
+  // Disable immediately so a slow OneNote round-trip can't trigger a double-save.
+  const saveNoteBtn = document.getElementById("saveNoteBtn");
+  if (saveNoteBtn) saveNoteBtn.disabled = true;
+
   // Attempt OneNote page creation for meeting-type notes if a notebook is linked
   let oneNoteUrl = "";
   let oneNoteErr = "";
@@ -1032,6 +1065,8 @@ async function doSaveNote() {
     updateProjectInList(updated);
     selectedProject = updated;
     await saveToSupabase(allProjects);
+    // Persist the appointment → project mapping so it auto-restores on next open.
+    setSelectedProject(selectedProject, true);
     const linkEl = document.getElementById("noteOneNoteLink");
     if (oneNoteUrl) {
       setStatus("noteStatus", "success", "✓ Note saved · OneNote page created");
@@ -1044,9 +1079,13 @@ async function doSaveNote() {
       if (linkEl) linkEl.innerHTML = "";
     }
     document.getElementById("noteBody").value = "";
+    // saveNoteBtn stays disabled — note is saved, re-clicking would double-create the OneNote page.
     refreshOneNoteLinkBanner();
+    refreshCalendarStatus();
   } catch (e) {
     setStatus("noteStatus", "error", "✗ " + e.message);
+    // Re-enable the button so the user can retry after fixing the error.
+    if (saveNoteBtn) saveNoteBtn.disabled = false;
   }
 }
 // ─── SHARED: file email+attachments into a project subfolder ─────────────────
