@@ -291,6 +291,7 @@ function loadItemContext() {
     document.getElementById("noteBody").value = buildMeetingNoteBody(emailItem);
     document.getElementById("saveSpBtn").disabled = true;
     document.getElementById("saveRecordBtn").disabled = true;
+    document.getElementById("logNoteBtn").disabled = true;
     document.getElementById("logRfiBtn").disabled = true;
     document.getElementById("logSubBtn").disabled = true;
     document.getElementById("findDatesBtn").disabled = true;
@@ -302,6 +303,7 @@ function loadItemContext() {
   } else {
     document.getElementById("saveSpBtn").disabled = false;
     document.getElementById("saveRecordBtn").disabled = false;
+    document.getElementById("logNoteBtn").disabled = false;
     document.getElementById("logRfiBtn").disabled = false;
     document.getElementById("logSubBtn").disabled = false;
     document.getElementById("findDatesBtn").disabled = false;
@@ -627,7 +629,7 @@ function refreshCalendarStatus() {
     )
   );
   if (logged) {
-    setStatus("actionStatus", "success", "✓ Meeting already logged — see OneNote link above.");
+    setStatus("actionStatus", "success", "✓ Meeting notes already logged for this event.");
   } else {
     setStatus("actionStatus", "info",
       "Calendar event detected: use 'Log as Note' for meetings/site visits and 'Add Participant to Contacts' for attendees.");
