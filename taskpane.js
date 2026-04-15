@@ -35,6 +35,7 @@ let emailFrom = "";
 let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
 let currentItemKind = "message"; // message | appointment
+let currentItemICalUId = "";    // iCalUId for appointments — same across all attendees' mailboxes
 let lastAttachmentUploadStats = null;
 let currentConversationId = "";
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
@@ -197,7 +198,20 @@ function buildMeetingNoteBody(item) {
 function loadItemContext() {
   emailItem = Office.context.mailbox.item;
   currentConversationId = "";
+  currentItemICalUId = "";
   if (!emailItem) return;
+  // For appointments, fetch the iCalUId in the background — it's the same across
+  // all attendees' mailboxes so we can use it to match notes saved by anyone on the team.
+  if (emailItem.itemType === Office.MailboxEnums.ItemType.Appointment) {
+    void (async () => {
+      try {
+        const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+        const ev = await graphFetch("GET", `/me/events/${restId}?$select=iCalUId`);
+        currentItemICalUId = ev?.iCalUId || "";
+        refreshOneNoteLinkBanner(); // re-run now that we have the shared ID
+      } catch { /* non-fatal */ }
+    })();
+  }
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
   if (currentItemKind === "appointment") {
     // Detect compose vs read mode — subject is a plain string in read mode,
@@ -534,14 +548,24 @@ function refreshOneNoteLinkBanner() {
   const banner = document.getElementById("oneNoteLinkBanner");
   const anchor = document.getElementById("oneNoteLinkAnchor");
   if (!banner || !anchor) return;
-  // Find a note for the current item that has a OneNote page linked
-  const itemId = emailItem?.itemId || "";
-  const note = itemId && selectedProject
-    ? (selectedProject.notes || []).find(n => n.sourceItemId === itemId && n.oneNoteUrl)
-    : null;
+  if (!selectedProject) { banner.style.display = "none"; return; }
+
+  const itemId    = emailItem?.itemId || "";
+  const icalUId   = currentItemICalUId || "";
+  const notes     = selectedProject.notes || [];
+
+  // Match on personal itemId first (instant), then fall back to iCalUId
+  // which is shared across all attendees of the same meeting.
+  const note = notes.find(n =>
+    n.oneNoteUrl && (
+      (itemId  && n.sourceItemId      === itemId)  ||
+      (icalUId && n.sourceCalendarUId === icalUId)
+    )
+  ) || null;
+
   if (note?.oneNoteUrl) {
     anchor.href = note.oneNoteUrl;
-    anchor.textContent = note.category ? note.category + " notes — Open in OneNote" : "Open in OneNote";
+    anchor.textContent = (note.category || "Meeting") + " notes — Open in OneNote";
     banner.style.display = "block";
   } else {
     banner.style.display = "none";
@@ -998,9 +1022,10 @@ async function doSaveNote() {
       author: msalAccount?.name || msalAccount?.username || "Unknown",
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       importedFromEmail: true, links: [],
-      // Store the Outlook item ID so the OneNote link can be surfaced when
-      // this same email or appointment is reloaded in the task pane.
+      // sourceItemId — matches for the person who saved the note (mailbox-specific).
+      // sourceCalendarUId — matches for ALL attendees of the same meeting (shared iCal standard ID).
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
+      ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
     const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
