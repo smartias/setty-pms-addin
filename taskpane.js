@@ -893,10 +893,15 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
 }
 
 async function createAddinOneNotePage(project, title, body, category, dateStr) {
+  const useTeams   = !!project.teamsOneNoteNotebookId;
   const notebookId = project.teamsOneNoteNotebookId || project.oneNoteNotebookId;
-  // Use /me/onenote — works for group and SharePoint notebooks the user has access to,
-  // and only requires Notes.ReadWrite (no admin consent) instead of Notes.ReadWrite.All.
-  const baseUrl    = `/me/onenote`;
+  // Route to the correct OneNote namespace based on where the notebook lives.
+  // Teams notebooks were created under /groups/{teamId}/onenote — the same ID returns
+  // 404 if looked up via /me/onenote because they are different namespaces.
+  // Notes.ReadWrite (no .All) is sufficient for the groups endpoint.
+  const baseUrl = useTeams
+    ? `/groups/${TEAMS_TEAM_ID}/onenote`
+    : `/me/onenote`;
   const sectionName = { Meeting: "Meetings", "Site Visit": "Site Visits", "Client Communication": "Client Communications" }[category] || "Notes";
 
   // Find or create the section
@@ -921,7 +926,7 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
 
   // OneNote pages require text/html — can't use graphFetch() which always sends JSON
   const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/me/onenote/sections/${section.id}/pages`, {
+  const res = await fetch(`https://graph.microsoft.com/v1.0/${baseUrl}/sections/${section.id}/pages`, {
     method: "POST",
     headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
     body: pageHtml,
