@@ -290,7 +290,7 @@
   <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
   <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
   <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
-  <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note (Meeting / Site Visit)</button>
+  <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note</button>
   <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
   <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
   <hr class="divider"/>
@@ -306,10 +306,14 @@
   <div class="section-title">Log as Note</div>
   <label>Category</label>
   <select id="noteCategory">
-    <option value="Meeting">Meeting</option>
+    <option value="Client Meeting">Client Meeting</option>
+    <option value="Internal Meeting">Internal Meeting</option>
     <option value="Site Visit">Site Visit</option>
     <option value="Client Communication">Client Communication</option>
     <option value="Decision">Decision</option>
+    <option value="Issue">Issue</option>
+    <option value="Action Item">Action Item</option>
+    <option value="Internal">Internal</option>
     <option value="General">General</option>
   </select>
   <label>Note Body</label>

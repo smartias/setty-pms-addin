@@ -287,7 +287,7 @@ function loadItemContext() {
       ]);
     }
 
-    document.getElementById("noteCategory").value = "Meeting";
+    document.getElementById("noteCategory").value = "Client Meeting";
     document.getElementById("noteBody").value = buildMeetingNoteBody(emailItem);
     document.getElementById("saveSpBtn").disabled = true;
     document.getElementById("saveRecordBtn").disabled = true;
@@ -576,7 +576,7 @@ function refreshOneNoteLinkBanner() {
 
   if (note?.oneNoteUrl) {
     anchor.href = note.oneNoteUrl;
-    anchor.textContent = (note.category || "Meeting") + " notes — Open in OneNote";
+    anchor.textContent = (note.category || "Client Meeting") + " notes — Open in OneNote";
     banner.style.display = "block";
   } else {
     banner.style.display = "none";
@@ -624,14 +624,13 @@ function refreshCalendarStatus() {
   const icalUId = currentItemICalUId || "";
   const notes   = selectedProject?.notes || [];
   const logged  = notes.find(n =>
-    n.oneNoteUrl && (
-      (itemId  && n.sourceItemId      === itemId)  ||
-      (icalUId && n.sourceCalendarUId === icalUId)
-    )
+    (itemId  && n.sourceItemId      === itemId)  ||
+    (icalUId && n.sourceCalendarUId === icalUId)
   );
   const logNoteBtn = document.getElementById("logNoteBtn");
   if (logged) {
-    setStatus("actionStatus", "success", "✓ Meeting notes already logged for this event.");
+    const loggedLabel = logged.category ? logged.category + " note" : "Note";
+    setStatus("actionStatus", "success", "✓ " + loggedLabel + " already logged for this event." + (logged.oneNoteUrl ? " 📓" : ""));
     if (logNoteBtn) logNoteBtn.disabled = true;
   } else {
     setStatus("actionStatus", "info",
@@ -980,7 +979,18 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
   const baseUrl = useTeams
     ? `/groups/${TEAMS_TEAM_ID}/onenote`
     : `/me/onenote`;
-  const sectionName = { Meeting: "Meetings", "Site Visit": "Site Visits", "Client Communication": "Client Communications" }[category] || "Notes";
+  const sectionName = {
+    "Client Meeting":       "Client Meetings",
+    "Internal Meeting":     "Internal Meetings",
+    "Meeting":              "Meetings",
+    "Site Visit":           "Site Visits",
+    "Client Communication": "Client Communications",
+    "Decision":             "Decisions",
+    "Issue":                "Issues",
+    "Action Item":          "Action Items",
+    "Internal":             "Internal Notes",
+    "General":              "General Notes",
+  }[category] || "General Notes";
 
   // Find or create the section
   const sectionsResp = await graphFetch("GET", `${baseUrl}/notebooks/${notebookId}/sections`);
@@ -1024,16 +1034,15 @@ async function doSaveNote() {
   const saveNoteBtn = document.getElementById("saveNoteBtn");
   if (saveNoteBtn) saveNoteBtn.disabled = true;
 
-  // Attempt OneNote page creation for meeting-type notes if a notebook is linked
+  // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
   let oneNoteErr = "";
   const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
-  if (["Meeting", "Site Visit", "Client Communication"].includes(category)) {
-    if (!notebookId) {
-      oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
-    } else {
-      setStatus("noteStatus", "info", "⏳ Creating OneNote page…");
-      try {
+  if (!notebookId) {
+    oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
+  } else {
+    setStatus("noteStatus", "info", "⏳ Creating OneNote page…");
+    try {
         // Use the subject element text as fallback — already resolved even in compose mode
         const subjectEl = document.getElementById("emailSubject").textContent;
         const resolvedSubject = (subjectEl && subjectEl !== "(Loading…)") ? subjectEl : null;
@@ -1052,7 +1061,6 @@ async function doSaveNote() {
         oneNoteErr = e.message;
       }
     }
-  }
 
   setStatus("noteStatus", "info", "⏳ Saving…");
   try {
