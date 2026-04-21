@@ -1351,9 +1351,25 @@ function extractDueDates(text, emailReceivedDate) {
   const MONTHS_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"];
   const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const DAYS         = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  function isValidDateParts(year, month1, day) {
+    const d = new Date(year, month1 - 1, day);
+    return d.getFullYear() === year && d.getMonth() === (month1 - 1) && d.getDate() === day;
+  }
   function toISO(year, month1, day) {
     const y = year < 100 ? 2000 + year : year;
+    if (!isValidDateParts(y, month1, day)) return "";
     return y + "-" + String(month1).padStart(2,"0") + "-" + String(day).padStart(2,"0");
+  }
+  function resolveYearlessMonthDay(month1, day) {
+    const refYear = refDate.getFullYear();
+    const candidates = [refYear, refYear + 1].map(y => toISO(y, month1, day)).filter(Boolean);
+    if (!candidates.length) return "";
+    const refMid = new Date(refDate.getFullYear(), refDate.getMonth(), refDate.getDate(), 12, 0, 0, 0);
+    const best = candidates.find(iso => {
+      const d = new Date(iso + "T12:00:00");
+      return d >= refMid;
+    });
+    return best || candidates[0];
   }
   function addResult(iso, display, idx) {
     if (seen.has(iso)) return;
@@ -1394,8 +1410,19 @@ function extractDueDates(text, emailReceivedDate) {
   const p4 = /\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/g;
   while ((m = p4.exec(text))) {
     const mo = +m[1], dy = +m[2], yr = +m[3];
-    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31)
-      addResult(toISO(yr, mo, dy), m[0], m.index);
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+      const iso = toISO(yr, mo, dy);
+      if (iso) addResult(iso, m[0], m.index);
+    }
+  }
+  // Slash notation without year: "4/22"
+  const p4b = /\b(\d{1,2})\/(\d{1,2})(?!\/)\b/g;
+  while ((m = p4b.exec(text))) {
+    const mo = +m[1], dy = +m[2];
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+      const iso = resolveYearlessMonthDay(mo, dy);
+      if (iso) addResult(iso, m[0] + "  (" + iso + ")", m.index);
+    }
   }
   // ISO: "2026-03-15"
   const p5 = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
@@ -1410,6 +1437,23 @@ function extractDueDates(text, emailReceivedDate) {
     d.setDate(d.getDate() + delta);
     const iso = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
     addResult(iso, m[0] + "  (" + iso + ")", m.index);
+  }
+  // Weekday + ordinal day: "Tuesday the 29th" / "Tue the 29th" / "Tuesday 29th"
+  const p7 = /\b(?:Mon(?:day)?|Tue(?:s(?:day)?)?|Wed(?:nesday)?|Thu(?:rs(?:day)?)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b/gi;
+  while ((m = p7.exec(text))) {
+    const day = +m[1];
+    if (day < 1 || day > 31) continue;
+    let found = "";
+    for (let i = 0; i <= 12; i++) {
+      const y = refDate.getFullYear() + Math.floor((refDate.getMonth() + i) / 12);
+      const mo = ((refDate.getMonth() + i) % 12) + 1;
+      const iso = toISO(y, mo, day);
+      if (!iso) continue;
+      const d = new Date(iso + "T12:00:00");
+      const refMid = new Date(refDate.getFullYear(), refDate.getMonth(), refDate.getDate(), 12, 0, 0, 0);
+      if (d >= refMid) { found = iso; break; }
+    }
+    if (found) addResult(found, m[0] + "  (" + found + ")", m.index);
   }
   // Keyword hits first, then chronological
   return results.sort((a, b) => {
