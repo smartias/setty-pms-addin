@@ -395,6 +395,7 @@ function refreshEmailSavedIndicator() {
     btnRecordOnly.disabled = true;
     btnRecordOnly.textContent = "✓ In project record";
   }
+  applyPipelineUiRules();
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
@@ -555,6 +556,70 @@ async function getSharedConversationProjectId(conversationId) {
     return "";
   }
 }
+function isProjectAwarded(project) {
+  if (!project) return true;
+  const explicit = [project.awarded, project.isAwarded, project.is_awarded].find(v => typeof v === "boolean");
+  if (typeof explicit === "boolean") return explicit;
+
+  const statusText = [
+    project.awardStatus,
+    project.projectStatus,
+    project.status,
+    project.stage,
+    project.phase,
+    project.lifecycleStatus,
+    project.bidStatus,
+  ].find(v => typeof v === "string" && v.trim());
+
+  if (!statusText) return true;
+  const normalized = statusText.trim().toLowerCase();
+  if (/(awarded|active|construction|in progress|won)/.test(normalized)) return true;
+  if (/(pipeline|not awarded|proposal|bidding|bid|pursuit|precon|opportunity|lead)/.test(normalized)) return false;
+  return true;
+}
+
+function applyPipelineUiRules() {
+  const isPipeline = !!selectedProject && !isProjectAwarded(selectedProject);
+  const hint = document.getElementById("projectPipelineHint");
+  if (hint) {
+    if (isPipeline) {
+      hint.textContent = "Pipeline project (not awarded yet): post-award actions are disabled.";
+      hint.style.display = "block";
+    } else {
+      hint.textContent = "";
+      hint.style.display = "none";
+    }
+  }
+  if (!isPipeline) return;
+
+  const keepEnabled = new Set([
+    "saveRecordBtn",
+    "openPmsBtn",
+    "openDashboardBtn",
+    "addParticipantBtn",
+    "extractContactBtn",
+  ]);
+  const actionButtons = [
+    "saveSpBtn",
+    "saveRecordBtn",
+    "openPmsBtn",
+    "openSpFolderBtn",
+    "openDashboardBtn",
+    "logNoteBtn",
+    "logRfiBtn",
+    "logSubBtn",
+    "findDatesBtn",
+    "manualMilestoneBtn",
+    "addParticipantBtn",
+    "extractContactBtn",
+  ];
+  actionButtons.forEach(id => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.disabled = !keepEnabled.has(id);
+  });
+}
+
 function refreshOneNoteLinkBanner() {
   const banner = document.getElementById("oneNoteLinkBanner");
   const anchor = document.getElementById("oneNoteLinkAnchor");
@@ -588,7 +653,8 @@ function setSelectedProject(project, persistForEmail = false) {
   const badge = document.getElementById("selectedProjectBadge");
   if (badge) {
     if (selectedProject) {
-      badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
+      const pipelineTag = isProjectAwarded(selectedProject) ? "" : " (Pipeline)";
+      badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name + pipelineTag;
       badge.style.display = "block";
     } else {
       badge.style.display = "none";
@@ -615,6 +681,7 @@ function setSelectedProject(project, persistForEmail = false) {
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
   refreshCalendarStatus();
+  applyPipelineUiRules();
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
 // Must be called AFTER selectedProject and currentItemICalUId are both resolved.
@@ -1629,6 +1696,7 @@ function updateProjectQuickLinks() {
   if (!pmsBtn || !spBtn) return;
   pmsBtn.disabled = !projectPmsUrl(selectedProject);
   spBtn.disabled = !selectedProject?.projectFolderUrl;
+  applyPipelineUiRules();
 }
 function openSelectedProjectInPms() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
