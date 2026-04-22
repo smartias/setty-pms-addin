@@ -133,9 +133,9 @@
       letter-spacing: 1px;
       margin-bottom: 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #contactView, #peopleView, #datesView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
+    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -292,6 +292,7 @@
   <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
   <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
   <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note</button>
+  <button class="btn btn-blue" id="newActionItemBtn">✅ New Action Item</button>
   <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
   <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
   <hr class="divider"/>
@@ -313,7 +314,6 @@
     <option value="Client Communication">Client Communication</option>
     <option value="Decision">Decision</option>
     <option value="Issue">Issue</option>
-    <option value="Action Item">Action Item</option>
     <option value="Internal">Internal</option>
     <option value="General">General</option>
   </select>
@@ -322,6 +322,22 @@
   <div id="noteStatus" class="status-msg"></div>
   <div id="noteOneNoteLink" style="margin-top:6px"></div>
   <button class="btn btn-blue" id="saveNoteBtn">💾 Save Note</button>
+</div>
+
+<!-- Action Item View -->
+<div id="actionItemView">
+  <button class="back-btn" id="actionItemBack">← Back</button>
+  <div class="section-title">New Action Item</div>
+  <label>Action Item</label>
+  <textarea id="actionItemBody" rows="4" placeholder="What needs to be done?"></textarea>
+  <label>Owner</label>
+  <select id="actionItemOwner">
+    <option value="">— Select team member —</option>
+  </select>
+  <label>Due Date</label>
+  <input type="date" id="actionItemDueDate"/>
+  <div id="actionItemStatus" class="status-msg"></div>
+  <button class="btn btn-blue" id="saveActionItemBtn">💾 Save Action Item</button>
 </div>
 
 <!-- RFI View -->

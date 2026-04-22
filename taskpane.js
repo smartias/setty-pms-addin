@@ -86,10 +86,12 @@ function setupEventListeners() {
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
+  document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
   document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
   document.getElementById("extractContactBtn").onclick = doExtractContact;
   document.getElementById("noteBack").onclick    = () => showView("mainView");
+  document.getElementById("actionItemBack").onclick = () => showView("mainView");
   document.getElementById("rfiBack").onclick     = () => showView("mainView");
   document.getElementById("subBack").onclick     = () => showView("mainView");
   document.getElementById("peopleBack").onclick  = () => showView("mainView");
@@ -100,6 +102,7 @@ function setupEventListeners() {
   document.getElementById("addParticipantBtn").onclick = showPeopleView;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
+  document.getElementById("saveActionItemBtn").onclick = doSaveActionItem;
   document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
   document.getElementById("saveSubBtn").onclick     = doSaveSub;
   document.getElementById("saveContactBtn").onclick = doSaveContact;
@@ -292,6 +295,7 @@ function loadItemContext() {
     document.getElementById("saveSpBtn").disabled = true;
     document.getElementById("saveRecordBtn").disabled = true;
     document.getElementById("logNoteBtn").disabled = true;
+    document.getElementById("newActionItemBtn").disabled = true;
     document.getElementById("logRfiBtn").disabled = true;
     document.getElementById("logSubBtn").disabled = true;
     document.getElementById("findDatesBtn").disabled = true;
@@ -304,6 +308,7 @@ function loadItemContext() {
     document.getElementById("saveSpBtn").disabled = false;
     document.getElementById("saveRecordBtn").disabled = false;
     document.getElementById("logNoteBtn").disabled = false;
+    document.getElementById("newActionItemBtn").disabled = false;
     document.getElementById("logRfiBtn").disabled = false;
     document.getElementById("logSubBtn").disabled = false;
     document.getElementById("findDatesBtn").disabled = false;
@@ -606,6 +611,7 @@ function applyPipelineUiRules() {
     "openSpFolderBtn",
     "openDashboardBtn",
     "logNoteBtn",
+    "newActionItemBtn",
     "logRfiBtn",
     "logSubBtn",
     "findDatesBtn",
@@ -648,6 +654,36 @@ function refreshOneNoteLinkBanner() {
   }
 }
 
+function getProjectTeamMembers(project) {
+  if (!project) return [];
+  const rawLists = [
+    project.projectTeam,
+    project.teamMembers,
+    project.team,
+    project.internalTeam,
+    project.staff,
+    project.assignedTeam,
+  ].filter(Array.isArray);
+
+  const picked = rawLists.flat().map(member => {
+    if (typeof member === "string") return member.trim();
+    if (!member || typeof member !== "object") return "";
+    return (member.name || member.displayName || member.fullName || member.userName || member.email || "").trim();
+  }).filter(Boolean);
+
+  return [...new Set(picked)].sort((a, b) => a.localeCompare(b));
+}
+
+function refreshActionItemOwnerOptions() {
+  const ownerSelect = document.getElementById("actionItemOwner");
+  if (!ownerSelect) return;
+  const teamMembers = getProjectTeamMembers(selectedProject);
+  const previous = ownerSelect.value || "";
+  ownerSelect.innerHTML = '<option value="">— Select team member —</option>'
+    + teamMembers.map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join("");
+  if (previous && teamMembers.includes(previous)) ownerSelect.value = previous;
+}
+
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
@@ -678,6 +714,7 @@ function setSelectedProject(project, persistForEmail = false) {
     })();
   }
   updateProjectQuickLinks();
+  refreshActionItemOwnerOptions();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
   refreshCalendarStatus();
@@ -1167,6 +1204,76 @@ async function doSaveNote() {
     setStatus("noteStatus", "error", "✗ " + e.message);
     // Re-enable the button so the user can retry after fixing the error.
     if (saveNoteBtn) saveNoteBtn.disabled = false;
+  }
+}
+
+function prefillActionItem() {
+  const body = document.getElementById("actionItemBody");
+  const ownerSelect = document.getElementById("actionItemOwner");
+  const dueDate = document.getElementById("actionItemDueDate");
+  const teamMembers = getProjectTeamMembers(selectedProject);
+  if (body) body.value = (emailItem?.subject || "").trim();
+  if (ownerSelect) {
+    refreshActionItemOwnerOptions();
+    const defaultOwner = [msalAccount?.name, msalAccount?.username, emailFrom]
+      .map(v => (v || "").trim())
+      .find(v => v && teamMembers.includes(v)) || "";
+    ownerSelect.value = defaultOwner;
+  }
+  if (dueDate) dueDate.value = addBizDays(new Date(), 5);
+  setStatus("actionItemStatus", "", "");
+}
+
+async function doSaveActionItem() {
+  if (!selectedProject) { setStatus("actionItemStatus", "error", "No project selected."); return; }
+  const teamMembers = getProjectTeamMembers(selectedProject);
+  const body = document.getElementById("actionItemBody").value.trim();
+  const owner = document.getElementById("actionItemOwner").value.trim();
+  const dueDate = document.getElementById("actionItemDueDate").value;
+  if (!teamMembers.length) {
+    setStatus("actionItemStatus", "error", "No project team members found. Add a team in PMS first.");
+    return;
+  }
+  if (!body) { setStatus("actionItemStatus", "error", "Action item is required."); return; }
+  if (!owner) { setStatus("actionItemStatus", "error", "Owner is required."); return; }
+  if (!teamMembers.includes(owner)) { setStatus("actionItemStatus", "error", "Please select a valid team member."); return; }
+  if (!dueDate) { setStatus("actionItemStatus", "error", "Due date is required."); return; }
+
+  const saveBtn = document.getElementById("saveActionItemBtn");
+  if (saveBtn) saveBtn.disabled = true;
+  setStatus("actionItemStatus", "info", "⏳ Saving…");
+
+  try {
+    const createdAt = new Date().toISOString();
+    const actionNoteBody = `${body}\n\nOwner: ${owner}\nDue: ${dueDate}`;
+    const note = {
+      id: uid(),
+      body: actionNoteBody,
+      category: "Action Item",
+      actionItem: true,
+      owner,
+      dueDate,
+      status: "Open",
+      author: msalAccount?.name || msalAccount?.username || "Unknown",
+      createdAt,
+      updatedAt: createdAt,
+      importedFromEmail: true,
+      links: [],
+      ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
+      ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
+    };
+    const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
+    updateProjectInList(updated);
+    selectedProject = updated;
+    await saveToSupabase(allProjects);
+    setSelectedProject(selectedProject, true);
+    setStatus("actionItemStatus", "success", "✓ Action item saved");
+    document.getElementById("actionItemBody").value = "";
+    document.getElementById("actionItemOwner").value = "";
+    document.getElementById("actionItemDueDate").value = "";
+  } catch (e) {
+    setStatus("actionItemStatus", "error", "✗ " + e.message);
+    if (saveBtn) saveBtn.disabled = false;
   }
 }
 // ─── SHARED: file email+attachments into a project subfolder ─────────────────
@@ -1875,7 +1982,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","actionItemView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
