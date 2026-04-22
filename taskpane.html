@@ -332,7 +332,9 @@
   <label>Action Item</label>
   <textarea id="actionItemBody" rows="4" placeholder="What needs to be done?"></textarea>
   <label>Owner</label>
-  <input type="text" id="actionItemOwner" placeholder="Who owns this item?"/>
+  <select id="actionItemOwner">
+    <option value="">— Select team member —</option>
+  </select>
   <label>Due Date</label>
   <input type="date" id="actionItemDueDate"/>
   <div id="actionItemStatus" class="status-msg"></div>

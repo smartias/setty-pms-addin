@@ -654,6 +654,36 @@ function refreshOneNoteLinkBanner() {
   }
 }
 
+function getProjectTeamMembers(project) {
+  if (!project) return [];
+  const rawLists = [
+    project.projectTeam,
+    project.teamMembers,
+    project.team,
+    project.internalTeam,
+    project.staff,
+    project.assignedTeam,
+  ].filter(Array.isArray);
+
+  const picked = rawLists.flat().map(member => {
+    if (typeof member === "string") return member.trim();
+    if (!member || typeof member !== "object") return "";
+    return (member.name || member.displayName || member.fullName || member.userName || member.email || "").trim();
+  }).filter(Boolean);
+
+  return [...new Set(picked)].sort((a, b) => a.localeCompare(b));
+}
+
+function refreshActionItemOwnerOptions() {
+  const ownerSelect = document.getElementById("actionItemOwner");
+  if (!ownerSelect) return;
+  const teamMembers = getProjectTeamMembers(selectedProject);
+  const previous = ownerSelect.value || "";
+  ownerSelect.innerHTML = '<option value="">— Select team member —</option>'
+    + teamMembers.map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join("");
+  if (previous && teamMembers.includes(previous)) ownerSelect.value = previous;
+}
+
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
@@ -684,6 +714,7 @@ function setSelectedProject(project, persistForEmail = false) {
     })();
   }
   updateProjectQuickLinks();
+  refreshActionItemOwnerOptions();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
   refreshCalendarStatus();
@@ -1178,21 +1209,34 @@ async function doSaveNote() {
 
 function prefillActionItem() {
   const body = document.getElementById("actionItemBody");
-  const owner = document.getElementById("actionItemOwner");
+  const ownerSelect = document.getElementById("actionItemOwner");
   const dueDate = document.getElementById("actionItemDueDate");
+  const teamMembers = getProjectTeamMembers(selectedProject);
   if (body) body.value = (emailItem?.subject || "").trim();
-  if (owner) owner.value = (emailFrom || "").trim();
+  if (ownerSelect) {
+    refreshActionItemOwnerOptions();
+    const defaultOwner = [msalAccount?.name, msalAccount?.username, emailFrom]
+      .map(v => (v || "").trim())
+      .find(v => v && teamMembers.includes(v)) || "";
+    ownerSelect.value = defaultOwner;
+  }
   if (dueDate) dueDate.value = addBizDays(new Date(), 5);
   setStatus("actionItemStatus", "", "");
 }
 
 async function doSaveActionItem() {
   if (!selectedProject) { setStatus("actionItemStatus", "error", "No project selected."); return; }
+  const teamMembers = getProjectTeamMembers(selectedProject);
   const body = document.getElementById("actionItemBody").value.trim();
   const owner = document.getElementById("actionItemOwner").value.trim();
   const dueDate = document.getElementById("actionItemDueDate").value;
+  if (!teamMembers.length) {
+    setStatus("actionItemStatus", "error", "No project team members found. Add a team in PMS first.");
+    return;
+  }
   if (!body) { setStatus("actionItemStatus", "error", "Action item is required."); return; }
   if (!owner) { setStatus("actionItemStatus", "error", "Owner is required."); return; }
+  if (!teamMembers.includes(owner)) { setStatus("actionItemStatus", "error", "Please select a valid team member."); return; }
   if (!dueDate) { setStatus("actionItemStatus", "error", "Due date is required."); return; }
 
   const saveBtn = document.getElementById("saveActionItemBtn");
