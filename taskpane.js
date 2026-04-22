@@ -109,6 +109,7 @@ function setupEventListeners() {
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
   document.getElementById("openDashboardBtn").onclick = openPmsDashboard;
+  document.getElementById("clearProjectTagBtn").onclick = () => { void clearProjectTagForCurrentEmail(); };
   // RFI mode toggles
   document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
   document.getElementById("rfiModeExisting").onclick = () => setRfiMode("existing");
@@ -582,6 +583,19 @@ async function saveSharedConversationProjectTag(conversationId, projectId) {
     console.warn("Shared conversation tag save failed:", e);
   }
 }
+async function clearSharedConversationProjectTag(conversationId) {
+  if (!conversationId) return;
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_THREAD_TAGS_TABLE + "?conversation_id=eq." + encodeURIComponent(conversationId);
+  try {
+    const res = await fetch(url, { method: "DELETE", headers: { ...SB_HEADERS, Prefer: "return=minimal" } });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("Shared conversation tag clear failed:", res.status, errText);
+    }
+  } catch (e) {
+    console.warn("Shared conversation tag clear failed:", e);
+  }
+}
 async function getSharedConversationProjectId(conversationId) {
   if (!conversationId) return "";
   const url =
@@ -721,18 +735,48 @@ function refreshActionItemOwnerOptions() {
     + teamMembers.map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join("");
   if (previous && teamMembers.includes(previous)) ownerSelect.value = previous;
 }
+async function clearProjectTagForCurrentEmail() {
+  const msgId = getCurrentMessageRestId();
+  if (msgId) {
+    const map = getEmailProjectMap();
+    if (map[msgId]) {
+      delete map[msgId];
+      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+    }
+  }
+  const conversationId = await getCurrentConversationId();
+  if (conversationId) {
+    const convoMap = getConversationProjectMap();
+    if (convoMap[conversationId]) {
+      delete convoMap[conversationId];
+      saveConversationProjectMap(convoMap);
+    }
+    await clearSharedConversationProjectTag(conversationId);
+  }
+  setSelectedProject(null, false);
+  setStatus("actionStatus", "info", "Project tag cleared for this email. Search and select the correct project.");
+}
 
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
+  const badgeText = document.getElementById("selectedProjectBadgeText");
+  const clearBtn = document.getElementById("clearProjectTagBtn");
   if (badge) {
     if (selectedProject) {
       const pipelineTag = isProjectAwarded(selectedProject) ? "" : " (Pipeline)";
-      badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name + pipelineTag;
-      badge.style.display = "block";
+      if (badgeText) {
+        badgeText.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name + pipelineTag;
+      } else {
+        badge.textContent = "✓ " + (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name + pipelineTag;
+      }
+      badge.style.display = "flex";
+      if (clearBtn) clearBtn.style.display = "inline";
     } else {
       badge.style.display = "none";
-      badge.textContent = "";
+      if (badgeText) badgeText.textContent = "";
+      if (clearBtn) clearBtn.style.display = "none";
+      if (!badgeText) badge.textContent = "";
     }
   }
   if (persistForEmail && selectedProject) {
