@@ -273,7 +273,10 @@
     <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
     <div id="projectDropdown"></div>
   </div>
-  <div id="selectedProjectBadge" style="display:none;margin-bottom:6px;font-size:12px;color:#60b4ff;font-weight:600;"></div>
+  <div id="selectedProjectBadge" style="display:none;margin-bottom:6px;font-size:12px;color:#60b4ff;font-weight:600;align-items:center;justify-content:space-between;gap:6px;">
+    <span id="selectedProjectBadgeText"></span>
+    <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:#94a3b8;font-size:14px;line-height:1;cursor:pointer;padding:0 2px;" title="Clear tagged project for this email">×</button>
+  </div>
   <div id="projectPipelineHint" style="display:none;margin:-2px 0 10px;font-size:11px;color:#fbbf24;font-weight:600;"></div>
 
   <div id="actionStatus" class="status-msg"></div>
