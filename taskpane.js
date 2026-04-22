@@ -349,8 +349,19 @@ function getCurrentMessageRestId() {
   return Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
 }
 function getCurrentMessageRecordId() {
-  // Prefer Graph REST id, but fall back so dedupe logic doesn't collapse to empty-string matches.
-  return getCurrentMessageRestId() || emailItem?.internetMessageId || emailItem?.itemId || "";
+  // Prefer internetMessageId (shared across recipients) for cross-mailbox matching.
+  // Keep REST/item IDs as fallbacks so existing records created before this change still resolve.
+  return emailItem?.internetMessageId || getCurrentMessageRestId() || emailItem?.itemId || "";
+}
+function getCurrentMessageIdCandidates() {
+  return [...new Set([
+    emailItem?.internetMessageId || "",
+    getCurrentMessageRestId(),
+    emailItem?.itemId || "",
+  ].filter(Boolean))];
+}
+function getCurrentSharedMessageId() {
+  return emailItem?.internetMessageId || "";
 }
 async function getCurrentConversationId() {
   if (currentConversationId) return currentConversationId;
@@ -366,7 +377,32 @@ async function getCurrentConversationId() {
 }
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
-  return (project.emails || []).find(e => e.msgId === msgId) || null;
+  const candidateIds = getCurrentMessageIdCandidates();
+  return (project.emails || []).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
+}
+function getLoggedEmailArtifactLabels(project) {
+  if (!project || !emailItem?.itemId) return [];
+  const labels = [];
+  const sourceItemId = emailItem.itemId;
+  const sourceMessageIds = getCurrentMessageIdCandidates();
+
+  const notes = project.notes || [];
+  const hasActionItem = notes.some(n =>
+    (n?.sourceItemId === sourceItemId || sourceMessageIds.includes(n?.sourceMessageId))
+    && (n?.actionItem || n?.category === "Action Item")
+  );
+  const hasNote = notes.some(n =>
+    (n?.sourceItemId === sourceItemId || sourceMessageIds.includes(n?.sourceMessageId))
+    && !(n?.actionItem || n?.category === "Action Item")
+  );
+  const hasMilestone = (project.milestones || []).some(m =>
+    m?.sourceItemId === sourceItemId || sourceMessageIds.includes(m?.sourceMessageId)
+  );
+
+  if (hasNote) labels.push("note");
+  if (hasActionItem) labels.push("action item");
+  if (hasMilestone) labels.push("milestone");
+  return labels;
 }
 function refreshEmailSavedIndicator() {
   const btnSharePoint = document.getElementById("saveSpBtn");
@@ -386,15 +422,17 @@ function refreshEmailSavedIndicator() {
   const savedDate = existing.savedAt
     ? new Date(existing.savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
     : "a prior session";
+  const loggedLabels = getLoggedEmailArtifactLabels(selectedProject);
+  const loggedSuffix = loggedLabels.length ? " Logged as " + loggedLabels.join(", ") + "." : "";
 
   if (emailItem?.hasAttachments) {
     // Allow re-run to catch attachments, but make it clear it was filed
-    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + ". Re-run to sync any new attachments.");
+    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix + " Re-run to sync any new attachments.");
     btnSharePoint.textContent = "↺ Re-sync attachments";
     btnRecordOnly.disabled = true;
     btnRecordOnly.textContent = "✓ In project record";
   } else {
-    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + ".");
+    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix);
     btnSharePoint.disabled = true;
     btnSharePoint.textContent = "✓ Filed to SharePoint";
     btnRecordOnly.disabled = true;
@@ -1176,6 +1214,7 @@ async function doSaveNote() {
       // sourceItemId — matches for the person who saved the note (mailbox-specific).
       // sourceCalendarUId — matches for ALL attendees of the same meeting (shared iCal standard ID).
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
+      ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
       ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
@@ -1260,6 +1299,7 @@ async function doSaveActionItem() {
       importedFromEmail: true,
       links: [],
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
+      ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
       ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
     };
     const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
@@ -1710,6 +1750,8 @@ async function doSaveMilestone() {
       fee:         0,
       notes:       "From email: " + (emailItem?.subject || ""),
       cancelled:   false,
+      ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
+      ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
     };
     setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
     const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
