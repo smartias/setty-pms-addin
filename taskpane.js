@@ -35,6 +35,7 @@ let emailParticipants = []; // { label, displayName, emailAddress }
 let currentItemKind = "message"; // message | appointment
 let lastAttachmentUploadStats = null;
 let currentConversationId = "";
+let projectSelectionVersion = 0;
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -447,6 +448,7 @@ async function getSharedConversationProjectId(conversationId) {
   }
 }
 function setSelectedProject(project, persistForEmail = false) {
+  if (persistForEmail) projectSelectionVersion += 1;
   selectedProject = project || null;
   const badge = document.getElementById("selectedProjectBadge");
   if (badge) {
@@ -479,6 +481,7 @@ function setSelectedProject(project, persistForEmail = false) {
 }
 async function restoreProjectSelectionForCurrentEmail() {
   const msgId = getCurrentMessageRestId();
+  const restoreSelectionVersion = projectSelectionVersion;
   if (!allProjects.length) return;
   let projectId = "";
   if (msgId) {
@@ -500,6 +503,8 @@ async function restoreProjectSelectionForCurrentEmail() {
     }
   }
   if (!projectId) return;
+  if (restoreSelectionVersion !== projectSelectionVersion) return;
+  if (msgId !== getCurrentMessageRestId()) return;
   const project = allProjects.find(p => p.id === projectId);
   if (project) setSelectedProject(project, false);
 }
