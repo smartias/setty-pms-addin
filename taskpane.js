@@ -1268,6 +1268,8 @@ async function doSaveActionItem() {
     await saveToSupabase(allProjects);
     setSelectedProject(selectedProject, true);
     setStatus("actionItemStatus", "success", "✓ Action item saved");
+    // Re-enable immediately on success so users can create another action item without reloading.
+    if (saveBtn) saveBtn.disabled = false;
     document.getElementById("actionItemBody").value = "";
     document.getElementById("actionItemOwner").value = "";
     document.getElementById("actionItemDueDate").value = "";
