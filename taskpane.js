@@ -1273,6 +1273,7 @@ async function doSaveActionItem() {
     document.getElementById("actionItemDueDate").value = "";
   } catch (e) {
     setStatus("actionItemStatus", "error", "✗ " + e.message);
+  } finally {
     if (saveBtn) saveBtn.disabled = false;
   }
 }
