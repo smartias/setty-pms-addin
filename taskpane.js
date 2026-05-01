@@ -1629,6 +1629,16 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
     + "</table>";
 }
 
+// HTML-escape OneNote title / metadata text to prevent breakage on `<`, `&`, etc.
+function escapeOneNoteTextAddin(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function createAddinOneNotePage(project, title, body, category, dateStr) {
   const useTeams   = !!project.teamsOneNoteNotebookId;
   const notebookId = project.teamsOneNoteNotebookId || project.oneNoteNotebookId;
@@ -1652,11 +1662,19 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
     "General":              "General Notes",
   }[category] || "General Notes";
 
-  // Find or create the section
+  // Race-safe section lookup-or-create: catch 409 if two saves try to create
+  // the same section simultaneously, then re-fetch to find the winner.
   const sectionsResp = await graphFetch("GET", `${baseUrl}/notebooks/${notebookId}/sections`);
   let section = (sectionsResp?.value || []).find(s => s.displayName === sectionName);
   if (!section) {
-    section = await graphFetch("POST", `${baseUrl}/notebooks/${notebookId}/sections`, { displayName: sectionName });
+    try {
+      section = await graphFetch("POST", `${baseUrl}/notebooks/${notebookId}/sections`, { displayName: sectionName });
+    } catch (e) {
+      // Another concurrent save may have created the section first — that's fine.
+      if (!(e.message || "").match(/409|nameconflict|already exists/i)) {
+        // Don't rethrow; fall through to re-fetch
+      }
+    }
     if (!section?.id) {
       const refetch = await graphFetch("GET", `${baseUrl}/notebooks/${notebookId}/sections`);
       section = (refetch?.value || []).find(s => s.displayName === sectionName);
@@ -1664,24 +1682,47 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
   }
   if (!section?.id) throw new Error("Could not find or create OneNote section: " + sectionName);
 
-  // Metadata badge header (matches SettyPMS style so pages look consistent)
+  // Metadata badge header (matches SettyPMS style so pages look consistent).
+  // Project number / category escaped — handles `&`, `<`, `>` in unusual project names.
+  const safeProjNum = escapeOneNoteTextAddin(project.projectNumber || "");
+  const safeCategory = escapeOneNoteTextAddin(category || "");
   const badge = [
-    project.projectNumber && `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${project.projectNumber}</span>`,
-    category              && `<span style="background:#e8edf2;color:#003865;padding:2px 8px;border-radius:3px;font-size:11px">${category}</span>`,
+    project.projectNumber && `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${safeProjNum}</span>`,
+    category              && `<span style="background:#e8edf2;color:#003865;padding:2px 8px;border-radius:3px;font-size:11px">${safeCategory}</span>`,
   ].filter(Boolean).join("");
   const header = `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">${badge}</div>`;
-  const pageHtml = `<!DOCTYPE html><html><head><title>${title}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)}</body></html>`;
+  const safeTitle = escapeOneNoteTextAddin(title);
+  const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)}</body></html>`;
 
-  // OneNote pages require text/html — can't use graphFetch() which always sends JSON
+  // POST page with retry on 429/503 — Graph throttles OneNote aggressively
+  // and the previous code would just fail on the first throttle response,
+  // which manifested as random "OneNote 429" errors during heavy save bursts.
   const token = await getToken();
-  const res = await fetch(`https://graph.microsoft.com/v1.0/${baseUrl}/sections/${section.id}/pages`, {
-    method: "POST",
-    headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
-    body: pageHtml,
-  });
-  if (!res.ok) throw new Error("OneNote " + res.status + ": " + (await res.text()).slice(0, 200));
-  const page = await res.json();
-  return { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
+  const url = `https://graph.microsoft.com/v1.0/${baseUrl}/sections/${section.id}/pages`;
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+      body: pageHtml,
+    });
+    if (res.ok) {
+      const page = await res.json();
+      return { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
+    }
+    if (res.status === 429 || res.status === 503) {
+      const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
+      const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(15000, 1000 * Math.pow(2, attempt));
+      console.warn("[OneNote-addin] " + res.status + " — retrying in " + wait + "ms (attempt " + attempt + "/" + maxAttempts + ")");
+      await new Promise(r => setTimeout(r, wait));
+      lastErr = new Error("OneNote throttled (" + res.status + ")");
+      continue;
+    }
+    const errText = await res.text().catch(() => "");
+    throw new Error("OneNote " + res.status + ": " + errText.slice(0, 200));
+  }
+  throw lastErr || new Error("OneNote page creation failed after " + maxAttempts + " attempts");
 }
 
 async function doSaveNote() {
