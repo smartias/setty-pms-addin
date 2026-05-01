@@ -38,6 +38,16 @@ let currentItemKind = "message"; // message | appointment
 let currentItemICalUId = "";    // iCalUId for appointments — same across all attendees' mailboxes
 let lastAttachmentUploadStats = null;
 let currentConversationId = "";
+// Context generation: incremented every time loadItemContext fires (= every
+// time the user clicks a different email/appointment). All in-flight async
+// fetches capture the generation number at start and discard their results
+// if the generation has advanced. Without this, slow Graph calls from email
+// A complete after the user moved to email B and stamp module-level state
+// (`currentItemICalUId`, `emailParticipants`) with values from the wrong item.
+let itemContextGeneration = 0;
+// Save in-flight flag — prevents double-clicks on save buttons from launching
+// parallel save paths that race the version counter and produce phantom errors.
+let saveInFlight = false;
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -200,9 +210,15 @@ function buildMeetingNoteBody(item) {
 }
 
 function loadItemContext() {
+  // Bump the generation. All async work below captures `myGen` at start and
+  // bails out before writing module state if the generation has advanced
+  // (= user clicked a different email mid-fetch).
+  itemContextGeneration++;
+  const myGen = itemContextGeneration;
   emailItem = Office.context.mailbox.item;
   currentConversationId = "";
   currentItemICalUId = "";
+  emailParticipants = [];
   if (!emailItem) return;
   // For appointments, fetch the iCalUId in the background — it's the same across
   // all attendees' mailboxes so we can use it to match notes saved by anyone on the team.
@@ -211,9 +227,11 @@ function loadItemContext() {
       try {
         const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
         const ev = await graphFetch("GET", `/me/events/${restId}?$select=iCalUId`);
+        // Stale-result guard — discard if user has moved to another item
+        if (myGen !== itemContextGeneration) return;
         currentItemICalUId = ev?.iCalUId || "";
-        refreshOneNoteLinkBanner();  // re-run now that we have the shared ID
-        refreshCalendarStatus();     // update "already logged" vs "use Log as Note"
+        refreshOneNoteLinkBanner();
+        refreshCalendarStatus();
       } catch { /* non-fatal */ }
     })();
   }
@@ -232,6 +250,7 @@ function loadItemContext() {
     if (isComposeMode) {
       document.getElementById("emailSubject").textContent = "(Loading…)";
       emailItem.subject.getAsync(r => {
+        if (myGen !== itemContextGeneration) return; // user moved on
         if (r.status === Office.AsyncResultStatus.Succeeded)
           document.getElementById("emailSubject").textContent = r.value || "(No subject)";
       });
@@ -254,6 +273,7 @@ function loadItemContext() {
     if (isComposeMode) {
       document.getElementById("emailMeta").textContent = "Organizer: " + (emailFrom || "(You)");
       emailItem.start.getAsync(r => {
+        if (myGen !== itemContextGeneration) return;
         if (r.status === Office.AsyncResultStatus.Succeeded) {
           const d = new Date(r.value);
           const dateFmt = isNaN(d) ? "" : d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
@@ -271,8 +291,14 @@ function loadItemContext() {
       { label: "Organizer", displayName: emailFrom, emailAddress: emailFromAddress },
     ]);
     if (isComposeMode) {
-      // Compose mode — attendees are async Recipients objects
+      // Compose mode — attendees are async Recipients objects. Without
+      // generation guarding, a user clicking "Log as Note" within ~200ms of
+      // opening a compose-mode appointment would save the note before
+      // attendees finished loading. Now: each callback bails if the item
+      // changed; loadAtts dispatches both required+optional in parallel and
+      // doesn't update emailParticipants from a stale generation.
       const loadAtts = (getter, label) => getter.getAsync(r => {
+        if (myGen !== itemContextGeneration) return;
         if (r.status === Office.AsyncResultStatus.Succeeded) {
           emailParticipants = dedupeParticipants([
             ...emailParticipants,
@@ -621,43 +647,94 @@ async function legacyApplyLocalChangeAndSave(projectId, mutateProject) {
   return mutated;
 }
 
+// Cached migration-status flag. Once we know V2 is canonical, we never fall
+// back to the legacy path — falling back would write a stale projects-array
+// snapshot to pms_data, creating a divergent shadow copy that nothing reads
+// but might mislead future debugging.
+let _migrationKnownComplete = false;
+
+async function _checkAddinMigrationStatus() {
+  if (_migrationKnownComplete) return true;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.migration_status&select=data", { headers: SB_HEADERS });
+    if (!res.ok) return false;
+    const rows = await res.json();
+    if (rows?.[0]?.data?.v1_complete) {
+      _migrationKnownComplete = true;
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // Main entry point — used by all save callsites in the add-in.
 async function applyLocalChangeAndSave(projectId, mutateProject) {
   if (!projectId) throw new Error("applyLocalChangeAndSave: missing projectId");
 
   // Try V2 path first
   let fresh;
+  let v2FetchFailed = false;
   try {
     fresh = await fetchFreshProjectV2(projectId);
   } catch (e) {
-    // pms_projects table missing or other error — fall back to legacy.
-    console.warn("V2 fetch failed, falling back to legacy save path:", e.message);
-    return legacyApplyLocalChangeAndSave(projectId, mutateProject);
+    v2FetchFailed = true;
+    console.warn("V2 fetch failed:", e.message);
   }
 
-  if (!fresh) {
-    // Not migrated yet — use legacy path. Migration happens in PMS app.
-    return legacyApplyLocalChangeAndSave(projectId, mutateProject);
-  }
-
-  // V2 happy path
-  const mutated = mutateProject(fresh.project);
-  if (!mutated || !mutated.id) throw new Error("mutator returned invalid project");
-  try {
-    await saveProjectRowV2(mutated, fresh.version);
-  } catch (e) {
-    if (e instanceof AddinConflictError) {
-      // For Phase 2 the add-in surfaces conflicts as errors. Phase 5 may add
-      // a "merge with cloud" UX; for now the user retries after refreshing.
-      throw new Error("⚠ Save conflict: " + e.message + ". Refresh the add-in pane and try again.");
+  if (fresh) {
+    // V2 happy path
+    const mutated = mutateProject(fresh.project);
+    if (!mutated || !mutated.id) throw new Error("mutator returned invalid project");
+    try {
+      await saveProjectRowV2(mutated, fresh.version);
+    } catch (e) {
+      if (e instanceof AddinConflictError) {
+        throw new Error("⚠ Save conflict: " + e.message + ". Refresh the add-in pane and try again.");
+      }
+      throw e;
     }
-    throw e;
+    allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
+    if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
+    return mutated;
   }
 
-  // Update in-memory caches
-  allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
-  if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
-  return mutated;
+  // No V2 row found OR V2 fetch errored. Before falling back to legacy, check
+  // whether migration has already happened — if it has, the legacy path would
+  // write a stale shadow copy that no one reads. In that case we surface a
+  // clear error rather than silently writing to a dead-end table.
+  const migrationDone = await _checkAddinMigrationStatus();
+  if (migrationDone && !fresh) {
+    // V2 migration is complete but this project doesn't have a V2 row. Either
+    // the project was added in legacy and never migrated (unlikely), or this
+    // is a brand-new add via the add-in. Treat as INSERT.
+    try {
+      const mutated = mutateProject({ id: projectId });
+      if (!mutated?.id) throw new Error("mutator returned invalid project");
+      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_projects", {
+        method: "POST",
+        headers: SB_HEADERS,
+        body: JSON.stringify({ id: projectId, project: mutated, version: 1, updated_at: new Date().toISOString() }),
+      });
+      if (!res.ok) throw new Error("pms_projects POST HTTP " + res.status);
+      _projectVersionCache.set(projectId, 1);
+      allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
+      if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
+      return mutated;
+    } catch (insertErr) {
+      throw new Error("Could not save: V2 row missing for project " + projectId + " and INSERT failed: " + insertErr.message);
+    }
+  }
+  if (migrationDone && v2FetchFailed) {
+    // Migration is done but our V2 fetch failed transiently. Don't fall back
+    // to legacy — surface the error so the user retries instead of writing
+    // to a dead-end table.
+    throw new Error("Cloud temporarily unreachable. Wait a few seconds and try again. (V2 fetch failed; not falling back to legacy because the data layer has migrated.)");
+  }
+
+  // Pre-migration: legacy path is still authoritative
+  return legacyApplyLocalChangeAndSave(projectId, mutateProject);
 }
 async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
   if (!projectId || !emailRecord?.msgId) return;
@@ -674,18 +751,19 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
     sp_folder_url: emailRecord.spFolderUrl || "",
     saved_to_sharepoint: !!savedToSharePoint,
   };
-  try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE, {
-      method: "POST",
-      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
-      body: JSON.stringify(row),
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn("Normalized email row save failed:", res.status, errText);
-    }
-  } catch (e) {
-    console.warn("Normalized email row save failed:", e);
+  // Throws on failure (caller catches and surfaces a warning). Previously this
+  // silently console.warn'd and returned, so users had no idea their email
+  // was missing from the search index. The email is still in the project
+  // record (saved by applyLocalChangeAndSave above), just not indexed for
+  // PMS-side search until a re-save.
+  const res = await fetch(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE, {
+    method: "POST",
+    headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+    body: JSON.stringify(row),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
   }
 }
 function updateProjectInList(updatedProject) {
@@ -759,6 +837,28 @@ async function getSharedConversationProjectId(conversationId) {
     return rows?.[0]?.project_id || "";
   } catch {
     return "";
+  }
+}
+
+// Returns full thread-tag info including who tagged it. Used by
+// restoreProjectSelectionForCurrentEmail to show an attribution banner
+// when a colleague tagged this thread (so the user knows their tag
+// inheritance came from someone else, not their own past click).
+async function getSharedConversationTag(conversationId) {
+  if (!conversationId) return null;
+  const url =
+    SUPABASE_URL +
+    "/rest/v1/" +
+    EMAIL_THREAD_TAGS_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&select=project_id,tagged_by,updated_at&limit=1";
+  try {
+    const res = await fetch(url, { headers: SB_HEADERS });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0] || null;
+  } catch {
+    return null;
   }
 }
 function isProjectAwarded(project) {
@@ -976,6 +1076,7 @@ async function restoreProjectSelectionForCurrentEmail() {
   const msgId = getCurrentMessageRestId();
   if (!allProjects.length) return;
   let projectId = "";
+  let taggedByOther = null; // colleague who tagged this thread, if any
   if (msgId) {
     const map = getEmailProjectMap();
     projectId = map[msgId] || "";
@@ -986,17 +1087,35 @@ async function restoreProjectSelectionForCurrentEmail() {
       const convoMap = getConversationProjectMap();
       projectId = convoMap[conversationId] || "";
       if (!projectId) {
-        projectId = await getSharedConversationProjectId(conversationId);
+        // Fetch shared tag with attribution so we can show "Tagged by Sara"
+        // banner — prevents users from being confused when a thread is
+        // auto-tagged to a project they didn't choose.
+        const tag = await getSharedConversationTag(conversationId);
+        projectId = tag?.project_id || "";
         if (projectId) {
           convoMap[conversationId] = projectId;
           saveConversationProjectMap(convoMap);
+          const myUsername = (msalAccount?.username || "").toLowerCase();
+          const taggedBy = (tag?.tagged_by || "").toLowerCase();
+          if (taggedBy && taggedBy !== myUsername) {
+            taggedByOther = tag.tagged_by;
+          }
         }
       }
     }
   }
   if (!projectId) return;
   const project = allProjects.find(p => p.id === projectId);
-  if (project) setSelectedProject(project, false);
+  if (project) {
+    setSelectedProject(project, false);
+    if (taggedByOther) {
+      // Surface attribution so the user sees this is a teammate's tag, not
+      // a stale auto-restoration. Last-write-wins on the tag is documented
+      // and fine, but invisible attribution is the bug.
+      const projLabel = (project.projectNumber ? project.projectNumber + " — " : "") + project.name;
+      setStatus("actionStatus", "info", "ℹ Auto-tagged to " + projLabel + " by " + taggedByOther + ". If wrong, click ✕ on the project chip to clear and pick another.");
+    }
+  }
 }
 function renderCompanySuggestions() {
   const list = document.getElementById("companyList");
@@ -1046,8 +1165,15 @@ async function getEmailBodyHtml(token) {
 
 // Phase 3: compress HTML email body to base64 deflate before storing in the
 // project record. Identical implementation to PMS so records are interchangeable.
+// Logs a clear warning when compression fails non-trivially (i.e., we had real
+// HTML to compress but couldn't), so failures don't silently produce empty
+// bodyHtmlCompressed fields the user later sees as "Live-fetched only".
 function compressHtmlAddin(html) {
-  if (!html || typeof pako === "undefined") return "";
+  if (!html) return "";
+  if (typeof pako === "undefined") {
+    console.warn("compressHtmlAddin: pako library not loaded — email will save with empty bodyHtmlCompressed and require live-fetch on view");
+    return "";
+  }
   try {
     const deflated = pako.deflate(html, { level: 6 });
     let binary = "";
@@ -1057,7 +1183,7 @@ function compressHtmlAddin(html) {
     }
     return btoa(binary);
   } catch (e) {
-    console.warn("compressHtmlAddin failed:", e);
+    console.warn("compressHtmlAddin failed for", html.length, "chars:", e);
     return "";
   }
 }
@@ -1204,8 +1330,36 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
   }
   return true;
 }
+// ─── CONCURRENT-SAVE GUARD ────────────────────────────────────────────────────
+// Wraps a save function so a second click during the first call's flight is
+// ignored rather than launching a parallel save that races the version
+// counter and produces phantom errors. Disables the supplied buttons during
+// the flight; restores them when finished (success or error). Uses the
+// `saveInFlight` module flag as a process-wide lock — only one save of any
+// type can run at a time, since they all go through applyLocalChangeAndSave
+// and would otherwise race on selectedProject's version.
+async function withSaveGuard(name, fn, buttonIds = []) {
+  if (saveInFlight) {
+    setStatus("actionStatus", "info", "⏳ Another save is in progress; please wait.");
+    return;
+  }
+  saveInFlight = true;
+  const buttons = buttonIds.map(id => document.getElementById(id)).filter(Boolean);
+  const wasDisabled = buttons.map(b => b.disabled);
+  buttons.forEach(b => { b.disabled = true; });
+  try {
+    return await fn();
+  } finally {
+    saveInFlight = false;
+    buttons.forEach((b, i) => { if (!wasDisabled[i]) b.disabled = false; });
+  }
+}
+
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
 async function doSaveToSharePoint() {
+  return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
+}
+async function _doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
 const currentMsgId = getCurrentMessageRecordId();
@@ -1220,7 +1374,11 @@ if (existingRecord) {
     const { driveId } = await resolveSpIds();
     // Phase 3: fetch body HTML once up front so we can both upload to SharePoint
     // AND store the compressed version on the project record.
+    // Track body-fetch failure separately so we can surface it in the success
+    // message — previously a silent "" fallback meant the user thought everything
+    // worked but the email record had no readable body.
     const bodyHtml = await getEmailBodyHtml(token);
+    const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(emailItem.dateTimeCreated);
@@ -1251,12 +1409,34 @@ if (existingRecord) {
       ...fresh,
       emails: [...(fresh.emails || []), emailRecord],
     }));
-    await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+    let indexSaveFailed = false;
+    try {
+      await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+    } catch (idxErr) {
+      console.warn("saveProjectEmailRow failed:", idxErr);
+      indexSaveFailed = true;
+    }
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     const attempted = lastAttachmentUploadStats?.attempted || 0;
+
+    // Compose status message accounting for ALL partial-failure modes (Issues #6, #7, #8):
+    //   - body fetch failed → email.html was uploaded with "(No body)"
+    //   - some attachments failed → user sees "X / Y uploaded"
+    //   - all attachments failed → error
+    //   - search-index write failed → email won't appear in PMS email-search results
+    const warnings = [];
+    if (bodyFetchFailed) warnings.push("⚠ Email body could not be retrieved from Outlook — saved record will show '(No body)' until you re-save when the email is reachable.");
+    if (attempted > 0 && attCount > 0 && attCount < attempted) {
+      const failedNames = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
+      warnings.push("⚠ Only " + attCount + "/" + attempted + " attachments uploaded" + (failedNames ? " (failed: " + failedNames + ")" : "") + ".");
+    }
+    if (indexSaveFailed) warnings.push("⚠ Email saved to project, but search-index write failed — it may not appear in PMS email searches until you resave or PMS is reloaded.");
+
     if (attempted > 0 && attCount === 0) {
       const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
-      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details."));
+      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details.") + (warnings.length ? " " + warnings.join(" ") : ""));
+    } else if (warnings.length > 0) {
+      setStatus("actionStatus", "info", "✓ Saved to SharePoint" + attMsg + " and project record. " + warnings.join(" "));
     } else if (attempted === 0) {
       setStatus("actionStatus", "info", "Email saved to SharePoint, but no attachments were detected by Outlook/Graph for this message.");
     } else {
@@ -1268,6 +1448,9 @@ if (existingRecord) {
   }
 }
 async function doSaveToProjectRecordOnly() {
+  return withSaveGuard("save-record", _doSaveToProjectRecordOnly, ["saveSpBtn", "saveRecordBtn"]);
+}
+async function _doSaveToProjectRecordOnly() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (emailItem?.hasAttachments) {
     setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint + Project Record' instead.");
@@ -1283,6 +1466,7 @@ async function doSaveToProjectRecordOnly() {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
     const bodyHtml = await getEmailBodyHtml(token);
+    const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
     const emailRecord = {
@@ -1302,8 +1486,21 @@ async function doSaveToProjectRecordOnly() {
       ...fresh,
       emails: [...(fresh.emails || []), emailRecord],
     }));
-    await saveProjectEmailRow(selectedProject.id, emailRecord, false);
-    setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
+    let indexSaveFailed = false;
+    try {
+      await saveProjectEmailRow(selectedProject.id, emailRecord, false);
+    } catch (idxErr) {
+      console.warn("saveProjectEmailRow failed:", idxErr);
+      indexSaveFailed = true;
+    }
+    const warnings = [];
+    if (bodyFetchFailed) warnings.push("⚠ Email body could not be retrieved from Outlook.");
+    if (indexSaveFailed) warnings.push("⚠ Search-index write failed — may not appear in PMS email searches until next resave.");
+    if (warnings.length > 0) {
+      setStatus("actionStatus", "info", "✓ Saved to project record. " + warnings.join(" "));
+    } else {
+      setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
+    }
     refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
@@ -1392,6 +1589,7 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
 
 async function doSaveNote() {
   if (!selectedProject) { setStatus("noteStatus", "error", "No project selected."); return; }
+  if (saveInFlight) { setStatus("noteStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const category = document.getElementById("noteCategory").value;
   const body = document.getElementById("noteBody").value.trim();
   if (!body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
@@ -1399,6 +1597,7 @@ async function doSaveNote() {
   // Disable immediately so a slow OneNote round-trip can't trigger a double-save.
   const saveNoteBtn = document.getElementById("saveNoteBtn");
   if (saveNoteBtn) saveNoteBtn.disabled = true;
+  saveInFlight = true;
 
   // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
@@ -1467,6 +1666,8 @@ async function doSaveNote() {
     setStatus("noteStatus", "error", "✗ " + e.message);
     // Re-enable the button so the user can retry after fixing the error.
     if (saveNoteBtn) saveNoteBtn.disabled = false;
+  } finally {
+    saveInFlight = false;
   }
 }
 
@@ -1489,6 +1690,7 @@ function prefillActionItem() {
 
 async function doSaveActionItem() {
   if (!selectedProject) { setStatus("actionItemStatus", "error", "No project selected."); return; }
+  if (saveInFlight) { setStatus("actionItemStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const teamMembers = getProjectTeamMembers(selectedProject);
   const body = document.getElementById("actionItemBody").value.trim();
   const owner = document.getElementById("actionItemOwner").value.trim();
@@ -1504,6 +1706,7 @@ async function doSaveActionItem() {
 
   const saveBtn = document.getElementById("saveActionItemBtn");
   if (saveBtn) saveBtn.disabled = true;
+  saveInFlight = true;
   setStatus("actionItemStatus", "info", "⏳ Saving…");
 
   try {
@@ -1538,6 +1741,8 @@ async function doSaveActionItem() {
   } catch (e) {
     setStatus("actionItemStatus", "error", "✗ " + e.message);
     if (saveBtn) saveBtn.disabled = false;
+  } finally {
+    saveInFlight = false;
   }
 }
 // ─── SHARED: file email+attachments into a project subfolder ─────────────────
@@ -1583,8 +1788,10 @@ function prefillRfi() {
 }
 async function doSaveRfi() {
   if (!selectedProject) { setStatus("rfiStatus", "error", "No project selected."); return; }
+  if (saveInFlight) { setStatus("rfiStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const title = document.getElementById("rfiTitle").value.trim();
   if (!title) { setStatus("rfiStatus", "error", "Title is required."); return; }
+  saveInFlight = true;
   setStatus("rfiStatus", "info", "⏳ Saving…");
   try {
     // Re-fetch fresh project data so the RFI number reflects what's actually in
@@ -1633,14 +1840,18 @@ async function doSaveRfi() {
     document.getElementById("rfiNotes").value = "";
   } catch (e) {
     setStatus("rfiStatus", "error", "✗ " + e.message);
+  } finally {
+    saveInFlight = false;
   }
 }
 async function doFileToExistingRfi() {
   if (!selectedProject) { setStatus("rfiExistingStatus", "error", "Select a project first."); return; }
   const rfiId = document.getElementById("rfiExistingSelect").value;
   if (!rfiId) { setStatus("rfiExistingStatus", "error", "Select an RFI."); return; }
+  if (saveInFlight) { setStatus("rfiExistingStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const rfi = (selectedProject.rfis || []).find(r => r.id === rfiId);
   if (!rfi) { setStatus("rfiExistingStatus", "error", "RFI not found."); return; }
+  saveInFlight = true;
   setStatus("rfiExistingStatus", "info", "⏳ Filing email…");
   try {
     const token = await getToken();
@@ -1667,6 +1878,8 @@ async function doFileToExistingRfi() {
     setStatus("rfiExistingStatus", "success", "✓ Filed to " + rfi.number + attMsg);
   } catch (e) {
     setStatus("rfiExistingStatus", "error", "✗ " + e.message);
+  } finally {
+    saveInFlight = false;
   }
 }
 // ─── LOG SUBMITTAL ────────────────────────────────────────────────────────────
@@ -1676,8 +1889,10 @@ function prefillSub() {
 }
 async function doSaveSub() {
   if (!selectedProject) { setStatus("subStatus", "error", "No project selected."); return; }
+  if (saveInFlight) { setStatus("subStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const desc = document.getElementById("subDesc").value.trim();
   if (!desc) { setStatus("subStatus", "error", "Description is required."); return; }
+  saveInFlight = true;
   setStatus("subStatus", "info", "⏳ Saving…");
   try {
     // Re-fetch so submittal numbering reflects current cloud state.
@@ -1727,14 +1942,18 @@ async function doSaveSub() {
     document.getElementById("subNotes").value = "";
   } catch (e) {
     setStatus("subStatus", "error", "✗ " + e.message);
+  } finally {
+    saveInFlight = false;
   }
 }
 async function doFileToExistingSub() {
   if (!selectedProject) { setStatus("subExistingStatus", "error", "Select a project first."); return; }
+  if (saveInFlight) { setStatus("subExistingStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const subId = document.getElementById("subExistingSelect").value;
   if (!subId) { setStatus("subExistingStatus", "error", "Select a submittal."); return; }
   const sub = (selectedProject.submittals || []).find(s => s.id === subId);
   if (!sub) { setStatus("subExistingStatus", "error", "Submittal not found."); return; }
+  saveInFlight = true;
   setStatus("subExistingStatus", "info", "⏳ Filing email…");
   try {
     const token = await getToken();
@@ -1759,6 +1978,8 @@ async function doFileToExistingSub() {
     setStatus("subExistingStatus", "success", "✓ Filed to " + sub.number + attMsg);
   } catch (e) {
     setStatus("subExistingStatus", "error", "✗ " + e.message);
+  } finally {
+    saveInFlight = false;
   }
 }
 // ─── CALENDAR HELPERS ─────────────────────────────────────────────────────────
@@ -1978,14 +2199,14 @@ async function doSaveMilestone() {
   if (!name)    { setStatus("milestoneStatus", "error", "Please enter a milestone name."); return; }
   if (!dueDate) { setStatus("milestoneStatus", "error", "Please select a date."); return; }
   if (!selectedProject) { setStatus("milestoneStatus", "error", "Select a project first (go back)."); return; }
+  if (saveInFlight) { setStatus("milestoneStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
   setStatus("milestoneStatus", "info", "⏳ Saving…");
   try {
-    const res  = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
-    const rows = await res.json();
-    const projects = rows[0]?.projects || [];
-    const proj = projects.find(p => p.id === selectedProject.id);
-    if (!proj) { setStatus("milestoneStatus", "error", "Project not found in Supabase."); return; }
-    // Create calendar event first so we can store its ID on the milestone
+    // Build the milestone first; sync calendar; then save via V2 path.
+    // Previously this function PATCHed pms_data.projects directly, which
+    // post-migration is a dead-end table — every milestone created here was
+    // silently lost. Now uses applyLocalChangeAndSave like every other save.
     const milestone = {
       id:          "addin-" + Date.now().toString(36) + Math.random().toString(36).slice(2,6),
       name,
@@ -2002,12 +2223,13 @@ async function doSaveMilestone() {
     setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
     const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
     if (calResult.success) milestone.calendarEventId = calResult.eventId;
-    proj.milestones = [...(proj.milestones || []), milestone];
-    await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
-      method:  "PATCH",
-      headers: SB_HEADERS,
-      body:    JSON.stringify({ projects, updated_at: new Date().toISOString() }),
-    });
+
+    setStatus("milestoneStatus", "info", "⏳ Saving to project…");
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      milestones: [...(fresh.milestones || []), milestone],
+    }));
+
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
     if (calResult.success) {
       const calLabel = calResult.onShared ? "NYC Shared Calendar" : "your personal calendar";
@@ -2018,6 +2240,8 @@ async function doSaveMilestone() {
     document.getElementById("milestoneForm").style.display = "none";
   } catch(e) {
     setStatus("milestoneStatus", "error", "✗ " + e.message);
+  } finally {
+    saveInFlight = false;
   }
 }
 // ─── PEOPLE PICKER ────────────────────────────────────────────────────────────
@@ -2179,52 +2403,80 @@ async function doSaveContact() {
   const type    = document.getElementById("contactType").value;
   const saveTo  = document.getElementById("contactSaveTo").value;
   if (!name && !email) { setStatus("contactStatus", "error", "Name or email required."); return; }
+  if (saveInFlight) { setStatus("contactStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
   setStatus("contactStatus", "info", "⏳ Saving…");
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=clients,projects", {
-      headers: SB_HEADERS,
-    });
-    const rows = await res.json();
-    const patchBody = {};
     if (saveTo === "client") {
-      const clients = rows[0]?.clients || [];
-      const existing = clients.find(c => c.name && c.name.trim().toLowerCase() === (company || name).trim().toLowerCase());
+      // V2: write to pms_clients (per-client rows). Previously this PATCHed
+      // pms_data.clients (legacy singleton blob), which post-migration is
+      // never re-read by PMS — so the contact silently disappeared. Now we
+      // upsert the client row directly.
+      const targetCompany = (company || name).trim();
       const contact = { id: uid(), name, title, email, phone, role: type };
+      // Find existing client by exact (case-insensitive) name match
+      const queryUrl = SUPABASE_URL + "/rest/v1/pms_clients?select=id,client,version";
+      const all = await fetch(queryUrl, { headers: SB_HEADERS });
+      if (!all.ok) throw new Error("pms_clients GET HTTP " + all.status);
+      const rows = await all.json();
+      const existing = (rows || []).find(r => r.client?.name && r.client.name.trim().toLowerCase() === targetCompany.toLowerCase());
       if (existing) {
-        existing.contacts = existing.contacts || [];
-        if (contactExistsInList(existing.contacts, email, name)) {
+        const ec = existing.client;
+        ec.contacts = ec.contacts || [];
+        if (contactExistsInList(ec.contacts, email, name)) {
           setStatus("contactStatus", "info", "Contact already exists for this client. No duplicate was added.");
           return;
         }
-        existing.contacts = [...existing.contacts, contact];
+        ec.contacts = [...ec.contacts, contact];
+        // Optimistic-version PATCH
+        const patchUrl = SUPABASE_URL + "/rest/v1/pms_clients?id=eq." + encodeURIComponent(existing.id) +
+                         "&version=eq." + existing.version;
+        const res = await fetch(patchUrl, {
+          method: "PATCH",
+          headers: { ...SB_HEADERS, "Prefer": "return=representation" },
+          body: JSON.stringify({ client: ec, version: existing.version + 1, updated_at: new Date().toISOString() }),
+        });
+        if (!res.ok) throw new Error("pms_clients PATCH HTTP " + res.status);
+        const result = await res.json();
+        if (!result || result.length === 0) throw new Error("Client modified by someone else. Retry from Outlook.");
       } else {
-        clients.push({ id: uid(), name: company || name, type, contacts: [contact], address: "" });
+        // New client — INSERT
+        const newClient = { id: uid(), name: targetCompany, type, contacts: [contact], address: "" };
+        const res = await fetch(SUPABASE_URL + "/rest/v1/pms_clients", {
+          method: "POST",
+          headers: SB_HEADERS,
+          body: JSON.stringify({ id: newClient.id, client: newClient, version: 1, updated_at: new Date().toISOString() }),
+        });
+        if (!res.ok) throw new Error("pms_clients POST HTTP " + res.status);
+        // Update in-memory cache so subsequent UI references see the new client
+        allClients = [...(allClients || []), newClient];
+        renderCompanySuggestions();
       }
-      patchBody.clients = clients;
     } else {
       if (!selectedProject) { setStatus("contactStatus", "error", "Select a project first."); return; }
       const poc = { id: uid(), name, title, email, phone, role: type };
-      const projects = rows[0]?.projects || allProjects;
-      const proj = projects.find(p => p.id === selectedProject.id);
-      if (proj) {
-        proj.projectContacts = proj.projectContacts || {};
-        proj.projectContacts.pm = proj.projectContacts.pm || [];
-        if (contactExistsInList(proj.projectContacts.pm, email, name)) {
-          setStatus("contactStatus", "info", "Contact already exists in this project's POC list. No duplicate was added.");
-          return;
+      // V2: per-project save with version check via applyLocalChangeAndSave.
+      // Already routes through pms_projects with optimistic concurrency.
+      await applyLocalChangeAndSave(selectedProject.id, fresh => {
+        const projectContacts = { ...(fresh.projectContacts || {}) };
+        const pm = projectContacts.pm || [];
+        if (contactExistsInList(pm, email, name)) {
+          // Throw to abort the save and tell user it's a no-op
+          throw new Error("__DUP__");
         }
-        proj.projectContacts.pm = [...proj.projectContacts.pm, poc];
-      }
-      patchBody.projects = projects;
+        projectContacts.pm = [...pm, poc];
+        return { ...fresh, projectContacts };
+      });
     }
-    await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
-      method: "PATCH",
-      headers: SB_HEADERS,
-      body: JSON.stringify({ ...patchBody, updated_at: new Date().toISOString() }),
-    });
     setStatus("contactStatus", "success", "✓ Contact saved.");
   } catch (e) {
-    setStatus("contactStatus", "error", "✗ " + e.message);
+    if (e.message === "__DUP__") {
+      setStatus("contactStatus", "info", "Contact already exists in this project's POC list. No duplicate was added.");
+    } else {
+      setStatus("contactStatus", "error", "✗ " + e.message);
+    }
+  } finally {
+    saveInFlight = false;
   }
 }
 // ─── PMS METADATA HELPERS (mirrors SettyPMS.html metadata schema) ─────────────
