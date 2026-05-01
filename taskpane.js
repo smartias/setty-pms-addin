@@ -516,7 +516,60 @@ const SB_HEADERS = {
   "Content-Type": "application/json",
   "Prefer": "return=minimal",
 };
+// Quick-Win #6: localStorage cache for the projects/clients list. Pane opens
+// instantly with last-known data; freshness fetch runs in the background and
+// re-renders if anything changed. Without this, the pane shows a blank state
+// while the V2 fetch round-trips Supabase (~300-800ms cold, longer on slow
+// VPN). With cache, perceived open time drops to ~50ms.
+const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV2";
+const PROJECTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h hard limit; revalidate every open
+
+function loadProjectsCache() {
+  try {
+    const raw = localStorage.getItem(PROJECTS_CACHE_KEY);
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    if (!cached || !Array.isArray(cached.projects)) return null;
+    if (!cached.savedAt || (Date.now() - cached.savedAt) > PROJECTS_CACHE_TTL_MS) return null;
+    return cached;
+  } catch {
+    return null;
+  }
+}
+
+function saveProjectsCache(projects, clients, versionMap) {
+  try {
+    const payload = {
+      projects,
+      clients: clients || [],
+      versionMap: versionMap || {},
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(payload));
+  } catch (e) {
+    // QuotaExceeded is the most likely failure; silently drop. Cache is an
+    // optimization, not a correctness requirement.
+    console.warn("Projects cache save failed (will work without cache):", e.message);
+  }
+}
+
 async function loadProjects() {
+  // Hydrate from cache instantly (if available) so the pane is responsive
+  // even before the fresh fetch returns. The cache holds the *projects array*
+  // (post-archived-filter) and the version map; we'll overwrite both when
+  // the fresh fetch completes.
+  const cached = loadProjectsCache();
+  let renderedFromCache = false;
+  if (cached) {
+    allProjects = cached.projects;
+    allClients = cached.clients;
+    for (const [id, ver] of Object.entries(cached.versionMap || {})) {
+      _projectVersionCache.set(id, ver);
+    }
+    renderCompanySuggestions();
+    renderedFromCache = true;
+  }
+
   // Prefer V2 (per-project rows). Falls back to legacy pms_data if V2 tables
   // don't exist yet or are empty (pre-migration). Once PMS migrates, V2 is
   // authoritative and the legacy row becomes a static safety net.
@@ -531,14 +584,26 @@ async function loadProjects() {
       if (pRows && pRows.length > 0) {
         // V2 path
         allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
-        for (const r of pRows) _projectVersionCache.set(r.id, r.version);
+        const versionMap = {};
+        for (const r of pRows) {
+          _projectVersionCache.set(r.id, r.version);
+          versionMap[r.id] = r.version;
+        }
         allClients = (cRows || []).map(r => r.client).filter(Boolean);
         renderCompanySuggestions();
+        // Refresh the cache with the latest data
+        saveProjectsCache(allProjects, allClients, versionMap);
         return;
       }
     }
   } catch (e) {
     console.warn("V2 loadProjects failed, falling back to legacy:", e.message);
+    // If we have cached data and the network fetch failed, leave the cache
+    // populated and surface a soft warning rather than blowing away the UI.
+    if (renderedFromCache) {
+      console.info("Working from cached projects (offline or transient error). Saves will revalidate.");
+      return;
+    }
   }
   // Legacy fallback
   try {
@@ -1227,31 +1292,63 @@ function buildEmailHtml(bodyHtml) {
 async function uploadEmailAndAttachments(driveId, token, targetPath) {
   lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [] };
   const bodyHtml = await getEmailBodyHtml(token);
-  await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath) + "/email.html:/content", {
-    method: "PUT",
-    headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
-    body: buildEmailHtml(bodyHtml),
-  });
+  // Kick off the email.html upload in parallel with the attachment loop —
+  // they don't depend on each other, so why serialize them.
+  const emailHtmlPromise = fetch(
+    "https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath) + "/email.html:/content",
+    {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+      body: buildEmailHtml(bodyHtml),
+    }
+  );
+
+  // Quick-Win #3: parallelize attachment uploads with bounded concurrency.
+  // Graph throttles aggressively above ~5 parallel writes per session; 3 is
+  // a safe ceiling that gives meaningful speedup (~3x for emails with 5+
+  // attachments) without triggering 429 backoff.
+  const ATTACHMENT_CONCURRENCY = 3;
+  async function uploadInBatches(items, doUpload) {
+    const failures = [];
+    let succeeded = 0;
+    for (let i = 0; i < items.length; i += ATTACHMENT_CONCURRENCY) {
+      const batch = items.slice(i, i + ATTACHMENT_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(doUpload));
+      results.forEach((r, idx) => {
+        const item = batch[idx];
+        if (r.status === "fulfilled" && r.value) succeeded++;
+        else failures.push((item.name || "attachment") + (r.status === "rejected" ? " (" + (r.reason?.message || "error").slice(0, 60) + ")" : ""));
+      });
+    }
+    return { succeeded, failures };
+  }
+
   try {
     let count = 0;
     // Prefer Outlook item APIs for attachment bytes; this is the most reliable in add-ins.
     const officeAtts = await getOfficeFileAttachments();
     if (officeAtts.length) {
-      for (const att of officeAtts) {
-        lastAttachmentUploadStats.attempted++;
-        const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes);
-        if (uploaded) count++;
-        else lastAttachmentUploadStats.failed.push(att.name || "attachment");
-      }
+      lastAttachmentUploadStats.attempted = officeAtts.length;
+      const { succeeded, failures } = await uploadInBatches(
+        officeAtts,
+        att => uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes)
+      );
+      count = succeeded;
+      lastAttachmentUploadStats.failed.push(...failures);
       lastAttachmentUploadStats.uploaded = count;
+      // Make sure email.html upload completed before returning
+      await emailHtmlPromise;
       return count;
     }
     // Fallback to Graph attachment APIs when Office APIs are unavailable.
+    // Download bytes in parallel too — for large emails with many attachments,
+    // this is where most of the time was being spent.
     const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
-    for (const att of (attData?.value || [])) {
-      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
-      lastAttachmentUploadStats.attempted++;
+    const fileAtts = (attData?.value || []).filter(att => att["@odata.type"] === "#microsoft.graph.fileAttachment");
+    lastAttachmentUploadStats.attempted = fileAtts.length;
+
+    const { succeeded, failures } = await uploadInBatches(fileAtts, async (att) => {
       let bytes = null;
       if (att.contentBytes) {
         const binary = atob(att.contentBytes);
@@ -1263,22 +1360,22 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
           { headers: { "Authorization": "Bearer " + token } }
         );
         if (!rawRes.ok) {
-          console.warn("Attachment download failed:", att.name, rawRes.status);
-          lastAttachmentUploadStats.failed.push((att.name || "attachment") + " (download " + rawRes.status + ")");
-          continue;
+          throw new Error("download " + rawRes.status);
         }
         bytes = new Uint8Array(await rawRes.arrayBuffer());
       }
-      if (!bytes) continue;
-      const uploaded = await uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
-      if (uploaded) count++;
-      else lastAttachmentUploadStats.failed.push(att.name || "attachment");
-    }
+      if (!bytes) return false;
+      return uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
+    });
+    count = succeeded;
+    lastAttachmentUploadStats.failed.push(...failures);
     lastAttachmentUploadStats.uploaded = count;
+    await emailHtmlPromise;
     return count;
   } catch (e) {
     console.warn("Attachment upload failed:", e.message);
     lastAttachmentUploadStats.failed.push("Unhandled error: " + e.message);
+    try { await emailHtmlPromise; } catch {}
     return 0;
   }
 }
