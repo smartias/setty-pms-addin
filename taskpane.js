@@ -491,6 +491,30 @@ const SB_HEADERS = {
   "Prefer": "return=minimal",
 };
 async function loadProjects() {
+  // Prefer V2 (per-project rows). Falls back to legacy pms_data if V2 tables
+  // don't exist yet or are empty (pre-migration). Once PMS migrates, V2 is
+  // authoritative and the legacy row becomes a static safety net.
+  try {
+    const [pRes, cRes] = await Promise.all([
+      fetch(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }),
+      fetch(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }),
+    ]);
+    if (pRes.ok && cRes.ok) {
+      const pRows = await pRes.json();
+      const cRows = await cRes.json();
+      if (pRows && pRows.length > 0) {
+        // V2 path
+        allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
+        for (const r of pRows) _projectVersionCache.set(r.id, r.version);
+        allClients = (cRows || []).map(r => r.client).filter(Boolean);
+        renderCompanySuggestions();
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn("V2 loadProjects failed, falling back to legacy:", e.message);
+  }
+  // Legacy fallback
   try {
     const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", {
       headers: SB_HEADERS,
@@ -510,6 +534,130 @@ async function saveToSupabase(updatedProjects) {
     headers: SB_HEADERS,
     body: JSON.stringify({ projects: updatedProjects, updated_at: new Date().toISOString() }),
   });
+}
+
+// ─── V2 SAVE GUARD (per-project rows + optimistic concurrency) ───────────────
+// Uses pms_projects (one row per project) instead of pms_data.projects[]. The
+// row carries a `version` int incremented on every UPDATE; saves do
+// PATCH ... WHERE id=? AND version=? — if 0 rows match, someone else saved
+// first and we throw a structured ConflictError that callers can surface.
+//
+// Falls back gracefully:
+//   - If pms_projects doesn't exist or the row doesn't exist (pre-migration),
+//     uses the legacy whole-array PATCH path.
+//   - If the GET-fresh fails (offline), uses the in-memory cache.
+
+class AddinConflictError extends Error {
+  constructor(message, projectId, cloudRow) {
+    super(message);
+    this.name = "AddinConflictError";
+    this.projectId = projectId;
+    this.cloudRow = cloudRow;
+  }
+}
+
+// Per-project version cache so we know what version we last loaded.
+// Populated lazily on first fetch.
+const _projectVersionCache = new Map();
+
+async function fetchFreshProjectV2(projectId) {
+  const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(projectId) + "&select=project,version";
+  const res = await fetch(url, { headers: SB_HEADERS });
+  if (!res.ok) throw new Error("pms_projects GET HTTP " + res.status);
+  const rows = await res.json();
+  if (!rows || rows.length === 0) return null; // not migrated yet
+  _projectVersionCache.set(projectId, rows[0].version);
+  return { project: rows[0].project, version: rows[0].version };
+}
+
+async function saveProjectRowV2(project, expectedVersion) {
+  const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(project.id) +
+              "&version=eq." + expectedVersion;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Prefer": "return=representation" },
+    body: JSON.stringify({
+      project,
+      version: expectedVersion + 1,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  if (!res.ok) throw new Error("pms_projects PATCH HTTP " + res.status);
+  const result = await res.json();
+  if (!result || result.length === 0) {
+    // version mismatch — re-fetch to give caller something to merge
+    const fresh = await fetchFreshProjectV2(project.id);
+    throw new AddinConflictError(
+      "Project " + project.id + " was modified by someone else (cloud v" +
+      (fresh?.version ?? "?") + ", you had v" + expectedVersion + ")",
+      project.id, fresh
+    );
+  }
+  _projectVersionCache.set(project.id, result[0].version);
+  return result[0].version;
+}
+
+// Pre-migration fallback: legacy whole-array PATCH against pms_data.
+async function legacyApplyLocalChangeAndSave(projectId, mutateProject) {
+  let freshProjects;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", {
+      headers: SB_HEADERS,
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const rows = await res.json();
+    freshProjects = (rows?.[0]?.projects) || [];
+  } catch (e) {
+    console.warn("legacyApplyLocalChangeAndSave: re-fetch failed, using cached allProjects:", e.message);
+    freshProjects = allProjects;
+  }
+  const idx = freshProjects.findIndex(p => p.id === projectId);
+  if (idx < 0) throw new Error("Project no longer exists in PMS.");
+  const mutated = mutateProject(freshProjects[idx]);
+  if (!mutated || !mutated.id) throw new Error("mutator returned invalid project");
+  await saveToSupabase(freshProjects.map((p, i) => i === idx ? mutated : p));
+  allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
+  if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
+  return mutated;
+}
+
+// Main entry point — used by all save callsites in the add-in.
+async function applyLocalChangeAndSave(projectId, mutateProject) {
+  if (!projectId) throw new Error("applyLocalChangeAndSave: missing projectId");
+
+  // Try V2 path first
+  let fresh;
+  try {
+    fresh = await fetchFreshProjectV2(projectId);
+  } catch (e) {
+    // pms_projects table missing or other error — fall back to legacy.
+    console.warn("V2 fetch failed, falling back to legacy save path:", e.message);
+    return legacyApplyLocalChangeAndSave(projectId, mutateProject);
+  }
+
+  if (!fresh) {
+    // Not migrated yet — use legacy path. Migration happens in PMS app.
+    return legacyApplyLocalChangeAndSave(projectId, mutateProject);
+  }
+
+  // V2 happy path
+  const mutated = mutateProject(fresh.project);
+  if (!mutated || !mutated.id) throw new Error("mutator returned invalid project");
+  try {
+    await saveProjectRowV2(mutated, fresh.version);
+  } catch (e) {
+    if (e instanceof AddinConflictError) {
+      // For Phase 2 the add-in surfaces conflicts as errors. Phase 5 may add
+      // a "merge with cloud" UX; for now the user retries after refreshing.
+      throw new Error("⚠ Save conflict: " + e.message + ". Refresh the add-in pane and try again.");
+    }
+    throw e;
+  }
+
+  // Update in-memory caches
+  allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
+  if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
+  return mutated;
 }
 async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
   if (!projectId || !emailRecord?.msgId) return;
@@ -1072,11 +1220,12 @@ if (existingRecord) {
       bodyText: "", spFolderUrl, links: [],
       savedAt: new Date().toISOString(),
     };
-    const updatedEmails = [...(selectedProject.emails || []), emailRecord];
-    const updatedProject = { ...selectedProject, emails: updatedEmails };
-    updateProjectInList(updatedProject);
-    selectedProject = updatedProject;
-    await saveToSupabase(allProjects);
+    // Re-fetch latest projects, then append email to the FRESH copy of this project.
+    // Prevents the add-in from overwriting concurrent PMS edits made during this session.
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      emails: [...(fresh.emails || []), emailRecord],
+    }));
     await saveProjectEmailRow(selectedProject.id, emailRecord, true);
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     const attempted = lastAttachmentUploadStats?.attempted || 0;
@@ -1118,10 +1267,10 @@ async function doSaveToProjectRecordOnly() {
       savedAt: new Date().toISOString(),
       savedToSharePoint: false,
     };
-    const updatedProject = { ...selectedProject, emails: [...(selectedProject.emails || []), emailRecord] };
-    updateProjectInList(updatedProject);
-    selectedProject = updatedProject;
-    await saveToSupabase(allProjects);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      emails: [...(fresh.emails || []), emailRecord],
+    }));
     await saveProjectEmailRow(selectedProject.id, emailRecord, false);
     setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
     refreshEmailSavedIndicator();
@@ -1262,10 +1411,10 @@ async function doSaveNote() {
       ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
-    const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
-    updateProjectInList(updated);
-    selectedProject = updated;
-    await saveToSupabase(allProjects);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      notes: [...(fresh.notes || []), note],
+    }));
     // Persist the appointment → project mapping so it auto-restores on next open.
     setSelectedProject(selectedProject, true);
     const linkEl = document.getElementById("noteOneNoteLink");
@@ -1346,10 +1495,10 @@ async function doSaveActionItem() {
       ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
       ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
     };
-    const updated = { ...selectedProject, notes: [...(selectedProject.notes || []), note] };
-    updateProjectInList(updated);
-    selectedProject = updated;
-    await saveToSupabase(allProjects);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      notes: [...(fresh.notes || []), note],
+    }));
     setSelectedProject(selectedProject, true);
     setStatus("actionItemStatus", "success", "✓ Action item saved");
     document.getElementById("actionItemBody").value = "";
@@ -1407,17 +1556,30 @@ async function doSaveRfi() {
   if (!title) { setStatus("rfiStatus", "error", "Title is required."); return; }
   setStatus("rfiStatus", "info", "⏳ Saving…");
   try {
-    const existingRfis = selectedProject.rfis || [];
+    // Re-fetch fresh project data so the RFI number reflects what's actually in
+    // the cloud — not the add-in's possibly-stale cache. Prevents two users from
+    // independently picking the same RFI number when both edit at the same time.
+    let freshProject = selectedProject;
+    try {
+      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+      if (res.ok) {
+        const rows = await res.json();
+        const found = (rows?.[0]?.projects || []).find(p => p.id === selectedProject.id);
+        if (found) freshProject = found;
+      }
+    } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
+
+    const existingRfis = freshProject.rfis || [];
     const nextNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
     const received = new Date();
     let spFolderUrl = "";
-    if (selectedProject.projectFolderUrl) {
+    if (freshProject.projectFolderUrl) {
       try {
         const token = await getToken();
         const { driveId } = await resolveSpIds();
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(selectedProject, "rfi"));
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"));
       } catch (e) { console.warn("RFI SP upload failed:", e.message); }
     }
     const rfi = {
@@ -1431,10 +1593,10 @@ async function doSaveRfi() {
       assignedTo: [], spFolderUrl, links: [],
       createdAt: new Date().toISOString(),
     };
-    const updated = { ...selectedProject, rfis: [...existingRfis, rfi] };
-    updateProjectInList(updated);
-    selectedProject = updated;
-    await saveToSupabase(allProjects);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      rfis: [...(fresh.rfis || []), rfi],
+    }));
     setStatus("rfiStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
     document.getElementById("rfiTitle").value = "";
     document.getElementById("rfiNotes").value = "";
@@ -1465,11 +1627,10 @@ async function doFileToExistingRfi() {
     // If this RFI didn't have a spFolderUrl yet, store it now
     if (!rfi.spFolderUrl) {
       const newUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
-      const updatedRfis = (selectedProject.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: newUrl } : r);
-      const updated = { ...selectedProject, rfis: updatedRfis };
-      updateProjectInList(updated);
-      selectedProject = updated;
-      await saveToSupabase(allProjects);
+      await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+        ...fresh,
+        rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: newUrl } : r),
+      }));
     }
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     setStatus("rfiExistingStatus", "success", "✓ Filed to " + rfi.number + attMsg);
@@ -1488,17 +1649,28 @@ async function doSaveSub() {
   if (!desc) { setStatus("subStatus", "error", "Description is required."); return; }
   setStatus("subStatus", "info", "⏳ Saving…");
   try {
-    const existing = selectedProject.submittals || [];
+    // Re-fetch so submittal numbering reflects current cloud state.
+    let freshProject = selectedProject;
+    try {
+      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+      if (res.ok) {
+        const rows = await res.json();
+        const found = (rows?.[0]?.projects || []).find(p => p.id === selectedProject.id);
+        if (found) freshProject = found;
+      }
+    } catch { /* fall back to cache */ }
+
+    const existing = freshProject.submittals || [];
     const nextNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
     const received = new Date();
     let spFolderUrl = "";
-    if (selectedProject.projectFolderUrl) {
+    if (freshProject.projectFolderUrl) {
       try {
         const token = await getToken();
         const { driveId } = await resolveSpIds();
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(selectedProject, "submittal"));
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"));
       } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
     }
     const sub = {
@@ -1514,10 +1686,10 @@ async function doSaveSub() {
       assignedTo: [], spFolderUrl, links: [],
       createdAt: new Date().toISOString(),
     };
-    const updated = { ...selectedProject, submittals: [...existing, sub] };
-    updateProjectInList(updated);
-    selectedProject = updated;
-    await saveToSupabase(allProjects);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      submittals: [...(fresh.submittals || []), sub],
+    }));
     setStatus("subStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
     document.getElementById("subDesc").value = "";
     document.getElementById("subSpec").value = "";
@@ -1547,11 +1719,10 @@ async function doFileToExistingSub() {
     const attCount = await uploadEmailAndAttachments(driveId, token, targetPath);
     if (!sub.spFolderUrl) {
       const newUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
-      const updatedSubs = (selectedProject.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: newUrl } : s);
-      const updated = { ...selectedProject, submittals: updatedSubs };
-      updateProjectInList(updated);
-      selectedProject = updated;
-      await saveToSupabase(allProjects);
+      await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+        ...fresh,
+        submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: newUrl } : s),
+      }));
     }
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     setStatus("subExistingStatus", "success", "✓ Filed to " + sub.number + attMsg);
