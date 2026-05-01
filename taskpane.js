@@ -1043,6 +1043,24 @@ async function getEmailBodyHtml(token) {
     return data?.body?.content || "";
   } catch { return ""; }
 }
+
+// Phase 3: compress HTML email body to base64 deflate before storing in the
+// project record. Identical implementation to PMS so records are interchangeable.
+function compressHtmlAddin(html) {
+  if (!html || typeof pako === "undefined") return "";
+  try {
+    const deflated = pako.deflate(html, { level: 6 });
+    let binary = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < deflated.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, deflated.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  } catch (e) {
+    console.warn("compressHtmlAddin failed:", e);
+    return "";
+  }
+}
 // ─── SP / EMAIL HELPERS ──────────────────────────────────────────────────────
 const SP_BASE_URL = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Document%20Library";
 function encodeDrivePath(path) {
@@ -1200,6 +1218,10 @@ if (existingRecord) {
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
+    // Phase 3: fetch body HTML once up front so we can both upload to SharePoint
+    // AND store the compressed version on the project record.
+    const bodyHtml = await getEmailBodyHtml(token);
+    const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(emailItem.dateTimeCreated);
     const safeSubject = (emailItem.subject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
@@ -1217,7 +1239,10 @@ if (existingRecord) {
       from: from?.displayName || "",
       fromAddress: from?.emailAddress || "",
       date: emailItem.dateTimeCreated,
-      bodyText: "", spFolderUrl, links: [],
+      bodyText: "",
+      bodyHtmlCompressed: compressedBody,
+      bodyHtmlSize: bodyHtml.length,
+      spFolderUrl, links: [],
       savedAt: new Date().toISOString(),
     };
     // Re-fetch latest projects, then append email to the FRESH copy of this project.
@@ -1255,6 +1280,10 @@ async function doSaveToProjectRecordOnly() {
   }
   setStatus("actionStatus", "info", "⏳ Saving to project record…");
   try {
+    // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
+    const token = await getToken();
+    const bodyHtml = await getEmailBodyHtml(token);
+    const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
     const emailRecord = {
       id: uid(), msgId,
@@ -1263,6 +1292,8 @@ async function doSaveToProjectRecordOnly() {
       fromAddress: from?.emailAddress || "",
       date: emailItem.dateTimeCreated,
       bodyText: "",
+      bodyHtmlCompressed: compressedBody,
+      bodyHtmlSize: bodyHtml.length,
       spFolderUrl: "", links: [],
       savedAt: new Date().toISOString(),
       savedToSharePoint: false,
