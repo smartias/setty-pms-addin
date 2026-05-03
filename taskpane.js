@@ -1185,25 +1185,25 @@ async function restoreProjectSelectionForCurrentEmail() {
   if (!allProjects.length) return;
   let projectId = "";
   let taggedByOther = null; // colleague who tagged this thread, if any
+  let restoredVia = "";     // which path actually found the project (for logging)
   if (msgId) {
     const map = getEmailProjectMap();
     projectId = map[msgId] || "";
+    if (projectId) restoredVia = "localStorage-msgId";
   }
   if (!projectId) {
     // Use shared key — iCalUId for appointments, conversationId for emails.
-    // For appointments, this awaits the iCalUId Graph fetch if it hasn't
-    // completed yet (loadItemContext kicks it off async). Without the await,
-    // we'd query the tag table with an empty key and find nothing — which
-    // is the bug that broke cross-device project-tag persistence for
-    // calendar events.
+    // Awaits the iCalUId Graph fetch internally for appointments.
     const sharedKey = await getCurrentSharedKey();
     if (sharedKey) {
       const convoMap = getConversationProjectMap();
       projectId = convoMap[sharedKey] || "";
+      if (projectId) restoredVia = "localStorage-sharedKey";
       if (!projectId) {
         const tag = await getSharedConversationTag(sharedKey);
         projectId = tag?.project_id || "";
         if (projectId) {
+          restoredVia = "cloud-sharedKey";
           convoMap[sharedKey] = projectId;
           saveConversationProjectMap(convoMap);
           const myUsername = (msalAccount?.username || "").toLowerCase();
@@ -1215,9 +1215,52 @@ async function restoreProjectSelectionForCurrentEmail() {
       }
     }
   }
+
+  // FALLBACK — scan all projects for a note matching this item.
+  // The localStorage maps and shared tag table can miss for notes saved before
+  // recent fixes (or from a different itemId context — e.g., organizer view
+  // vs attendee view, calendar-folder shifts, recurring meeting occurrences).
+  // The note itself is the source of truth: if the note exists in a project
+  // with sourceItemId or sourceCalendarUId matching the current item, that
+  // project IS the right answer regardless of any external mapping.
+  if (!projectId) {
+    const itemId  = emailItem?.itemId || "";
+    const icalUId = currentItemICalUId || "";
+    if (itemId || icalUId) {
+      for (const p of allProjects) {
+        const notes = p.notes || [];
+        const matchingNote = notes.find(n =>
+          (itemId  && n.sourceItemId      === itemId)  ||
+          (icalUId && n.sourceCalendarUId === icalUId)
+        );
+        if (matchingNote) {
+          projectId = p.id;
+          restoredVia = "note-scan-" + (matchingNote.sourceItemId === itemId ? "itemId" : "icalUId");
+          // Backfill the localStorage map AND the cloud shared tag so future
+          // lookups hit the fast path. Self-healing for legacy notes.
+          if (msgId) {
+            const map = getEmailProjectMap();
+            map[msgId] = projectId;
+            localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+          }
+          const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
+          if (sharedKey) {
+            const convoMap = getConversationProjectMap();
+            convoMap[sharedKey] = projectId;
+            saveConversationProjectMap(convoMap);
+            // Fire-and-forget cloud upsert
+            void saveSharedConversationProjectTag(sharedKey, projectId);
+          }
+          break;
+        }
+      }
+    }
+  }
+
   if (!projectId) return;
   const project = allProjects.find(p => p.id === projectId);
   if (project) {
+    console.info("[restore] Restored project via", restoredVia, ":", project.projectNumber || project.name);
     setSelectedProject(project, false);
     if (taggedByOther) {
       const projLabel = (project.projectNumber ? project.projectNumber + " — " : "") + project.name;
@@ -1843,6 +1886,16 @@ async function doSaveNote() {
     // saveNoteBtn stays disabled — note is saved, re-clicking would double-create the OneNote page.
     refreshOneNoteLinkBanner();
     refreshCalendarStatus();
+    // After a successful save, return the user to the main view. The OneNote
+    // link banner is now visible there (refreshOneNoteLinkBanner just ran),
+    // showing the linked project + 📓 link. Without this nav, the user is
+    // stuck on the note-edit view and has to manually click back to see the
+    // result of their save.
+    if (oneNoteUrl || !oneNoteErr) {
+      // Brief delay so the user can see the success status flash before the
+      // view changes — feels like confirmation, not abrupt.
+      setTimeout(() => showView("mainView"), 700);
+    }
   } catch (e) {
     setStatus("noteStatus", "error", "✗ " + e.message);
     // Re-enable the button so the user can retry after fixing the error.
