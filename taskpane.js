@@ -2081,13 +2081,16 @@ async function doSaveSub() {
   setStatus("subStatus", "info", "⏳ Saving…");
   try {
     // Re-fetch so submittal numbering reflects current cloud state.
+    // Reads from pms_projects (V2) — pms_data is frozen at migration time.
     let freshProject = selectedProject;
     try {
-      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+      const res = await fetch(
+        SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
+        { headers: SB_HEADERS }
+      );
       if (res.ok) {
         const rows = await res.json();
-        const found = (rows?.[0]?.projects || []).find(p => p.id === selectedProject.id);
-        if (found) freshProject = found;
+        if (rows?.[0]?.project) freshProject = rows[0].project;
       }
     } catch { /* fall back to cache */ }
 
