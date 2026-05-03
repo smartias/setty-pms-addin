@@ -232,6 +232,13 @@ function loadItemContext() {
         currentItemICalUId = ev?.iCalUId || "";
         refreshOneNoteLinkBanner();
         refreshCalendarStatus();
+        // Re-attempt restoration if no project was found on the first pass.
+        // The first pass (in loadItemContext) might have run before iCalUId
+        // was available — without this re-fire, an appointment opened on a
+        // device that's never tagged it would never auto-restore the tag.
+        if (!selectedProject && currentItemICalUId) {
+          await restoreProjectSelectionForCurrentEmail();
+        }
       } catch { /* non-fatal */ }
     })();
   }
@@ -401,6 +408,36 @@ async function getCurrentConversationId() {
   } catch {
     return "";
   }
+}
+
+// Shared key for the current item — used by the cross-device tag system in
+// pms_email_thread_tags so a project tag set on one device shows up on others.
+//   - Emails:      conversationId (Graph; shared across all recipients of a thread)
+//   - Appointments: iCalUId         (Graph; shared across all attendees of an event)
+//
+// This was the missing piece for cross-device persistence on calendar events:
+// previously appointments fell through to getCurrentConversationId() which
+// returned "" (because the /me/messages endpoint 404s for appointments), so
+// no shared tag was ever written or read for appointments. Now the iCalUId
+// acts as the cross-device key, reusing the existing tag-table infrastructure.
+async function getCurrentSharedKey() {
+  if (currentItemKind === "appointment") {
+    if (currentItemICalUId) return currentItemICalUId;
+    // iCalUId not yet loaded — fetch synchronously now
+    if (emailItem?.itemId) {
+      try {
+        const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+        const ev = await graphFetch("GET", "/me/events/" + restId + "?$select=iCalUId", null);
+        currentItemICalUId = ev?.iCalUId || "";
+        return currentItemICalUId;
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
+  // Default (emails, drafts, etc.) — use conversationId
+  return await getCurrentConversationId();
 }
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
@@ -1057,17 +1094,19 @@ async function clearProjectTagForCurrentEmail() {
       localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
     }
   }
-  const conversationId = await getCurrentConversationId();
-  if (conversationId) {
+  // Use shared key (handles both emails and appointments) so the cross-device
+  // tag also gets cleared, not just the email-conversation one.
+  const sharedKey = await getCurrentSharedKey();
+  if (sharedKey) {
     const convoMap = getConversationProjectMap();
-    if (convoMap[conversationId]) {
-      delete convoMap[conversationId];
+    if (convoMap[sharedKey]) {
+      delete convoMap[sharedKey];
       saveConversationProjectMap(convoMap);
     }
-    await clearSharedConversationProjectTag(conversationId);
+    await clearSharedConversationProjectTag(sharedKey);
   }
   setSelectedProject(null, false);
-  setStatus("actionStatus", "info", "Project tag cleared for this email. Search and select the correct project.");
+  setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project.");
 }
 
 function setSelectedProject(project, persistForEmail = false) {
@@ -1100,12 +1139,16 @@ function setSelectedProject(project, persistForEmail = false) {
       localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
     }
     void (async () => {
-      const conversationId = await getCurrentConversationId();
-      if (!conversationId) return;
+      // Use the shared key (iCalUId for appointments, conversationId for emails)
+      // so the tag is restorable from any device, by any attendee/recipient.
+      // Previously this only handled emails — appointments silently skipped
+      // the cloud tag write, meaning calendar-event project tags didn't sync.
+      const sharedKey = await getCurrentSharedKey();
+      if (!sharedKey) return;
       const convoMap = getConversationProjectMap();
-      convoMap[conversationId] = selectedProject.id;
+      convoMap[sharedKey] = selectedProject.id;
       saveConversationProjectMap(convoMap);
-      await saveSharedConversationProjectTag(conversationId, selectedProject.id);
+      await saveSharedConversationProjectTag(sharedKey, selectedProject.id);
     })();
   }
   updateProjectQuickLinks();
@@ -1147,18 +1190,21 @@ async function restoreProjectSelectionForCurrentEmail() {
     projectId = map[msgId] || "";
   }
   if (!projectId) {
-    const conversationId = await getCurrentConversationId();
-    if (conversationId) {
+    // Use shared key — iCalUId for appointments, conversationId for emails.
+    // For appointments, this awaits the iCalUId Graph fetch if it hasn't
+    // completed yet (loadItemContext kicks it off async). Without the await,
+    // we'd query the tag table with an empty key and find nothing — which
+    // is the bug that broke cross-device project-tag persistence for
+    // calendar events.
+    const sharedKey = await getCurrentSharedKey();
+    if (sharedKey) {
       const convoMap = getConversationProjectMap();
-      projectId = convoMap[conversationId] || "";
+      projectId = convoMap[sharedKey] || "";
       if (!projectId) {
-        // Fetch shared tag with attribution so we can show "Tagged by Sara"
-        // banner — prevents users from being confused when a thread is
-        // auto-tagged to a project they didn't choose.
-        const tag = await getSharedConversationTag(conversationId);
+        const tag = await getSharedConversationTag(sharedKey);
         projectId = tag?.project_id || "";
         if (projectId) {
-          convoMap[conversationId] = projectId;
+          convoMap[sharedKey] = projectId;
           saveConversationProjectMap(convoMap);
           const myUsername = (msalAccount?.username || "").toLowerCase();
           const taggedBy = (tag?.tagged_by || "").toLowerCase();
@@ -1174,9 +1220,6 @@ async function restoreProjectSelectionForCurrentEmail() {
   if (project) {
     setSelectedProject(project, false);
     if (taggedByOther) {
-      // Surface attribution so the user sees this is a teammate's tag, not
-      // a stale auto-restoration. Last-write-wins on the tag is documented
-      // and fine, but invisible attribution is the bug.
       const projLabel = (project.projectNumber ? project.projectNumber + " — " : "") + project.name;
       setStatus("actionStatus", "info", "ℹ Auto-tagged to " + projLabel + " by " + taggedByOther + ". If wrong, click ✕ on the project chip to clear and pick another.");
     }
@@ -1935,13 +1978,17 @@ async function doSaveRfi() {
     // Re-fetch fresh project data so the RFI number reflects what's actually in
     // the cloud — not the add-in's possibly-stale cache. Prevents two users from
     // independently picking the same RFI number when both edit at the same time.
+    // Reads from pms_projects (V2) — pms_data is frozen at migration time and
+    // doesn't include projects created post-migration.
     let freshProject = selectedProject;
     try {
-      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+      const res = await fetch(
+        SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
+        { headers: SB_HEADERS }
+      );
       if (res.ok) {
         const rows = await res.json();
-        const found = (rows?.[0]?.projects || []).find(p => p.id === selectedProject.id);
-        if (found) freshProject = found;
+        if (rows?.[0]?.project) freshProject = rows[0].project;
       }
     } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
 
