@@ -99,14 +99,23 @@ function setupEventListeners() {
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
   document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
-  document.getElementById("extractContactBtn").onclick = doExtractContact;
   document.getElementById("noteBack").onclick    = () => showView("mainView");
   document.getElementById("actionItemBack").onclick = () => showView("mainView");
   document.getElementById("rfiBack").onclick     = () => showView("mainView");
   document.getElementById("subBack").onclick     = () => showView("mainView");
   document.getElementById("peopleBack").onclick  = () => showView("mainView");
-  document.getElementById("contactBack").onclick = () => showView("mainView");
+  // Contact form back returns to peopleView (the only entry point); peopleBack handles return-to-main
+  document.getElementById("contactBack").onclick = () => showView("peopleView");
   document.getElementById("datesBack").onclick   = () => showView("mainView");
+  // "More" expander — persist open/closed state across emails so power users
+  // who expand it once don't have to keep doing so.
+  const moreEl = document.getElementById("moreActions");
+  if (moreEl) {
+    if (localStorage.getItem("settyPms:moreExpanded") === "1") moreEl.open = true;
+    moreEl.addEventListener("toggle", () => {
+      localStorage.setItem("settyPms:moreExpanded", moreEl.open ? "1" : "0");
+    });
+  }
   document.getElementById("findDatesBtn").onclick    = showDatesView;
   document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
   document.getElementById("addParticipantBtn").onclick = showPeopleView;
@@ -219,6 +228,8 @@ function loadItemContext() {
   currentConversationId = "";
   currentItemICalUId = "";
   emailParticipants = [];
+  // Per-item ✓ "added this session" marks reset when item changes
+  _sessionSavedContactEmails.clear();
   if (!emailItem) return;
   // For appointments, fetch the iCalUId in the background — it's the same across
   // all attendees' mailboxes so we can use it to match notes saved by anyone on the team.
@@ -334,7 +345,6 @@ function loadItemContext() {
     document.getElementById("logSubBtn").disabled = true;
     document.getElementById("findDatesBtn").disabled = true;
     document.getElementById("manualMilestoneBtn").disabled = true;
-    document.getElementById("extractContactBtn").disabled = true;
     // Status depends on whether this event was already logged; refreshCalendarStatus()
     // is also called from setSelectedProject() so it re-evaluates once the project restores.
     refreshCalendarStatus();
@@ -347,7 +357,6 @@ function loadItemContext() {
     document.getElementById("logSubBtn").disabled = false;
     document.getElementById("findDatesBtn").disabled = false;
     document.getElementById("manualMilestoneBtn").disabled = false;
-    document.getElementById("extractContactBtn").disabled = false;
     setStatus("actionStatus", "", "");
     document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
     const from = emailItem.from;
@@ -1004,7 +1013,6 @@ function applyPipelineUiRules() {
     "openPmsBtn",
     "openDashboardBtn",
     "addParticipantBtn",
-    "extractContactBtn",
   ]);
   const actionButtons = [
     "saveSpBtn",
@@ -1019,7 +1027,6 @@ function applyPipelineUiRules() {
     "findDatesBtn",
     "manualMilestoneBtn",
     "addParticipantBtn",
-    "extractContactBtn",
   ];
   actionButtons.forEach(id => {
     const btn = document.getElementById(id);
@@ -1157,6 +1164,7 @@ function setSelectedProject(project, persistForEmail = false) {
   refreshOneNoteLinkBanner();
   refreshCalendarStatus();
   applyPipelineUiRules();
+  renderProjectSuggestions();
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
 // Must be called AFTER selectedProject and currentItemICalUId are both resolved.
@@ -1257,7 +1265,13 @@ async function restoreProjectSelectionForCurrentEmail() {
     }
   }
 
-  if (!projectId) return;
+  if (!projectId) {
+    // No tag exists for this thread — surface ranked suggestions instead so
+    // users don't always have to type/search. The chip area is hidden by
+    // setSelectedProject the moment they pick one.
+    renderProjectSuggestions();
+    return;
+  }
   const project = allProjects.find(p => p.id === projectId);
   if (project) {
     console.info("[restore] Restored project via", restoredVia, ":", project.projectNumber || project.name);
@@ -1268,6 +1282,136 @@ async function restoreProjectSelectionForCurrentEmail() {
     }
   }
 }
+
+// ─── PROJECT SUGGESTION ──────────────────────────────────────────────────────
+// Ranks projects by likelihood of being "the project this email is about" using
+// signals from subject, sender domain, and project number. We *suggest* (never
+// auto-apply) — accuracy matters more than saved clicks given multiple active
+// projects per client. Tier-1 (existing thread tag) is handled separately by
+// restoreProjectSelectionForCurrentEmail.
+//
+// TUNE: weights below were chosen so that "subject contains a unique acronym"
+// or "subject contains 1 distinctive name token" easily clears the threshold,
+// but "sender domain matches client" alone does not. Adjust after real-world
+// testing if you find the chip suggesting too eagerly or not enough.
+const SUGGESTION_WEIGHTS = {
+  projectNumberInSubject: 10,
+  perNameTokenInSubject:   2,
+  acronymInSubject:        3,
+  senderDomainMatchClient: 1,
+};
+const SUGGESTION_MIN_SCORE = 2;
+const SUGGESTION_MAX_RESULTS = 3;
+// Words to ignore when tokenizing project names and subjects — too generic to
+// signal anything ("Project Renovation" matching "Renovation Project" should
+// not count as a hit).
+const SUGGESTION_STOPWORDS = new Set([
+  "the","and","of","for","at","to","a","an","or","by","on","in","with",
+  "re","fwd","fw","project","renovation","reno","new","update","updated",
+  "phase","building","bldg","floor","fl","st","ave","road","rd",
+]);
+function suggestionTokenize(s) {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter(t => t && t.length >= 2 && !SUGGESTION_STOPWORDS.has(t));
+}
+// Build the set of acronyms that COULD appear in a subject for a given project
+// name. For "Queens College ADA": {qc, ca, qca}. We generate every contiguous
+// 2+ word slice's initials so "QC" matches even when the project has more words
+// after "Queens College".
+function suggestionAcronyms(name) {
+  const words = (name || "").split(/\s+/).filter(Boolean);
+  const out = new Set();
+  for (let i = 0; i < words.length; i++) {
+    for (let j = i + 2; j <= words.length; j++) {
+      const acro = words.slice(i, j).map(w => w.charAt(0).toLowerCase()).join("");
+      if (acro.length >= 2 && acro.length <= 6 && /^[a-z]+$/.test(acro)) out.add(acro);
+    }
+  }
+  return out;
+}
+function suggestProjects(subject, senderEmail) {
+  const subj = (subject || "").toLowerCase();
+  if (!subj && !senderEmail) return [];
+  const subjTokens = new Set(suggestionTokenize(subj));
+  // Project number heuristic — most Setty project numbers are 5 digits but we
+  // accept 4-6 to be tolerant of legacy/special projects.
+  const numMatches = [...subj.matchAll(/\b(\d{4,6})\b/g)].map(m => m[1]);
+  const senderDomain = (senderEmail || "").toLowerCase().split("@")[1] || "";
+  const senderClient = senderDomain ? getClientByEmail(senderEmail) : null;
+
+  const scored = [];
+  for (const p of (allProjects || [])) {
+    if (!p || p.archived) continue;
+    if (!p.name && !p.projectNumber) continue;
+    let score = 0;
+    const reasons = [];
+
+    if (p.projectNumber && numMatches.includes(String(p.projectNumber))) {
+      score += SUGGESTION_WEIGHTS.projectNumberInSubject;
+      reasons.push("project # in subject");
+    }
+
+    const projTokens = suggestionTokenize(p.name || "");
+    const tokenHits = projTokens.filter(t => subjTokens.has(t));
+    if (tokenHits.length) {
+      score += tokenHits.length * SUGGESTION_WEIGHTS.perNameTokenInSubject;
+      reasons.push(tokenHits.length + " name word" + (tokenHits.length > 1 ? "s" : "") + " match");
+    }
+
+    const acros = suggestionAcronyms(p.name || "");
+    const acroHit = [...acros].some(a => subjTokens.has(a));
+    if (acroHit) {
+      score += SUGGESTION_WEIGHTS.acronymInSubject;
+      reasons.push("acronym match");
+    }
+
+    if (senderClient && p) {
+      const projClient = (p.prime || p.clientName || "").toLowerCase().trim();
+      if (projClient && projClient === (senderClient.name || "").toLowerCase().trim()) {
+        score += SUGGESTION_WEIGHTS.senderDomainMatchClient;
+        reasons.push("sender's company");
+      }
+    }
+
+    if (score >= SUGGESTION_MIN_SCORE) {
+      scored.push({ project: p, score, reasons });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
+  return scored.slice(0, SUGGESTION_MAX_RESULTS);
+}
+function renderProjectSuggestions() {
+  const block = document.getElementById("suggestionBlock");
+  const chips = document.getElementById("suggestionChips");
+  const labelText = document.getElementById("suggestionLabelText");
+  if (!block || !chips) return;
+  if (selectedProject) { block.style.display = "none"; chips.innerHTML = ""; return; }
+
+  const subject = (typeof emailItem?.subject === "string") ? emailItem.subject : "";
+  const results = suggestProjects(subject, emailFromAddress);
+  if (!results.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
+
+  if (labelText) labelText.textContent = results.length === 1 ? "Suggested project" : "Possible projects";
+  chips.innerHTML = results.map((r, i) => `
+    <button type="button" class="suggestion-chip" data-id="${escHtml(r.project.id)}">
+      <div class="sc-num">${escHtml(r.project.projectNumber || "")}</div>
+      <div class="sc-name">${escHtml(r.project.name || "")}</div>
+      <div class="sc-reason">${escHtml(r.reasons.join(" · "))}</div>
+    </button>
+  `).join("");
+  chips.querySelectorAll(".suggestion-chip").forEach(el => {
+    el.onclick = () => {
+      const proj = allProjects.find(p => p.id === el.dataset.id);
+      if (proj) setSelectedProject(proj, true);
+    };
+  });
+  block.style.display = "block";
+}
+
 function renderCompanySuggestions() {
   const list = document.getElementById("companyList");
   if (!list) return;
@@ -2486,28 +2630,37 @@ async function doSaveMilestone() {
   }
 }
 // ─── PEOPLE PICKER ────────────────────────────────────────────────────────────
+// Tracks emails saved as contacts during the current pane session — used to
+// mark them with a ✓ when the user returns to the participant list after
+// saving, so they can immediately move on to the next person without losing
+// their place. Cleared per-email in loadItemContext.
+const _sessionSavedContactEmails = new Set();
 function showPeopleView() {
   const list = document.getElementById("participantList");
   if (!emailParticipants.length) {
-    list.innerHTML = '<p style="font-size:12px;color:#64748b;">No participants found.</p>';
+    list.innerHTML = '<p style="font-size:12px;color:var(--text-soft);">No participants found.</p>';
   } else {
-    const labelColor = { From: "#C00000", To: "#1d4ed8", CC: "#0f766e" };
-    const labelBg    = { From: "#450a0a", To: "#1e3a5f", CC: "#134e4a" };
-    list.innerHTML = emailParticipants.map((p, i) => `
-      <div class="participant-row" data-idx="${i}">
+    const labelColor = { From: "#c50f1f", To: "#0f6cbd", CC: "#0e6d5c", Required: "#0f6cbd", Optional: "#616161", Organizer: "#c50f1f" };
+    const labelBg    = { From: "#fde7e9", To: "#eaf3fb", CC: "#e0f5f0", Required: "#eaf3fb", Optional: "#f3f2f1", Organizer: "#fde7e9" };
+    list.innerHTML = emailParticipants.map((p, i) => {
+      const emailKey = (p.emailAddress || "").toLowerCase();
+      const alreadyAdded = emailKey && _sessionSavedContactEmails.has(emailKey);
+      return `
+      <div class="participant-row${alreadyAdded ? ' added' : ''}" data-idx="${i}">
         <div style="flex:1;min-width:0;">
-          <div style="font-size:12px;font-weight:600;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-            ${p.displayName || p.emailAddress}
+          <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            ${escHtml(p.displayName || p.emailAddress)}
           </div>
-          <div style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-            ${p.emailAddress}
+          <div style="font-size:11px;color:var(--text-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            ${escHtml(p.emailAddress || "")}
           </div>
         </div>
-        <span class="pill" style="background:${labelBg[p.label]||'#1e2235'};color:${labelColor[p.label]||'#94a3b8'};">
-          ${p.label}
+        ${alreadyAdded ? '<span class="pill added">✓ Added</span>' : ''}
+        <span class="pill" style="background:${labelBg[p.label]||'var(--surface-2)'};color:${labelColor[p.label]||'var(--text-soft)'};">
+          ${escHtml(p.label || "")}
         </span>
-      </div>
-    `).join("");
+      </div>`;
+    }).join("");
     list.querySelectorAll(".participant-row").forEach(el => {
       el.onclick = () => prefillContactFromParticipant(emailParticipants[+el.dataset.idx]);
     });
@@ -2522,21 +2675,6 @@ function prefillContactFromParticipant(p) {
   document.getElementById("contactEmail").value   = p.emailAddress || "";
   document.getElementById("contactPhone").value   = "";
   setStatus("contactStatus", "", "");
-  showView("contactView");
-}
-// ─── EXTRACT CONTACT ──────────────────────────────────────────────────────────
-async function doExtractContact() {
-  setStatus("actionStatus", "info", "⏳ Extracting contact…");
-  const token = await getToken();
-  const body = await getEmailBodyHtml(token);
-  const contact = parseSignature(body, emailFrom, emailFromAddress);
-  const matchedClient = getClientByEmail(contact.email || emailFromAddress);
-  document.getElementById("contactName").value    = contact.name;
-  document.getElementById("contactTitle").value   = contact.title;
-  document.getElementById("contactCompany").value = matchedClient?.name || contact.company;
-  document.getElementById("contactEmail").value   = contact.email;
-  document.getElementById("contactPhone").value   = contact.phone;
-  setStatus("actionStatus", "info", "");
   showView("contactView");
 }
 function projectPmsUrl(project) {
@@ -2583,44 +2721,6 @@ function openExternalUrl(url) {
     console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
   window.open(url, "_blank");
-}
-function parseSignature(html, fromName, fromEmail) {
-  // Strip HTML tags for text parsing
-  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
-  // Phone: various formats
-  const phoneMatch = text.match(/(?:Tel|Phone|Cell|Mobile|Direct|T|P|M|D)[:\.]?\s*([\+\d\s\(\)\-\.]{7,20})/i)
-    || text.match(/\b(\+?1?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4})\b/);
-  const phone = phoneMatch ? phoneMatch[1].trim() : "";
-  // Email — look for any email that isn't the from address
-  const emailMatches = [...text.matchAll(/\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g)];
-  const sigEmail = emailMatches.find(m => m[1].toLowerCase() !== (fromEmail || "").toLowerCase())?.[1] || fromEmail;
-  // Title: look for common title patterns
-  const titlePatterns = [
-    /\b(Senior|Junior|Lead|Principal|Director|Manager|Engineer|Architect|Associate|Project|Design|MEP|VP|Vice President|President|Principal|Officer|Superintendent|Foreman|Coordinator|Analyst|Consultant|Officer|Executive)[^\n,|•\|]{0,50}/i,
-    /(?:Title|Position|Role)[:\s]+([^\n,|•]{5,60})/i,
-  ];
-  let title = "";
-  for (const pat of titlePatterns) {
-    const m = text.match(pat);
-    if (m) { title = m[0].trim().replace(/[|•].*$/, "").trim(); break; }
-  }
-  // Company: look for lines after signature break or before phone
-  const companyPatterns = [
-    /(?:Company|Firm|Organization|Corp|LLC|Inc|PLLC|PC|LLP|Associates|Group|Construction|Consulting)[^\n,|•]{0,60}/i,
-    /(Setty|AECOM|WSP|Arup|Thornton|Langan|STV|Jacobs|Turner|Skanska|Suffolk|Structure Tone)[^\n,|•]{0,40}/i,
-  ];
-  let company = "";
-  for (const pat of companyPatterns) {
-    const m = text.match(pat);
-    if (m) { company = m[0].trim().replace(/[|•].*$/, "").trim().slice(0, 60); break; }
-  }
-  return {
-    name: fromName || "",
-    title: title.slice(0, 80),
-    company: company.slice(0, 80),
-    email: sigEmail || "",
-    phone: phone.replace(/\s+/g, " ").trim(),
-  };
 }
 function normalizeEmail(v) {
   return (v || "").trim().toLowerCase();
@@ -2709,13 +2809,30 @@ async function doSaveContact() {
         return { ...fresh, projectContacts };
       });
     }
-    setStatus("contactStatus", "success", "✓ Contact saved.");
+    // Mark this email as added-this-session so the participant list shows ✓
+    // when we return there. Then bounce straight back to the list — the user
+    // is almost always working through several participants in sequence.
+    const savedEmailKey = (email || "").toLowerCase();
+    if (savedEmailKey) _sessionSavedContactEmails.add(savedEmailKey);
+    const destLabel = saveTo === "client"
+      ? (company || name)
+      : ((selectedProject?.projectNumber ? selectedProject.projectNumber + " — " : "") + (selectedProject?.name || "project POC"));
+    setStatus("actionStatus", "success", "✓ Saved " + (name || email) + " to " + destLabel + ".");
+    setStatus("contactStatus", "", "");
+    showPeopleView();
+    return;
   } catch (e) {
     if (e.message === "__DUP__") {
-      setStatus("contactStatus", "info", "Contact already exists in this project's POC list. No duplicate was added.");
-    } else {
-      setStatus("contactStatus", "error", "✗ " + e.message);
+      // Treat dup as a benign success for the "add another" flow — mark them
+      // as ✓ and return to the list rather than stranding the user on the form.
+      const savedEmailKey = (email || "").toLowerCase();
+      if (savedEmailKey) _sessionSavedContactEmails.add(savedEmailKey);
+      setStatus("actionStatus", "info", "Already in this project's POC list — no duplicate added.");
+      setStatus("contactStatus", "", "");
+      showPeopleView();
+      return;
     }
+    setStatus("contactStatus", "error", "✗ " + e.message);
   } finally {
     saveInFlight = false;
   }

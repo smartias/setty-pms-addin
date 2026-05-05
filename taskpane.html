@@ -8,18 +8,41 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-05-03-addin-v3";</script>
+  <script>window.__appVersion = "2026-05-05-ux-v1";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   <style>
+    /* Fluent-light palette — designed to feel native inside Outlook.
+       Setty red (#C00000) is reserved as a logo accent only, not a UI color. */
+    :root {
+      --bg:           #ffffff;
+      --surface:      #faf9f8;
+      --surface-2:    #f3f2f1;
+      --border:       #e1dfdd;
+      --border-strong:#c8c6c4;
+      --text:         #242424;
+      --text-soft:    #616161;
+      --text-faint:   #8a8886;
+      --primary:      #0f6cbd;
+      --primary-hov:  #115ea3;
+      --primary-soft: #eaf3fb;
+      --success:      #107c10;
+      --success-bg:   #dff6dd;
+      --warn:         #8a4f00;
+      --warn-bg:      #fff4ce;
+      --error:        #c50f1f;
+      --error-bg:     #fde7e9;
+      --setty-red:    #C00000;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0d0f1a;
-      color: #e2e8f0;
-      font-size: 13px;
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.4;
       padding: 12px;
       min-height: 100vh;
     }
@@ -28,117 +51,138 @@
       align-items: center;
       gap: 8px;
       margin-bottom: 14px;
-      padding-bottom: 12px;
-      border-bottom: 2px solid #C00000;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--setty-red);
     }
     .header-logo {
-      font-size: 16px;
-      font-weight: 800;
-      color: #C00000;
-      letter-spacing: 1px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--setty-red);
+      letter-spacing: 0.5px;
     }
     .header-sub {
       font-size: 11px;
-      color: #64748b;
+      color: var(--text-faint);
     }
     .email-preview {
-      background: #1e2235;
-      border: 1px solid #2d3452;
-      border-radius: 8px;
-      padding: 10px 12px;
-      margin-bottom: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      margin-bottom: 12px;
     }
     .email-subject {
-      font-weight: 700;
+      font-weight: 600;
       font-size: 13px;
-      color: #e2e8f0;
-      margin-bottom: 4px;
+      color: var(--text);
+      margin-bottom: 2px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .email-meta {
       font-size: 11px;
-      color: #64748b;
+      color: var(--text-faint);
     }
     label {
       display: block;
-      font-size: 11px;
-      color: #94a3b8;
+      font-size: 12px;
+      color: var(--text-soft);
       margin-bottom: 4px;
       font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
     }
-    select, input[type="text"], textarea {
+    select, input[type="text"], input[type="date"], textarea {
       width: 100%;
-      background: #1e2235;
-      border: 1px solid #2d3452;
-      border-radius: 6px;
-      color: #e2e8f0;
-      padding: 7px 10px;
-      font-size: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 6px 8px;
+      font-size: 13px;
       font-family: inherit;
       margin-bottom: 10px;
       outline: none;
+      transition: border-color 0.1s;
     }
     select:focus, input:focus, textarea:focus {
-      border-color: #3b5998;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 1px var(--primary);
     }
     textarea { resize: vertical; min-height: 60px; }
     .btn {
       width: 100%;
-      padding: 9px 12px;
-      border-radius: 7px;
-      border: none;
+      padding: 7px 12px;
+      border-radius: 4px;
+      border: 1px solid transparent;
       font-size: 13px;
       font-weight: 600;
+      font-family: inherit;
       cursor: pointer;
-      margin-bottom: 8px;
-      transition: opacity 0.15s;
+      margin-bottom: 6px;
+      transition: background 0.1s, border-color 0.1s;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
+      min-height: 32px;
     }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-primary { background: #1F3864; color: #fff; }
-    .btn-primary:hover:not(:disabled) { background: #2F5496; }
-    .btn-green { background: #14532d; color: #4ade80; border: 1px solid #166534; }
-    .btn-green:hover:not(:disabled) { background: #166534; }
-    .btn-blue { background: #1e3a5f; color: #60b4ff; border: 1px solid #1d4ed8; }
-    .btn-blue:hover:not(:disabled) { background: #1d4ed8; color: #fff; }
-    .btn-purple { background: #2d1b69; color: #a78bfa; border: 1px solid #4c1d95; }
-    .btn-purple:hover:not(:disabled) { background: #4c1d95; color: #fff; }
-    .btn-teal { background: #134e4a; color: #34d399; border: 1px solid #0f766e; }
-    .btn-teal:hover:not(:disabled) { background: #0f766e; }
-    .btn-orange { background: #431407; color: #fb923c; border: 1px solid #7c2d12; }
-    .btn-orange:hover:not(:disabled) { background: #7c2d12; }
-    .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #2d3452; }
-    .btn-ghost:hover:not(:disabled) { background: #1e2235; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    /* Primary — solid blue, the only "look at me" button */
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hov); border-color: var(--primary-hov); }
+    /* Secondary — subtle, used for everything else; reads as a "regular" button */
+    .btn-secondary {
+      background: var(--bg);
+      color: var(--text);
+      border-color: var(--border-strong);
+    }
+    .btn-secondary:hover:not(:disabled) { background: var(--surface-2); }
+    /* Ghost — barely visible, used for tertiary actions */
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-soft);
+      border-color: transparent;
+    }
+    .btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+    /* Legacy color classes mapped to subdued accents (used in subviews — note/RFI/etc.) */
+    .btn-blue    { background: var(--primary-soft); color: var(--primary-hov); border-color: #b7daf2; }
+    .btn-blue:hover:not(:disabled)    { background: #d6e9f7; }
+    .btn-green   { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
+    .btn-green:hover:not(:disabled)   { background: #c8eec8; }
+    .btn-purple  { background: #f3edff; color: #5b2cad; border-color: #d9c8f5; }
+    .btn-purple:hover:not(:disabled)  { background: #e7daff; }
+    .btn-teal    { background: #e0f5f0; color: #0e6d5c; border-color: #b8e2d6; }
+    .btn-teal:hover:not(:disabled)    { background: #cdebe1; }
+    .btn-orange  { background: var(--warn-bg); color: var(--warn); border-color: #f1d875; }
+    .btn-orange:hover:not(:disabled)  { background: #ffeaa3; }
     .divider {
       border: none;
-      border-top: 1px solid #2d3452;
-      margin: 12px 0;
+      border-top: 1px solid var(--border);
+      margin: 10px 0;
     }
     .status-msg {
-      padding: 8px 12px;
-      border-radius: 6px;
+      padding: 8px 10px;
+      border-radius: 4px;
       font-size: 12px;
       margin-bottom: 10px;
       display: none;
+      border: 1px solid transparent;
     }
     .status-msg.show { display: block; }
-    .status-msg.success { background: #14532d; color: #4ade80; border: 1px solid #166534; }
-    .status-msg.error { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; }
-    .status-msg.info { background: #1e3a5f; color: #60b4ff; border: 1px solid #1d4ed8; }
+    .status-msg.success { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
+    .status-msg.error   { background: var(--error-bg);   color: var(--error);   border-color: #f1c0c4; }
+    .status-msg.info    { background: var(--primary-soft); color: var(--primary-hov); border-color: #b7daf2; }
     .section-title {
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 700;
-      color: #64748b;
+      color: var(--text-soft);
       text-transform: uppercase;
-      letter-spacing: 1px;
-      margin-bottom: 8px;
+      letter-spacing: 0.6px;
+      margin: 4px 0 8px;
     }
     #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
@@ -146,96 +190,150 @@
     .back-btn {
       background: none;
       border: none;
-      color: #64748b;
+      color: var(--text-soft);
       cursor: pointer;
       font-size: 12px;
-      margin-bottom: 12px;
-      padding: 0;
+      font-family: inherit;
+      margin-bottom: 10px;
+      padding: 2px 0;
       display: flex;
       align-items: center;
       gap: 4px;
     }
-    .back-btn:hover { color: #94a3b8; }
-    .contact-field {
-      background: #1e2235;
-      border: 1px solid #2d3452;
-      border-radius: 6px;
-      padding: 7px 10px;
-      font-size: 12px;
-      color: #e2e8f0;
-      margin-bottom: 6px;
-      word-break: break-word;
-    }
-    .contact-label {
-      font-size: 10px;
-      color: #64748b;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 2px;
-    }
+    .back-btn:hover { color: var(--primary); }
     .spinner {
       display: inline-block;
       width: 14px; height: 14px;
-      border: 2px solid rgba(255,255,255,0.2);
-      border-top-color: #fff;
+      border: 2px solid rgba(15,108,189,0.2);
+      border-top-color: var(--primary);
       border-radius: 50%;
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .mode-tab { flex: 1; font-size: 11px; padding: 6px 8px; }
-    .project-search-wrapper { position: relative; margin-bottom: 10px; }
+    .mode-tab { flex: 1; font-size: 12px; padding: 6px 8px; }
+    .project-search-wrapper { position: relative; margin-bottom: 8px; }
     .project-search-wrapper input { margin-bottom: 0; }
     #projectDropdown {
       position: absolute;
       top: 100%;
       left: 0; right: 0;
-      background: #1e2235;
-      border: 1px solid #3b5998;
-      border-radius: 0 0 6px 6px;
-      max-height: 180px;
+      background: var(--bg);
+      border: 1px solid var(--primary);
+      border-top: none;
+      border-radius: 0 0 4px 4px;
+      max-height: 200px;
       overflow-y: auto;
       z-index: 100;
       display: none;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.08);
     }
     .proj-option {
       padding: 8px 10px;
       cursor: pointer;
-      border-bottom: 1px solid #2d3452;
+      border-bottom: 1px solid var(--border);
     }
     .proj-option:last-child { border-bottom: none; }
-    .proj-option:hover { background: #2d3452; }
-    .proj-option .proj-num { font-size: 10px; color: #64748b; font-family: monospace; }
-    .proj-option .proj-name { font-size: 12px; color: #e2e8f0; font-weight: 500; }
+    .proj-option:hover { background: var(--primary-soft); }
+    .proj-option .proj-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
+    .proj-option .proj-name { font-size: 13px; color: var(--text); font-weight: 500; }
+
+    /* Suggestion chips — shown when no project is tagged yet */
+    .suggestion-block {
+      background: var(--primary-soft);
+      border: 1px solid #b7daf2;
+      border-radius: 4px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+    }
+    .suggestion-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--primary-hov);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .suggestion-chip {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      padding: 6px 8px;
+      margin-bottom: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      transition: border-color 0.1s, background 0.1s;
+    }
+    .suggestion-chip:hover { border-color: var(--primary); background: #fff; }
+    .suggestion-chip:last-child { margin-bottom: 0; }
+    .suggestion-chip .sc-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
+    .suggestion-chip .sc-name { font-size: 13px; color: var(--text); font-weight: 600; }
+    .suggestion-chip .sc-reason { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+
     .pill {
       display: inline-block;
       font-size: 10px;
-      font-weight: 700;
-      padding: 2px 7px;
-      border-radius: 4px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 10px;
       margin-right: 4px;
+      border: 1px solid transparent;
     }
+    .pill.added { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
     .date-card {
-      padding: 12px;
-      background: #1e2235;
-      border: 1px solid #2d3452;
-      border-radius: 6px;
-      margin-bottom: 8px;
-      transition: border-color 0.15s;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: border-color 0.1s, background 0.1s;
     }
-    .date-card:hover { border-color: #3b5998; }
+    .date-card:hover { border-color: var(--primary); background: #fff; }
     .participant-row {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 10px 12px;
-      background: #1e2235;
-      border: 1px solid #2d3452;
-      border-radius: 6px;
-      margin-bottom: 6px;
+      padding: 8px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 4px;
+      margin-bottom: 4px;
       cursor: pointer;
-      transition: border-color 0.15s, background 0.15s;
+      transition: border-color 0.1s, background 0.1s;
     }
-    .participant-row:hover { border-color: #3b5998; background: #252d45; }
+    .participant-row:hover { border-color: var(--primary); background: var(--surface); }
+    .participant-row.added { background: var(--success-bg); border-color: #b6e3b6; }
+    .participant-row.added:hover { background: #c8eec8; }
+
+    /* Native <details> styling for the "More" expander */
+    details.more-expander { margin-top: 6px; }
+    details.more-expander > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 6px 0;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-soft);
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    details.more-expander > summary::-webkit-details-marker { display: none; }
+    details.more-expander > summary::before {
+      content: "▸";
+      font-size: 10px;
+      color: var(--text-faint);
+      transition: transform 0.15s;
+      display: inline-block;
+    }
+    details.more-expander[open] > summary::before { transform: rotate(90deg); }
+    details.more-expander > summary:hover { color: var(--primary); }
+    details.more-expander > .more-body { padding-top: 4px; }
   </style>
 </head>
 <body>
@@ -254,11 +352,20 @@
       <div class="header-sub">Project Management System</div>
     </div>
   </div>
-  <p style="color:#94a3b8;font-size:12px;margin-bottom:16px;line-height:1.6;">
-    Sign in with your Setty Microsoft 365 account to file emails/calendar items, log notes, RFIs, and submittals.
+  <p style="color:var(--text);font-size:13px;margin-bottom:10px;font-weight:600;">
+    Connect this email to your projects in one click.
   </p>
-  <button class="btn btn-primary" id="signInBtn">🔐 Sign in with Microsoft</button>
-  <div id="signInStatus" class="status-msg"></div>
+  <ul style="color:var(--text-soft);font-size:12px;margin-bottom:16px;line-height:1.7;padding-left:18px;">
+    <li>File emails &amp; attachments to the right SharePoint folder</li>
+    <li>Log meetings as notes — synced to OneNote</li>
+    <li>Capture RFIs, submittals, action items, milestones</li>
+    <li>Auto-suggest the project from the subject line</li>
+  </ul>
+  <button class="btn btn-primary" id="signInBtn">Sign in with Microsoft</button>
+  <div id="signInStatus" class="status-msg" style="margin-top:10px;"></div>
+  <p style="color:var(--text-faint);font-size:11px;margin-top:14px;line-height:1.5;">
+    Tip: after signing in, click the 📌 pin in the top-right of this pane so it stays open as you move between emails.
+  </p>
 </div>
 
 <!-- Main View -->
@@ -267,7 +374,7 @@
     <div style="flex:1">
       <div class="header-logo">SETTY PMS</div>
     </div>
-    <button class="btn-ghost btn" style="width:auto;padding:4px 10px;font-size:11px;" id="signOutBtn">Sign out</button>
+    <button class="btn-ghost btn" style="width:auto;padding:4px 10px;font-size:11px;min-height:0;" id="signOutBtn">Sign out</button>
   </div>
 
   <div class="email-preview">
@@ -275,41 +382,53 @@
     <div class="email-meta" id="emailMeta"></div>
   </div>
 
+  <!-- Project suggestion chips — shown when no project tag exists for this thread -->
+  <div id="suggestionBlock" class="suggestion-block" style="display:none;">
+    <div class="suggestion-label">💡 <span id="suggestionLabelText">Possible projects</span></div>
+    <div id="suggestionChips"></div>
+  </div>
+
   <div class="project-search-wrapper">
     <label>Project</label>
     <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
     <div id="projectDropdown"></div>
   </div>
-  <div id="selectedProjectBadge" style="display:none;margin-bottom:6px;font-size:12px;color:#60b4ff;font-weight:600;align-items:center;justify-content:space-between;gap:6px;">
+  <div id="selectedProjectBadge" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;font-size:13px;color:var(--success);font-weight:600;align-items:center;justify-content:space-between;gap:6px;">
     <span id="selectedProjectBadgeText"></span>
-    <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:#94a3b8;font-size:14px;line-height:1;cursor:pointer;padding:0 2px;" title="Clear tagged project for this email">×</button>
+    <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:var(--text-soft);font-size:16px;line-height:1;cursor:pointer;padding:0 2px;" title="Clear tagged project for this email">×</button>
   </div>
-  <div id="projectPipelineHint" style="display:none;margin:-2px 0 10px;font-size:11px;color:#fbbf24;font-weight:600;"></div>
+  <div id="projectPipelineHint" style="display:none;margin:-4px 0 10px;padding:6px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;"></div>
 
   <div id="actionStatus" class="status-msg"></div>
 
   <!-- OneNote link banner — shown when current item has a linked note page -->
-  <div id="oneNoteLinkBanner" style="display:none;margin-bottom:10px;background:#0f2a1a;border:1px solid #22c55e60;border-radius:8px;padding:12px 14px;">
-    <div style="font-size:11px;font-weight:700;color:#22c55e;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:5px;">📓 Meeting Notes Logged</div>
-    <a id="oneNoteLinkAnchor" href="#" target="_blank" style="font-size:15px;font-weight:700;color:#60b4ff;text-decoration:none;">Open in OneNote →</a>
+  <div id="oneNoteLinkBanner" style="display:none;margin-bottom:10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;padding:8px 10px;">
+    <div style="font-size:11px;font-weight:700;color:var(--success);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">📓 Meeting Notes Logged</div>
+    <a id="oneNoteLinkAnchor" href="#" target="_blank" style="font-size:13px;font-weight:600;color:var(--primary);text-decoration:none;">Open in OneNote →</a>
   </div>
 
-  <div class="section-title">Actions</div>
+  <!-- Primary action zone — the 80/20 actions, always visible -->
+  <button class="btn btn-primary" id="saveSpBtn">📁 File email to project</button>
+  <button class="btn btn-secondary" id="logNoteBtn">📝 Log as Note</button>
+  <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
 
-  <button class="btn btn-green" id="saveSpBtn">📁 Save to SharePoint + Project Record</button>
-  <button class="btn btn-blue" id="saveRecordBtn">🗂️ Save to Project Record Only</button>
-  <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
-  <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
-  <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
-  <button class="btn btn-blue" id="logNoteBtn">📝 Log as Note</button>
-  <button class="btn btn-blue" id="newActionItemBtn">✅ New Action Item</button>
-  <button class="btn btn-blue" id="logRfiBtn">🔵 Log as RFI</button>
-  <button class="btn btn-purple" id="logSubBtn">📋 Log as Submittal</button>
-  <hr class="divider"/>
-  <button class="btn btn-orange" id="findDatesBtn">📅 Find Due Dates → Create Milestone</button>
-  <button class="btn btn-orange" id="manualMilestoneBtn">➕ Create Milestone Manually</button>
-  <button class="btn btn-teal" id="addParticipantBtn">👥 Add Participant to Contacts</button>
-  <button class="btn btn-ghost" id="extractContactBtn" style="font-size:12px;">👤 Extract from Signature</button>
+  <!-- More — collapsed by default; persists open state in localStorage -->
+  <details class="more-expander" id="moreActions">
+    <summary>More actions</summary>
+    <div class="more-body">
+      <button class="btn btn-secondary" id="logRfiBtn">🔵 Log as RFI</button>
+      <button class="btn btn-secondary" id="logSubBtn">📋 Log as Submittal</button>
+      <hr class="divider"/>
+      <button class="btn btn-secondary" id="findDatesBtn">📅 Find Due Dates → Milestone</button>
+      <button class="btn btn-secondary" id="manualMilestoneBtn">➕ Create Milestone Manually</button>
+      <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
+      <hr class="divider"/>
+      <button class="btn btn-secondary" id="saveRecordBtn">🗂️ Save to Project Record Only</button>
+      <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
+      <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
+      <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
+    </div>
+  </details>
 </div>
 
 <!-- Note View -->
