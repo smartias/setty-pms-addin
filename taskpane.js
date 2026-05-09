@@ -504,7 +504,7 @@ function refreshEmailSavedIndicator() {
   btnRecordOnly.disabled = true;
   btnRecordOnly.textContent = "✓ In project record";
 
-  if (wasFiledToSharePoint && emailItem?.hasAttachments) {
+  if (wasFiledToSharePoint && emailLikelyHasAttachments() === true) {
     // Filed to SharePoint with attachments — re-run is offered to catch any new attachments
     setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix + " Re-run to sync any new attachments.");
     btnSharePoint.textContent = "↺ Re-sync attachments";
@@ -521,15 +521,29 @@ function refreshEmailSavedIndicator() {
   applyEmailFlowEmphasis();
 }
 
-// Visual emphasis between the twin save buttons.
-// Both remain clickable; this only nudges which one looks like the "expected" choice
-// based on the email's shape (attachments vs. body-only).
+// Single source of truth for "does this email have file attachments?".
+// Returns true / false / null (unknown). null happens in edge cases — e.g.
+// compose mode, or clients where neither signal is populated — and callers
+// should treat it as "don't bias the UI either way".
 //
-// TODO (UX policy — see request below): implement the emphasis rules.
-//   - Inputs available: emailItem?.hasAttachments (bool), selectedProject (may be null)
-//   - DOM hooks: btnSp, btnRecord (buttons), capSp, capRecord (caption spans)
-//   - Toggle .btn-deemph on the off-flow button to soften it without disabling it.
-//   - Optionally rewrite the caption text to reflect the recommended path.
+// `emailItem.hasAttachments` was the original signal but it's not a documented
+// Office.js property; it's undefined on some clients, which falsely read as
+// "no attachments" and pushed users toward the wrong save button.
+function emailLikelyHasAttachments() {
+  const item = emailItem;
+  if (!item) return null;
+  if (item.hasAttachments === true) return true;
+  if (Array.isArray(item.attachments)) {
+    return item.attachments.some(a =>
+      a.attachmentType === Office.MailboxEnums.AttachmentType.File && !a.isInline
+    );
+  }
+  return null;
+}
+
+// Visual emphasis between the twin save buttons. Both remain clickable; this only
+// nudges which one looks like the "expected" choice based on whether the email
+// has attachments. When the answer is unknown, neither side is biased.
 function applyEmailFlowEmphasis() {
   const btnSp = document.getElementById("saveSpBtn");
   const btnRecord = document.getElementById("saveRecordBtn");
@@ -546,13 +560,15 @@ function applyEmailFlowEmphasis() {
   // No project picked yet — keep both neutral; we don't know what's relevant.
   if (!selectedProject) return;
 
-  if (emailItem?.hasAttachments) {
+  const hasAtt = emailLikelyHasAttachments();
+  if (hasAtt === true) {
     btnRecord.classList.add("btn-deemph");
     if (capSp) capSp.textContent = "Recommended — has attachments";
-  } else {
+  } else if (hasAtt === false) {
     btnSp.classList.add("btn-deemph");
     if (capRecord) capRecord.textContent = "Recommended — no attachments";
   }
+  // hasAtt === null → keep both buttons neutral; we don't know enough to bias.
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
@@ -1882,8 +1898,8 @@ async function doSaveToProjectRecordOnly() {
 }
 async function _doSaveToProjectRecordOnly() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
-  if (emailItem?.hasAttachments) {
-    setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint + Project Record' instead.");
+  if (emailLikelyHasAttachments() === true) {
+    setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint' instead so they get filed.");
     return;
   }
   const msgId = getCurrentMessageRecordId();
