@@ -425,6 +425,13 @@
 
   <div id="actionStatus" class="status-msg"></div>
 
+  <!-- Date suggestion chips — shown when the email body contains date candidates and a project is selected.
+       Mirrors the project-suggestion pattern: surfaced automatically, never modal. -->
+  <div id="dateSuggestionBlock" class="suggestion-block" style="display:none;">
+    <div class="suggestion-label">📅 <span id="dateSuggestionLabelText">Possible date</span></div>
+    <div id="dateSuggestionChips"></div>
+  </div>
+
   <!-- OneNote link banner — shown when current item has a linked note page -->
   <div id="oneNoteLinkBanner" style="display:none;margin-bottom:10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;padding:8px 10px;">
     <div style="font-size:11px;font-weight:700;color:var(--success);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">📓 Meeting Notes Logged</div>
@@ -451,8 +458,7 @@
       <button class="btn btn-secondary" id="logRfiBtn">🔵 Log as RFI</button>
       <button class="btn btn-secondary" id="logSubBtn">📋 Log as Submittal</button>
       <hr class="divider"/>
-      <button class="btn btn-secondary" id="findDatesBtn">📅 Find Due Dates → Milestone</button>
-      <button class="btn btn-secondary" id="manualMilestoneBtn">➕ Create Milestone Manually</button>
+      <button class="btn btn-secondary" id="manualMilestoneBtn">📅 New Milestone</button>
       <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
       <hr class="divider"/>
       <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>

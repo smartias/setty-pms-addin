@@ -116,7 +116,6 @@ function setupEventListeners() {
       localStorage.setItem("settyPms:moreExpanded", moreEl.open ? "1" : "0");
     });
   }
-  document.getElementById("findDatesBtn").onclick    = showDatesView;
   document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
   document.getElementById("addParticipantBtn").onclick = showPeopleView;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
@@ -343,7 +342,6 @@ function loadItemContext() {
     document.getElementById("newActionItemBtn").disabled = true;
     document.getElementById("logRfiBtn").disabled = true;
     document.getElementById("logSubBtn").disabled = true;
-    document.getElementById("findDatesBtn").disabled = true;
     document.getElementById("manualMilestoneBtn").disabled = true;
     // Status depends on whether this event was already logged; refreshCalendarStatus()
     // is also called from setSelectedProject() so it re-evaluates once the project restores.
@@ -355,7 +353,6 @@ function loadItemContext() {
     document.getElementById("newActionItemBtn").disabled = false;
     document.getElementById("logRfiBtn").disabled = false;
     document.getElementById("logSubBtn").disabled = false;
-    document.getElementById("findDatesBtn").disabled = false;
     document.getElementById("manualMilestoneBtn").disabled = false;
     setStatus("actionStatus", "", "");
     document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
@@ -1062,7 +1059,6 @@ function applyPipelineUiRules() {
     "newActionItemBtn",
     "logRfiBtn",
     "logSubBtn",
-    "findDatesBtn",
     "manualMilestoneBtn",
     "addParticipantBtn",
   ];
@@ -1203,6 +1199,7 @@ function setSelectedProject(project, persistForEmail = false) {
   refreshCalendarStatus();
   applyPipelineUiRules();
   renderProjectSuggestions();
+  void renderDateSuggestions();
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
 // Must be called AFTER selectedProject and currentItemICalUId are both resolved.
@@ -1448,6 +1445,69 @@ function renderProjectSuggestions() {
     };
   });
   block.style.display = "block";
+}
+
+// Cached per-item body fetch — avoids re-hitting Graph each time
+// renderDateSuggestions runs (e.g., on project re-selection within the same
+// email). Keyed on itemContextGeneration so it auto-invalidates when the
+// user opens a different email.
+let _dateSuggestBodyCache = { gen: -1, text: "" };
+
+async function renderDateSuggestions() {
+  const block = document.getElementById("dateSuggestionBlock");
+  const chips = document.getElementById("dateSuggestionChips");
+  const labelText = document.getElementById("dateSuggestionLabelText");
+  if (!block || !chips) return;
+
+  // Hide chips when there's no project to attach a milestone to.
+  // Also skip in compose-mode appointments and when no email is loaded.
+  if (!selectedProject || !emailItem || currentItemKind === "appointment") {
+    block.style.display = "none"; chips.innerHTML = ""; return;
+  }
+
+  const myGen = itemContextGeneration;
+  let text = "";
+  if (_dateSuggestBodyCache.gen === myGen) {
+    text = _dateSuggestBodyCache.text;
+  } else {
+    try {
+      const token = await getToken();
+      const html  = await getEmailBodyHtml(token);
+      if (myGen !== itemContextGeneration) return; // user moved on
+      const tmp = document.createElement("div");
+      tmp.innerHTML = html || "";
+      text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
+      _dateSuggestBodyCache = { gen: myGen, text };
+    } catch { return; /* non-fatal — chips just won't show */ }
+  }
+
+  const dates = extractDueDates(text, emailItem?.dateTimeCreated).slice(0, 3);
+  if (!dates.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
+
+  if (labelText) labelText.textContent = dates.length === 1 ? "Possible date" : "Possible dates";
+  chips.innerHTML = dates.map(d => {
+    const friendly = new Date(d.iso + "T12:00:00").toLocaleDateString("en-US", {
+      weekday: "short", month: "short", day: "numeric", year: "numeric"
+    });
+    const ctxShort = (d.ctx || "").length > 110 ? d.ctx.slice(0, 110) + "…" : d.ctx;
+    return `
+      <button type="button" class="suggestion-chip" data-iso="${escHtml(d.iso)}">
+        <div class="sc-name">${escHtml(friendly)}${d.hasKeyword ? ' <span class="pill" style="background:#1e3a5f;color:#60b4ff;">deadline</span>' : ""}</div>
+        <div class="sc-reason">${escHtml(ctxShort)}</div>
+      </button>
+    `;
+  }).join("");
+  chips.querySelectorAll(".suggestion-chip").forEach(el => {
+    el.onclick = () => openMilestoneFormFromChip(el.dataset.iso);
+  });
+  block.style.display = "block";
+}
+
+function openMilestoneFormFromChip(iso) {
+  showView("datesView");
+  const list = document.getElementById("datesList");
+  if (list) list.innerHTML = "";
+  prefillMilestone(iso);
 }
 
 function renderCompanySuggestions() {
@@ -2448,7 +2508,28 @@ async function createMilestoneCalendarEvent(milestone, project) {
   }
 }
 // ─── DUE DATE EXTRACTOR ───────────────────────────────────────────────────────
-function extractDueDates(text, emailReceivedDate) {
+// Strip Outlook reply chains so we don't surface dates from older messages
+// quoted inside a forward. First marker past the first ~50 chars wins —
+// the threshold prevents truncating an email whose first line happens to
+// start with "On Monday, …".
+function trimToCurrentMessage(text) {
+  if (!text) return "";
+  const markers = [
+    /\bFrom:\s+\S[\s\S]{0,200}?\bSent:/i,    // Outlook header block
+    /\bOn\s+[\s\S]{1,120}?wrote:/i,           // "On Tue, May 6 ... wrote:"
+    /-{3,}\s*Original Message\s*-{3,}/i,
+    /_{20,}/,
+  ];
+  let cutoff = text.length;
+  for (const re of markers) {
+    const m = re.exec(text);
+    if (m && m.index > 50 && m.index < cutoff) cutoff = m.index;
+  }
+  return text.slice(0, cutoff);
+}
+
+function extractDueDates(rawText, emailReceivedDate) {
+  const text = trimToCurrentMessage(rawText);
   const results = [];
   const seen    = new Set();
   const refDate = emailReceivedDate ? new Date(emailReceivedDate) : new Date();
@@ -2558,6 +2639,26 @@ function extractDueDates(text, emailReceivedDate) {
       if (d >= refMid) { found = iso; break; }
     }
     if (found) addResult(found, m[0] + "  (" + found + ")", m.index);
+  }
+  // Bare weekday: "Friday", "by Tue", "ready Wed" — resolve to next future occurrence.
+  // Skips matches already covered by p6 (next/this) or p7 (weekday + ordinal day),
+  // and skips trailing "wrote:" footers (still possible if trimToCurrentMessage missed one).
+  const p8 = /\b(Mon(?:day)?|Tue(?:s(?:day)?)?|Wed(?:nesday)?|Thu(?:rs(?:day)?)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)\b/gi;
+  while ((m = p8.exec(text))) {
+    const before = text.slice(Math.max(0, m.index - 10), m.index).toLowerCase();
+    if (/\b(next|this|last|on)\s+$/.test(before)) continue;
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 60);
+    if (/^\s+(?:the\s+)?\d{1,2}(?:st|nd|rd|th)\b/.test(after)) continue; // "Tuesday the 29th"
+    if (/wrote:/i.test(after) && /^,?\s+\w{3,}\s+\d{1,2}/.test(after)) continue; // "Mon, May 6, 2025 ... wrote:"
+    const word   = m[1];
+    const target = DAYS.findIndex(d => d.toLowerCase().startsWith(word.toLowerCase().slice(0, 3)));
+    if (target < 0) continue;
+    const d = new Date(refDate);
+    let delta = target - d.getDay();
+    if (delta <= 0) delta += 7;
+    d.setDate(d.getDate() + delta);
+    const iso = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+    addResult(iso, m[0] + "  (" + iso + ")", m.index);
   }
   // Keyword hits first, then chronological
   return results.sort((a, b) => {
