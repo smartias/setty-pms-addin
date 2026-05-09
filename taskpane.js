@@ -498,18 +498,24 @@ function refreshEmailSavedIndicator() {
   const loggedLabels = getLoggedEmailArtifactLabels(selectedProject);
   const loggedSuffix = loggedLabels.length ? " Logged as " + loggedLabels.join(", ") + "." : "";
 
-  if (emailItem?.hasAttachments) {
-    // Allow re-run to catch attachments, but make it clear it was filed
+  // Branch on what was actually saved: presence of spFolderUrl is the truth signal.
+  // Without this, a record-only save would falsely claim the email was "Filed to SharePoint".
+  const wasFiledToSharePoint = !!existing.spFolderUrl;
+  btnRecordOnly.disabled = true;
+  btnRecordOnly.textContent = "✓ In project record";
+
+  if (wasFiledToSharePoint && emailItem?.hasAttachments) {
+    // Filed to SharePoint with attachments — re-run is offered to catch any new attachments
     setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix + " Re-run to sync any new attachments.");
     btnSharePoint.textContent = "↺ Re-sync attachments";
-    btnRecordOnly.disabled = true;
-    btnRecordOnly.textContent = "✓ In project record";
-  } else {
+  } else if (wasFiledToSharePoint) {
     setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix);
     btnSharePoint.disabled = true;
     btnSharePoint.textContent = "✓ Filed to SharePoint";
-    btnRecordOnly.disabled = true;
-    btnRecordOnly.textContent = "✓ In project record";
+  } else {
+    // Record-only save — SharePoint button stays at its default label so the user can
+    // still file there if they later decide to (e.g., they realize they want a folder anyway).
+    setStatus("actionStatus", "success", "✓ Saved to project record on " + savedDate + "." + loggedSuffix);
   }
   applyPipelineUiRules();
   applyEmailFlowEmphasis();
@@ -2830,9 +2836,11 @@ function projectPmsUrl(project) {
 function updateProjectQuickLinks() {
   const pmsBtn = document.getElementById("openPmsBtn");
   const spBtn = document.getElementById("openSpFolderBtn");
+  const wrap = document.getElementById("projectQuickLinks");
   if (!pmsBtn || !spBtn) return;
   pmsBtn.disabled = !projectPmsUrl(selectedProject);
   spBtn.disabled = !selectedProject?.projectFolderUrl;
+  if (wrap) wrap.style.display = selectedProject ? "grid" : "none";
   applyPipelineUiRules();
 }
 function openSelectedProjectInPms() {

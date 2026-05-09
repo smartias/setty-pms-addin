@@ -188,6 +188,23 @@
        without disabling it. User can still click; it just visually steps back. */
     .btn.btn-deemph { opacity: 0.7; }
     .btn.btn-deemph:hover:not(:disabled) { opacity: 1; }
+    /* Quick-access row — compact ghost buttons beneath the project badge for jumping
+       to the project page in PMS or its SharePoint folder. Lives at the top so it
+       reads as part of the project context, not a save action. */
+    .quick-links {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin: -4px 0 10px;
+    }
+    .quick-links .btn {
+      margin-bottom: 0;
+      min-height: 26px;
+      padding: 3px 6px;
+      font-size: 11.5px;
+      border: 1px solid var(--border);
+    }
+    .quick-links .btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
     .status-msg {
       padding: 8px 10px;
       border-radius: 4px;
@@ -423,6 +440,13 @@
   </div>
   <div id="projectPipelineHint" style="display:none;margin:-4px 0 10px;padding:6px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;"></div>
 
+  <!-- Quick access — surfaces the two most-used project-context jumps right next to
+       the project name, so they read as part of the project card, not buried in "More". -->
+  <div id="projectQuickLinks" class="quick-links" style="display:none;">
+    <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open in PMS</button>
+    <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 SharePoint Folder</button>
+  </div>
+
   <div id="actionStatus" class="status-msg"></div>
 
   <!-- Date suggestion chips — shown when the email body contains date candidates and a project is selected.
@@ -461,8 +485,6 @@
       <button class="btn btn-secondary" id="manualMilestoneBtn">📅 New Milestone</button>
       <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
       <hr class="divider"/>
-      <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
-      <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
       <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
     </div>
   </details>
