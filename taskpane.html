@@ -164,6 +164,30 @@
       border-top: 1px solid var(--border);
       margin: 10px 0;
     }
+    /* Twin-save row — SharePoint and Project Record presented as peer actions.
+       Grid keeps both buttons full-width within their column on the narrow Outlook pane. */
+    .save-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+    .save-row .btn { margin-bottom: 0; }
+    .save-row-caption {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-size: 10.5px;
+      color: var(--text-faint);
+      line-height: 1.25;
+      margin-bottom: 10px;
+      padding: 0 2px;
+    }
+    .save-row-caption span { text-align: center; }
+    /* Emphasis dimming — used by applyEmailFlowEmphasis to soften the off-flow button
+       without disabling it. User can still click; it just visually steps back. */
+    .btn.btn-deemph { opacity: 0.7; }
+    .btn.btn-deemph:hover:not(:disabled) { opacity: 1; }
     .status-msg {
       padding: 8px 10px;
       border-radius: 4px;
@@ -407,8 +431,16 @@
     <a id="oneNoteLinkAnchor" href="#" target="_blank" style="font-size:13px;font-weight:600;color:var(--primary);text-decoration:none;">Open in OneNote →</a>
   </div>
 
-  <!-- Primary action zone — the 80/20 actions, always visible -->
-  <button class="btn btn-primary" id="saveSpBtn">📁 File email to project</button>
+  <!-- Primary action zone — the 80/20 actions, always visible.
+       Twin-save row: SharePoint (email + attachments) and Project Record (email body copy). -->
+  <div class="save-row">
+    <button class="btn btn-primary" id="saveSpBtn">📁 Save to SharePoint</button>
+    <button class="btn btn-primary" id="saveRecordBtn">🗂️ Save to Project</button>
+  </div>
+  <div class="save-row-caption">
+    <span id="saveSpCaption">Email + attachments → SharePoint</span>
+    <span id="saveRecordCaption">Copy of email → project record</span>
+  </div>
   <button class="btn btn-secondary" id="logNoteBtn">📝 Log as Note</button>
   <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
 
@@ -423,7 +455,6 @@
       <button class="btn btn-secondary" id="manualMilestoneBtn">➕ Create Milestone Manually</button>
       <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
       <hr class="divider"/>
-      <button class="btn btn-secondary" id="saveRecordBtn">🗂️ Save to Project Record Only</button>
       <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open Project in PMS</button>
       <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 Open SharePoint Folder</button>
       <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>

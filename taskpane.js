@@ -485,12 +485,15 @@ function refreshEmailSavedIndicator() {
   // Reset to default state first
   btnSharePoint.disabled = false;
   btnRecordOnly.disabled = false;
-  btnSharePoint.textContent = "📁 Save to SharePoint + Project Record";
-  btnRecordOnly.textContent = "🗂️ Save to Project Record Only";
+  btnSharePoint.textContent = "📁 Save to SharePoint";
+  btnRecordOnly.textContent = "🗂️ Save to Project";
 
   if (!selectedProject || !emailItem?.itemId) return;
   const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
-  if (!existing) return;
+  if (!existing) {
+    applyEmailFlowEmphasis();
+    return;
+  }
 
   const savedDate = existing.savedAt
     ? new Date(existing.savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
@@ -512,6 +515,41 @@ function refreshEmailSavedIndicator() {
     btnRecordOnly.textContent = "✓ In project record";
   }
   applyPipelineUiRules();
+  applyEmailFlowEmphasis();
+}
+
+// Visual emphasis between the twin save buttons.
+// Both remain clickable; this only nudges which one looks like the "expected" choice
+// based on the email's shape (attachments vs. body-only).
+//
+// TODO (UX policy — see request below): implement the emphasis rules.
+//   - Inputs available: emailItem?.hasAttachments (bool), selectedProject (may be null)
+//   - DOM hooks: btnSp, btnRecord (buttons), capSp, capRecord (caption spans)
+//   - Toggle .btn-deemph on the off-flow button to soften it without disabling it.
+//   - Optionally rewrite the caption text to reflect the recommended path.
+function applyEmailFlowEmphasis() {
+  const btnSp = document.getElementById("saveSpBtn");
+  const btnRecord = document.getElementById("saveRecordBtn");
+  const capSp = document.getElementById("saveSpCaption");
+  const capRecord = document.getElementById("saveRecordCaption");
+  if (!btnSp || !btnRecord) return;
+
+  // Reset emphasis and captions each call so previous state doesn't leak
+  btnSp.classList.remove("btn-deemph");
+  btnRecord.classList.remove("btn-deemph");
+  if (capSp) capSp.textContent = "Email + attachments → SharePoint";
+  if (capRecord) capRecord.textContent = "Copy of email → project record";
+
+  // No project picked yet — keep both neutral; we don't know what's relevant.
+  if (!selectedProject) return;
+
+  if (emailItem?.hasAttachments) {
+    btnRecord.classList.add("btn-deemph");
+    if (capSp) capSp.textContent = "Recommended — has attachments";
+  } else {
+    btnSp.classList.add("btn-deemph");
+    if (capRecord) capRecord.textContent = "Recommended — no attachments";
+  }
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
