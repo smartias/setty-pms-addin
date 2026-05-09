@@ -191,6 +191,57 @@
        without disabling it. User can still click; it just visually steps back. */
     .btn.btn-deemph { opacity: 0.7; }
     .btn.btn-deemph:hover:not(:disabled) { opacity: 1; }
+    /* Post-save confirmation card — replaces the save row once the email is filed.
+       Big circular checkmark + summary text. Subtle pop-in animation on appearance. */
+    #saveConfirmation {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--success-bg);
+      border: 1px solid #b6e3b6;
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    #saveConfirmation .sc-icon {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #fff;
+      border: 2px solid var(--success);
+      color: var(--success);
+      font-size: 18px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    #saveConfirmation .sc-text { min-width: 0; }
+    #saveConfirmation .sc-primary {
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--success);
+      line-height: 1.3;
+    }
+    #saveConfirmation .sc-secondary {
+      font-size: 11px;
+      color: var(--text-soft);
+      margin-top: 2px;
+      line-height: 1.4;
+    }
+    #saveConfirmation.entering { animation: sc-pop-in 0.42s cubic-bezier(0.2, 1.2, 0.4, 1); }
+    @keyframes sc-pop-in {
+      from { opacity: 0; transform: scale(0.92); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    #saveConfirmation.entering .sc-icon { animation: sc-check-pop 0.55s cubic-bezier(0.2, 1.4, 0.4, 1); }
+    @keyframes sc-check-pop {
+      0%   { transform: scale(0); }
+      60%  { transform: scale(1.18); }
+      100% { transform: scale(1); }
+    }
     /* Quick-access row — compact ghost buttons beneath the project badge for jumping
        to the project page in PMS or its SharePoint folder. Lives at the top so it
        reads as part of the project context, not a save action. */
@@ -514,6 +565,15 @@
   <div class="save-row-caption">
     <span id="saveSpCaption">Email + attachments → SharePoint + record</span>
     <span id="saveRecordCaption">Email body → project record only</span>
+  </div>
+  <!-- Post-save confirmation — replaces the save buttons once the email is filed.
+       Big check + summary line so the "done" state actually feels done. -->
+  <div id="saveConfirmation" style="display:none;">
+    <div class="sc-icon">✓</div>
+    <div class="sc-text">
+      <div class="sc-primary"></div>
+      <div class="sc-secondary"></div>
+    </div>
   </div>
   <button class="btn btn-secondary" id="logNoteBtn">📝 Log as Note</button>
   <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>

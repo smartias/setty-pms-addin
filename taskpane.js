@@ -477,12 +477,15 @@ function getLoggedEmailArtifactLabels(project) {
 function refreshEmailSavedIndicator() {
   const btnSharePoint = document.getElementById("saveSpBtn");
   const btnRecordOnly = document.getElementById("saveRecordBtn");
+  const saveRow = document.querySelector(".save-row");
+  const saveCapRow = document.querySelector(".save-row-caption");
+  const confirmation = document.getElementById("saveConfirmation");
   if (!btnSharePoint || !btnRecordOnly) return;
 
-  // Reset to default state first.
-  // SharePoint label includes the attachment count when known — concrete
-  // framing ("3 files") makes the action feel more meaningful than abstract
-  // ("Save"). Fallback to a no-count label when we can't read the array.
+  // Default — buttons visible, confirmation hidden. Reset button text/state.
+  if (saveRow) saveRow.style.display = "";
+  if (saveCapRow) saveCapRow.style.display = "";
+  if (confirmation) confirmation.style.display = "none";
   btnSharePoint.disabled = false;
   btnRecordOnly.disabled = false;
   const attCount = emailFileAttachmentCount();
@@ -491,42 +494,55 @@ function refreshEmailSavedIndicator() {
     : "📁 Save to SharePoint";
   btnRecordOnly.textContent = "🗂️ Save to Project";
 
-  if (!selectedProject || !emailItem?.itemId) return;
+  if (!selectedProject || !emailItem?.itemId) {
+    applyEmailFlowEmphasis();
+    return;
+  }
   const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
   if (!existing) {
     applyEmailFlowEmphasis();
     return;
   }
 
+  // Saved → collapse the save row into a single big-check confirmation card.
+  if (saveRow) saveRow.style.display = "none";
+  if (saveCapRow) saveCapRow.style.display = "none";
+
   const savedDate = existing.savedAt
     ? new Date(existing.savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-    : "a prior session";
+    : "earlier";
   const loggedLabels = getLoggedEmailArtifactLabels(selectedProject);
-  const loggedSuffix = loggedLabels.length ? " Logged as " + loggedLabels.join(", ") + "." : "";
-
-  // Branch on what was actually saved: presence of spFolderUrl is the truth signal.
-  // Without this, a record-only save would falsely claim the email was "Filed to SharePoint".
   const wasFiledToSharePoint = !!existing.spFolderUrl;
-  btnRecordOnly.disabled = true;
-  btnRecordOnly.textContent = "✓ In project record";
 
-  if (wasFiledToSharePoint && emailLikelyHasAttachments() === true) {
-    // Filed to SharePoint with attachments — re-run is offered to catch any new attachments
-    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix + " Re-run to sync any new attachments.");
-    btnSharePoint.textContent = (attCount && attCount > 0)
-      ? `↺ Re-sync · ${attCount} file${attCount > 1 ? "s" : ""}`
-      : "↺ Re-sync attachments";
-  } else if (wasFiledToSharePoint) {
-    setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix);
-    btnSharePoint.disabled = true;
-    btnSharePoint.textContent = "✓ Filed to SharePoint";
-  } else {
-    // Record-only save — SharePoint button stays at its default label so the user can
-    // still file there if they later decide to (e.g., they realize they want a folder anyway).
-    setStatus("actionStatus", "success", "✓ Saved to project record on " + savedDate + "." + loggedSuffix);
+  const primary = wasFiledToSharePoint
+    ? "Saved to SharePoint + project record"
+    : "Saved to project record";
+  const secondaryParts = [`Filed ${savedDate}`];
+  if (wasFiledToSharePoint && attCount && attCount > 0) {
+    secondaryParts.push(`${attCount} file${attCount > 1 ? "s" : ""}`);
+  } else if (!wasFiledToSharePoint && attCount && attCount > 0) {
+    secondaryParts.push(`${attCount} attachment${attCount > 1 ? "s" : ""} not filed`);
   }
+  if (loggedLabels.length) {
+    secondaryParts.push(`also logged as ${loggedLabels.join(", ")}`);
+  }
+
+  if (confirmation) {
+    const primaryEl = confirmation.querySelector(".sc-primary");
+    const secondaryEl = confirmation.querySelector(".sc-secondary");
+    if (primaryEl) primaryEl.textContent = primary;
+    if (secondaryEl) secondaryEl.textContent = secondaryParts.join(" · ");
+    confirmation.style.display = "flex";
+    // Re-trigger entry animation each time it appears (e.g., right after save).
+    confirmation.classList.remove("entering");
+    void confirmation.offsetWidth;
+    confirmation.classList.add("entering");
+  }
+
+  // Clear the transient status banner — the confirmation card now carries the
+  // saved-state message, so showing both would be redundant.
+  setStatus("actionStatus", "", "");
   applyPipelineUiRules();
-  applyEmailFlowEmphasis();
 }
 
 // Single source of truth for "does this email have file attachments?".
@@ -1994,22 +2010,10 @@ async function doSaveToProjectRecordOnly() {
 }
 async function _doSaveToProjectRecordOnly() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
-  // Soft-gate (not hard-block): if there are attachments, the recommended path is
-  // SharePoint, but some users intentionally want a body-only record (e.g., the
-  // attachments were already filed elsewhere, or they're just procedural junk).
-  // Surface the consequence and let them proceed.
-  if (emailLikelyHasAttachments() === true) {
-    const proceed = window.confirm(
-      "This email has attachments.\n\n" +
-      "Saving to the project record only will file the email body — attachments will NOT be saved anywhere.\n\n" +
-      "Use 'Save to SharePoint' if you want the attachments filed too.\n\n" +
-      "Continue with body-only save?"
-    );
-    if (!proceed) {
-      setStatus("actionStatus", "info", "Save cancelled.");
-      return;
-    }
-  }
+  // Body-only save works regardless of attachments — the visual emphasis (de-emph
+  // + caption) is the soft nudge toward SharePoint when attachments exist.
+  // No confirm dialog: trust the user's intent, surface the consequence in the
+  // post-save card ("3 attachments not filed").
   const msgId = getCurrentMessageRecordId();
   if (findSavedEmailRecord(selectedProject, msgId)) {
     refreshEmailSavedIndicator();
