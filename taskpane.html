@@ -313,6 +313,18 @@
     .suggestion-chip .sc-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
     .suggestion-chip .sc-name { font-size: 13px; color: var(--text); font-weight: 600; }
     .suggestion-chip .sc-reason { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+    /* Date variant — compact single-line chip emphasizing the milestone-create action.
+       No context snippet (it never read cleanly out of email HTML), so the chip stays small. */
+    .suggestion-chip.date-chip {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 10px;
+      gap: 8px;
+    }
+    .suggestion-chip.date-chip .sc-date { font-size: 13px; color: var(--text); font-weight: 600; }
+    .suggestion-chip.date-chip .sc-cta { font-size: 11px; color: var(--primary); font-weight: 600; white-space: nowrap; }
+    .suggestion-chip.date-chip:hover .sc-cta { color: var(--primary-hov); }
 
     .pill {
       display: inline-block;
@@ -617,11 +629,7 @@
 <!-- Dates View -->
 <div id="datesView">
   <button class="back-btn" id="datesBack">← Back</button>
-  <div class="section-title">Due Dates Found</div>
-  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
-    Dates flagged with <span style="color:#60b4ff;">deadline</span> language appear first.
-    Click one to create a non-billable milestone on the selected project.
-  </p>
+  <div class="section-title">New Milestone</div>
   <div id="datesList"></div>
 
   <!-- Milestone form — revealed when a date card is clicked -->

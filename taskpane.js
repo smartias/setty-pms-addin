@@ -1490,16 +1490,15 @@ async function renderDateSuggestions() {
   const dates = extractDueDates(text, emailItem?.dateTimeCreated).slice(0, 3);
   if (!dates.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
 
-  if (labelText) labelText.textContent = dates.length === 1 ? "Possible date" : "Possible dates";
+  if (labelText) labelText.textContent = dates.length === 1 ? "Possible milestone date" : "Possible milestone dates";
   chips.innerHTML = dates.map(d => {
     const friendly = new Date(d.iso + "T12:00:00").toLocaleDateString("en-US", {
       weekday: "short", month: "short", day: "numeric", year: "numeric"
     });
-    const ctxShort = (d.ctx || "").length > 110 ? d.ctx.slice(0, 110) + "…" : d.ctx;
     return `
-      <button type="button" class="suggestion-chip" data-iso="${escHtml(d.iso)}">
-        <div class="sc-name">${escHtml(friendly)}${d.hasKeyword ? ' <span class="pill" style="background:#1e3a5f;color:#60b4ff;">deadline</span>' : ""}</div>
-        <div class="sc-reason">${escHtml(ctxShort)}</div>
+      <button type="button" class="suggestion-chip date-chip" data-iso="${escHtml(d.iso)}">
+        <span class="sc-date">${escHtml(friendly)}${d.hasKeyword ? ' <span class="pill" style="background:var(--primary-soft);color:var(--primary-hov);border:1px solid #b7daf2;">deadline</span>' : ""}</span>
+        <span class="sc-cta">+ Create →</span>
       </button>
     `;
   }).join("");
@@ -2579,23 +2578,43 @@ function extractDueDates(rawText, emailReceivedDate) {
     results.push({ iso, display, ctx, hasKeyword });
   }
   let m;
-  // Long month name: "March 15, 2026" / "March 15th, 2026"
-  const p1 = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/gi;
+  // Long month name with optional year: "March 15, 2026" / "May 18th" / "May 18"
+  // Year-optional was the missing case — "May 18th" without a year is the dominant
+  // form in AEC email; year is implied by the email's received date.
+  const p1 = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b/gi;
   while ((m = p1.exec(text))) {
     const mo = MONTHS_LONG.findIndex(x => x.toLowerCase() === m[1].toLowerCase()) + 1;
-    addResult(toISO(+m[3], mo, +m[2]), m[0], m.index);
+    const dy = +m[2];
+    if (m[3]) {
+      addResult(toISO(+m[3], mo, dy), m[0], m.index);
+    } else {
+      const iso = resolveYearlessMonthDay(mo, dy);
+      if (iso) addResult(iso, m[0] + "  (" + iso + ")", m.index);
+    }
   }
-  // Short month name: "Mar 15, 2026" / "Mar. 15 2026"
-  const p2 = /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/gi;
+  // Short month name with optional year: "Mar 15, 2026" / "Mar. 15" / "Sep 8"
+  const p2 = /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b/gi;
   while ((m = p2.exec(text))) {
     const mo = MONTHS_SHORT.findIndex(x => x.toLowerCase() === m[1].toLowerCase()) + 1;
-    addResult(toISO(+m[3], mo, +m[2]), m[0], m.index);
+    const dy = +m[2];
+    if (m[3]) {
+      addResult(toISO(+m[3], mo, dy), m[0], m.index);
+    } else {
+      const iso = resolveYearlessMonthDay(mo, dy);
+      if (iso) addResult(iso, m[0] + "  (" + iso + ")", m.index);
+    }
   }
-  // Day-first: "15 March 2026"
-  const p3 = /\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/gi;
+  // Day-first with optional year: "15 March 2026" / "18 May"
+  const p3 = /\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+(\d{4}))?\b/gi;
   while ((m = p3.exec(text))) {
     const mo = MONTHS_LONG.findIndex(x => x.toLowerCase() === m[2].toLowerCase()) + 1;
-    addResult(toISO(+m[3], mo, +m[1]), m[0], m.index);
+    const dy = +m[1];
+    if (m[3]) {
+      addResult(toISO(+m[3], mo, dy), m[0], m.index);
+    } else {
+      const iso = resolveYearlessMonthDay(mo, dy);
+      if (iso) addResult(iso, m[0] + "  (" + iso + ")", m.index);
+    }
   }
   // Slash notation: "3/15/2026" or "03/15/26"
   const p4 = /\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/g;
