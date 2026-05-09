@@ -123,6 +123,10 @@ function setupEventListeners() {
   });
   const credits = document.getElementById("creditsOverlay");
   if (credits) credits.onclick = () => credits.classList.remove("show");
+  // Hint banner link — single entry point for "open project in PMS" so the
+  // URL/permissions logic stays in one place (openSelectedProjectInPms).
+  const spHintLink = document.getElementById("spFolderHintLink");
+  if (spHintLink) spHintLink.onclick = (e) => { e.preventDefault(); openSelectedProjectInPms(); };
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -1610,7 +1614,20 @@ async function renderDateSuggestions() {
     } catch { return; /* non-fatal — chips just won't show */ }
   }
 
-  const dates = extractDueDates(text, emailItem?.dateTimeCreated).slice(0, 3);
+  // Filter out dates that already correspond to a milestone created from this
+  // email — match by sourceItemId or sourceMessageId (set when a milestone is
+  // saved). Once a chip has been acted on, it shouldn't reappear on reopen.
+  const itemId   = emailItem?.itemId || "";
+  const sharedId = getCurrentSharedMessageId() || "";
+  const usedDates = new Set(
+    (selectedProject.milestones || [])
+      .filter(m => (itemId && m.sourceItemId === itemId) || (sharedId && m.sourceMessageId === sharedId))
+      .map(m => m.dueDate)
+      .filter(Boolean)
+  );
+  const dates = extractDueDates(text, emailItem?.dateTimeCreated)
+    .filter(d => !usedDates.has(d.iso))
+    .slice(0, 3);
   if (!dates.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
 
   if (labelText) labelText.textContent = dates.length === 1 ? "Possible milestone date" : "Possible milestone dates";
@@ -3389,10 +3406,17 @@ function updateProjectQuickLinks() {
   const pmsBtn = document.getElementById("openPmsBtn");
   const spBtn = document.getElementById("openSpFolderBtn");
   const wrap = document.getElementById("projectQuickLinks");
+  const spHint = document.getElementById("projectSpFolderHint");
   if (!pmsBtn || !spBtn) return;
   pmsBtn.disabled = !projectPmsUrl(selectedProject);
   spBtn.disabled = !selectedProject?.projectFolderUrl;
   if (wrap) wrap.style.display = selectedProject ? "grid" : "none";
+  // Pre-emptive hint when the selected project has no SharePoint folder yet.
+  // Catches the user before they click "Save to SharePoint" and hit the
+  // existing block-on-click error.
+  if (spHint) {
+    spHint.style.display = (selectedProject && !selectedProject.projectFolderUrl) ? "block" : "none";
+  }
   applyPipelineUiRules();
 }
 function openSelectedProjectInPms() {
