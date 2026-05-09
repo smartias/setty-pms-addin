@@ -1714,23 +1714,111 @@ const STREAK_THRESHOLDS = [
   { count: 100, pool: MILESTONE_QUIPS_100 },
 ];
 
+// Pep quips fired when a NEW milestone is saved (from a date chip or "New
+// Milestone" form). Different vibe than the email-save quips — these are about
+// commitment to a future date, so the encouragement leans toward "you got this".
+const NEW_MILESTONE_QUIPS = [
+  "📌 Locked in — keeping it on point!",
+  "🎯 Don't forget about this one!",
+  "📅 Milestone pinned — Future-You is grateful.",
+  "📐 New dot on the project timeline.",
+  "🗓️ Marked. Move with confidence.",
+  "⏰ This one's on the radar now.",
+  "✅ Date noted, project record updated.",
+  "🔔 Milestone in the books.",
+];
+
+// Combinatorial silly-word generator (Claude Code style). With ~17 verbs ×
+// ~10 nouns × 9 emojis = 1,530+ unique combos, daily users will rarely see
+// the same one twice — much fresher than a curated pool alone.
+const SILLY_VERBS = [
+  "Frobnicating", "Hatching", "Pondering", "Cogitating", "Wrangling",
+  "Marinating", "Conjuring", "Reticulating", "Burnishing", "Spelunking",
+  "Quibbling", "Caboodling", "Bamboozling", "Filibustering", "Spellbinding",
+  "Hornswoggling", "Yarning",
+];
+const SILLY_NOUNS = [
+  "the email", "the metadata", "the project entropy", "the docu-mojo",
+  "the timestamps", "the bytes", "the cosmic file order",
+  "the project chunkings", "the file vibes", "the AEC ether",
+];
+const SILLY_EMOJI = ["🛠️", "🪄", "🌀", "🎩", "🧙", "🦴", "🐌", "🪅", "✨"];
+
+function generateSillySavingMessage() {
+  const e = SILLY_EMOJI[Math.floor(Math.random() * SILLY_EMOJI.length)];
+  const v = SILLY_VERBS[Math.floor(Math.random() * SILLY_VERBS.length)];
+  const n = SILLY_NOUNS[Math.floor(Math.random() * SILLY_NOUNS.length)];
+  return `${e} ${v} ${n}…`;
+}
+
 function pickQuip(pool) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+// Saving message picker — ~30% chance of a freshly-generated silly combo,
+// otherwise pulls from the curated pool. The dual layer keeps things from
+// getting stale even for users who save dozens of emails a day.
+function pickSavingMessage() {
+  if (Math.random() < 0.3) return generateSillySavingMessage();
+  return pickQuip(SAVING_QUIPS);
+}
+
 // Time-of-day greeting — first save of the day gets a personalized line
-// appended to the post-save card. Recognizes the reality of consulting hours
-// without nagging.
+// appended to the post-save card. Each slot has multiple variants so daily
+// users see something different. Lunch and afternoon slots include break
+// reminders, since those are the hours people actually skip breaks.
+const TIME_GREETINGS = {
+  morning: [
+    "☕ Morning — first file of the day. Strong start.",
+    "☕ Filing before 10am? Disciplined.",
+    "🌅 Bright and early. Project record blessed.",
+  ],
+  lateBreakfast: [
+    "🥐 Late breakfast filing. Solid.",
+    "🥐 Pre-lunch productivity. Building momentum.",
+    "🍵 Mid-morning groove. Nice pace.",
+  ],
+  lunch: [
+    "🥪 Lunchtime filing — but eat something too, ok?",
+    "🥪 Filing while you eat? AEC heroics. Don't forget the food.",
+    "🥗 Lunch-hour documentation. Hydrate too.",
+    "🍴 Filing through lunch? At least step away from the screen for 5.",
+  ],
+  afternoon: [
+    "📊 Mid-afternoon focus. Respect.",
+    "🧘 Afternoon files going in — also: stand up, stretch, water?",
+    "📊 3pm momentum. You've earned a 5-min break soon.",
+    "👀 Eyes off the screen for a sec? Then back to it.",
+    "☕ Mid-afternoon — second coffee window is officially open.",
+  ],
+  evening: [
+    "🌅 Evening filing — wrapping up clean.",
+    "🌅 End-of-day cleanup. Tomorrow-You says thanks.",
+    "🌇 Closing the loop on today. Nice.",
+  ],
+  lateEvening: [
+    "🌙 9-to-9 day? Thanks for the dedication.",
+    "🌙 Past 7pm? Make sure dinner happened.",
+    "🌃 Evening shift respect.",
+  ],
+  lateNight: [
+    "🦉 Filing past 10pm — admirable. Sleep is also good.",
+    "🌙 Late shift respect. Set a hard stop?",
+    "🦉 The owl hours. Don't let this become a habit.",
+  ],
+};
 function timeOfDayGreeting() {
   const h = new Date().getHours();
-  if (h >= 5 && h < 10)  return "☕ Morning — first file of the day. Strong start.";
-  if (h >= 10 && h < 12) return "🥐 Late breakfast filing. Solid.";
-  if (h >= 12 && h < 14) return "🥪 Lunchtime documentation. Multitasker.";
-  if (h >= 14 && h < 17) return "📊 Mid-afternoon focus. Respect.";
-  if (h >= 17 && h < 19) return "🌅 Evening filing — wrapping up clean.";
-  if (h >= 19 && h < 22) return "🌙 9-to-9 day? Thanks for the dedication.";
-  if (h >= 22)            return "🦉 Filing past 10pm — admirable. Sleep is also good.";
-  return "🌌 Filing at " + h + ":00? You're a different kind of person. Respect.";
+  let pool;
+  if (h >= 5  && h < 10) pool = TIME_GREETINGS.morning;
+  else if (h >= 10 && h < 12) pool = TIME_GREETINGS.lateBreakfast;
+  else if (h >= 12 && h < 14) pool = TIME_GREETINGS.lunch;
+  else if (h >= 14 && h < 17) pool = TIME_GREETINGS.afternoon;
+  else if (h >= 17 && h < 19) pool = TIME_GREETINGS.evening;
+  else if (h >= 19 && h < 22) pool = TIME_GREETINGS.lateEvening;
+  else if (h >= 22)           pool = TIME_GREETINGS.lateNight;
+  else pool = ["🌌 Filing at " + h + ":00? You're a different kind of person. Respect."];
+  return pickQuip(pool);
 }
 
 const LAST_SAVE_DATE_KEY = "setty_pms_last_save_date_v1";
@@ -2103,7 +2191,7 @@ if (existingRecord) {
   refreshEmailSavedIndicator();
   return;
 }
-  setStatus("actionStatus", "info", pickQuip(SAVING_QUIPS));
+  setStatus("actionStatus", "info", pickSavingMessage());
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -2197,7 +2285,7 @@ async function _doSaveToProjectRecordOnly() {
     refreshEmailSavedIndicator();
     return;
   }
-  setStatus("actionStatus", "info", pickQuip(SAVING_QUIPS));
+  setStatus("actionStatus", "info", pickSavingMessage());
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
@@ -3087,11 +3175,12 @@ async function doSaveMilestone() {
     }));
 
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
+    const pep = pickQuip(NEW_MILESTONE_QUIPS);
     if (calResult.success) {
       const calLabel = calResult.onShared ? "NYC Shared Calendar" : "your personal calendar";
-      setStatus("milestoneStatus", "success", "✓ Saved to " + projLabel + " · synced to " + calLabel);
+      setStatus("milestoneStatus", "success", pep + " Saved to " + projLabel + " · synced to " + calLabel);
     } else {
-      setStatus("milestoneStatus", "success", "✓ Saved to " + projLabel + " (calendar sync failed: " + calResult.error + ")");
+      setStatus("milestoneStatus", "success", pep + " Saved to " + projLabel + " (calendar sync failed: " + calResult.error + ")");
     }
     document.getElementById("milestoneForm").style.display = "none";
   } catch(e) {
