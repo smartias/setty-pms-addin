@@ -1586,6 +1586,33 @@ function renderProjectSuggestions() {
 // user opens a different email.
 let _dateSuggestBodyCache = { gen: -1, text: "" };
 
+// Per-email date dismissals — when the user clicks × on a date chip we
+// remember it locally so it doesn't reappear on reload. Stored as
+// { [emailId]: ["2026-05-18", ...] } in localStorage. Per-device by design;
+// dismissals are UI preference, not project data.
+const DISMISSED_DATES_KEY = "setty_pms_dismissed_dates_v1";
+function _loadDismissedDatesMap() {
+  try {
+    const raw = localStorage.getItem(DISMISSED_DATES_KEY);
+    return raw ? (JSON.parse(raw) || {}) : {};
+  } catch { return {}; }
+}
+function getDismissedDatesForCurrentEmail() {
+  const id = getCurrentMessageRecordId();
+  if (!id) return new Set();
+  const map = _loadDismissedDatesMap();
+  return new Set(map[id] || []);
+}
+function dismissDateForCurrentEmail(iso) {
+  const id = getCurrentMessageRecordId();
+  if (!id || !iso) return;
+  const map = _loadDismissedDatesMap();
+  const list = new Set(map[id] || []);
+  list.add(iso);
+  map[id] = Array.from(list);
+  try { localStorage.setItem(DISMISSED_DATES_KEY, JSON.stringify(map)); } catch {}
+}
+
 async function renderDateSuggestions() {
   const block = document.getElementById("dateSuggestionBlock");
   const chips = document.getElementById("dateSuggestionChips");
@@ -1615,8 +1642,8 @@ async function renderDateSuggestions() {
   }
 
   // Filter out dates that already correspond to a milestone created from this
-  // email — match by sourceItemId or sourceMessageId (set when a milestone is
-  // saved). Once a chip has been acted on, it shouldn't reappear on reopen.
+  // email (acted-on dismissal, durable across devices) AND dates the user has
+  // explicitly dismissed via × (UI preference, per-device).
   const itemId   = emailItem?.itemId || "";
   const sharedId = getCurrentSharedMessageId() || "";
   const usedDates = new Set(
@@ -1625,8 +1652,9 @@ async function renderDateSuggestions() {
       .map(m => m.dueDate)
       .filter(Boolean)
   );
+  const dismissedDates = getDismissedDatesForCurrentEmail();
   const dates = extractDueDates(text, emailItem?.dateTimeCreated)
-    .filter(d => !usedDates.has(d.iso))
+    .filter(d => !usedDates.has(d.iso) && !dismissedDates.has(d.iso))
     .slice(0, 3);
   if (!dates.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
 
@@ -1636,14 +1664,24 @@ async function renderDateSuggestions() {
       weekday: "short", month: "short", day: "numeric", year: "numeric"
     });
     return `
-      <button type="button" class="suggestion-chip date-chip" data-iso="${escHtml(d.iso)}">
-        <span class="sc-date">${escHtml(friendly)}${d.hasKeyword ? ' <span class="pill" style="background:var(--primary-soft);color:var(--primary-hov);border:1px solid #b7daf2;">deadline</span>' : ""}</span>
-        <span class="sc-cta">+ Create →</span>
-      </button>
+      <div class="date-chip-row">
+        <button type="button" class="suggestion-chip date-chip" data-iso="${escHtml(d.iso)}">
+          <span class="sc-date">${escHtml(friendly)}${d.hasKeyword ? ' <span class="pill" style="background:var(--primary-soft);color:var(--primary-hov);border:1px solid #b7daf2;">deadline</span>' : ""}</span>
+          <span class="sc-cta">+ Create →</span>
+        </button>
+        <button type="button" class="chip-dismiss" data-iso="${escHtml(d.iso)}" title="Not a deadline — dismiss" aria-label="Dismiss this date">×</button>
+      </div>
     `;
   }).join("");
-  chips.querySelectorAll(".suggestion-chip").forEach(el => {
+  chips.querySelectorAll(".suggestion-chip.date-chip").forEach(el => {
     el.onclick = () => openMilestoneFormFromChip(el.dataset.iso);
+  });
+  chips.querySelectorAll(".chip-dismiss").forEach(el => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      dismissDateForCurrentEmail(el.dataset.iso);
+      void renderDateSuggestions();
+    };
   });
   block.style.display = "block";
 }

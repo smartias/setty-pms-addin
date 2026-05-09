@@ -502,6 +502,37 @@
     .suggestion-chip.date-chip .sc-date { font-size: 13px; color: var(--text); font-weight: 600; }
     .suggestion-chip.date-chip .sc-cta { font-size: 11px; color: var(--primary); font-weight: 600; white-space: nowrap; }
     .suggestion-chip.date-chip:hover .sc-cta { color: var(--primary-hov); }
+    /* Date-chip row — chip + small × dismiss button side by side. The dismiss
+       lets users prune false positives ("the meeting on Tuesday" wasn't a
+       deadline) without acting on them. Persists per-email in localStorage. */
+    .date-chip-row {
+      display: flex;
+      align-items: stretch;
+      gap: 4px;
+      margin-bottom: 4px;
+    }
+    .date-chip-row .suggestion-chip { flex: 1; margin-bottom: 0; }
+    .date-chip-row .chip-dismiss {
+      flex-shrink: 0;
+      width: 28px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-faint);
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.1s, border-color 0.1s, background 0.1s;
+    }
+    .date-chip-row .chip-dismiss:hover {
+      color: var(--error);
+      border-color: #f1c0c4;
+      background: var(--error-bg);
+    }
 
     .pill {
       display: inline-block;
