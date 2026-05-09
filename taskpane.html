@@ -231,6 +231,16 @@
       margin-top: 2px;
       line-height: 1.4;
     }
+    #saveConfirmation #scSharePointLink {
+      display: inline-flex;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--primary);
+      text-decoration: none;
+      margin-top: 6px;
+    }
+    #saveConfirmation #scSharePointLink:hover { color: var(--primary-hov); text-decoration: underline; }
     #saveConfirmation.entering { animation: sc-pop-in 0.42s cubic-bezier(0.2, 1.2, 0.4, 1); }
     @keyframes sc-pop-in {
       from { opacity: 0; transform: scale(0.92); }
@@ -665,12 +675,14 @@
     <span id="saveRecordCaption">Email body → project record only</span>
   </div>
   <!-- Post-save confirmation — replaces the save buttons once the email is filed.
-       Big check + summary line so the "done" state actually feels done. -->
+       Big check + summary line so the "done" state actually feels done.
+       Optional SharePoint link surfaces only when the email was filed there. -->
   <div id="saveConfirmation" style="display:none;">
     <div class="sc-icon">✓</div>
     <div class="sc-text">
       <div class="sc-primary"></div>
       <div class="sc-secondary"></div>
+      <a id="scSharePointLink" href="#" style="display:none;">📂 Open SharePoint folder →</a>
     </div>
   </div>
   <button class="btn btn-secondary" id="logNoteBtn">📝 Log as Note</button>

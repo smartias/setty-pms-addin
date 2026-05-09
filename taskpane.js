@@ -570,8 +570,21 @@ function refreshEmailSavedIndicator(animate = false) {
   if (confirmation) {
     const primaryEl = confirmation.querySelector(".sc-primary");
     const secondaryEl = confirmation.querySelector(".sc-secondary");
+    const linkEl = confirmation.querySelector("#scSharePointLink");
     if (primaryEl) primaryEl.textContent = primary;
     if (secondaryEl) secondaryEl.textContent = secondaryParts.join(" · ");
+    // SharePoint folder link — surfaces only when the email was actually filed
+    // there. openExternalUrl handles Outlook's pop-out semantics; a bare
+    // target="_blank" works in Outlook web but not always in desktop.
+    if (linkEl) {
+      if (wasFiledToSharePoint && existing.spFolderUrl) {
+        linkEl.style.display = "inline-flex";
+        linkEl.onclick = (e) => { e.preventDefault(); openExternalUrl(existing.spFolderUrl); };
+      } else {
+        linkEl.style.display = "none";
+        linkEl.onclick = null;
+      }
+    }
     confirmation.style.display = "flex";
     // Animation only on a fresh save click — silent on email reopen so the card
     // feels like a stable "saved" state, not a celebration that happens twice.
