@@ -113,9 +113,10 @@ function setupEventListeners() {
         _logoClickCount = 0;
         const overlay = document.getElementById("creditsOverlay");
         if (overlay) overlay.classList.add("show");
-        if (typeof confetti === "function") {
+        loadConfetti().then(ok => {
+          if (!ok || typeof confetti !== "function") return;
           confetti({ particleCount: 40, spread: 60, origin: { y: 0.5 }, scalar: 0.7, ...(getSeasonalConfettiOpts() || {}) });
-        }
+        });
         return;
       }
       _logoClickTimer = setTimeout(() => { _logoClickCount = 0; }, 3000);
@@ -1856,6 +1857,24 @@ function pickQuip(pool) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+// Lazy-load canvas-confetti on first celebration. Saves the ~5KB download
+// (and parse cost) on every pane open for users who never hit a milestone.
+// Browser caches the script after first load, so subsequent celebrations
+// are instant. Returns a Promise<boolean> — true when ready, false on load error.
+let _confettiLoadPromise = null;
+function loadConfetti() {
+  if (typeof confetti === "function") return Promise.resolve(true);
+  if (_confettiLoadPromise) return _confettiLoadPromise;
+  _confettiLoadPromise = new Promise(resolve => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js";
+    s.onload = () => resolve(true);
+    s.onerror = () => { _confettiLoadPromise = null; resolve(false); }; // allow retry next time
+    document.head.appendChild(s);
+  });
+  return _confettiLoadPromise;
+}
+
 // Saving message picker — ~30% chance of a freshly-generated silly combo,
 // otherwise pulls from the curated pool. The dual layer keeps things from
 // getting stale even for users who save dozens of emails a day.
@@ -2109,23 +2128,27 @@ function triggerFirstSaveCelebration() {
       toast.classList.remove("show", "first-save");
     }, 5000);
   }
-  if (typeof confetti !== "function") return;
-  const duration = 2500;
-  const animationEnd = Date.now() + duration;
-  const seasonal = getSeasonalConfettiOpts() || {};
-  const defaults = { startVelocity: 32, spread: 360, ticks: 80, zIndex: 9999, scalar: 1.1, ...seasonal };
-  const rand = (min, max) => Math.random() * (max - min) + min;
-  const interval = setInterval(() => {
-    const timeLeft = animationEnd - Date.now();
-    if (timeLeft <= 0) { clearInterval(interval); return; }
-    const particleCount = 60 * (timeLeft / duration);
-    confetti({ ...defaults, particleCount, origin: { x: rand(0.1, 0.3), y: rand(0, 0.4) } });
-    confetti({ ...defaults, particleCount, origin: { x: rand(0.7, 0.9), y: rand(0, 0.4) } });
-  }, 200);
-  // Big finale a beat after the rolling bursts end — mixed shapes for variety.
-  setTimeout(() => {
-    confetti({ particleCount: 160, spread: 110, startVelocity: 50, origin: { y: 0.55 }, scalar: 1.3, shapes: ["star", "circle"], ...seasonal });
-  }, duration + 80);
+  // Lazy-load confetti on first celebration. The fireworks pattern starts
+  // once it resolves; toast/animation above is unaffected.
+  loadConfetti().then(ok => {
+    if (!ok || typeof confetti !== "function") return;
+    const duration = 2500;
+    const animationEnd = Date.now() + duration;
+    const seasonal = getSeasonalConfettiOpts() || {};
+    const defaults = { startVelocity: 32, spread: 360, ticks: 80, zIndex: 9999, scalar: 1.1, ...seasonal };
+    const rand = (min, max) => Math.random() * (max - min) + min;
+    const interval = setInterval(() => {
+      const timeLeft = animationEnd - Date.now();
+      if (timeLeft <= 0) { clearInterval(interval); return; }
+      const particleCount = 60 * (timeLeft / duration);
+      confetti({ ...defaults, particleCount, origin: { x: rand(0.1, 0.3), y: rand(0, 0.4) } });
+      confetti({ ...defaults, particleCount, origin: { x: rand(0.7, 0.9), y: rand(0, 0.4) } });
+    }, 200);
+    // Big finale a beat after the rolling bursts end — mixed shapes for variety.
+    setTimeout(() => {
+      confetti({ particleCount: 160, spread: 110, startVelocity: 50, origin: { y: 0.55 }, scalar: 1.3, shapes: ["star", "circle"], ...seasonal });
+    }, duration + 80);
+  });
 }
 
 function triggerCelebration(message) {
@@ -2142,13 +2165,16 @@ function triggerCelebration(message) {
       toast.classList.remove("show");
     }, 2800);
   }
-  if (typeof confetti === "function") {
+  // Lazy-load confetti on first celebration. Toast above is sync; confetti
+  // arrives a beat later — actually feels more dramatic.
+  loadConfetti().then(ok => {
+    if (!ok || typeof confetti !== "function") return;
     // Two bursts a beat apart — feels more alive than one big shot.
     // Seasonal opts layer on top (snowflakes in Dec, hearts on Valentine's, etc.)
     const seasonal = getSeasonalConfettiOpts() || {};
     confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85, ...seasonal });
     setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7, ...seasonal }), 220);
-  }
+  });
 }
 
 function compressHtmlAddin(html) {
@@ -3160,7 +3186,7 @@ function extractDueDates(rawText, emailReceivedDate) {
     if (ctxStart > 0) ctx = "…" + ctx;
     if (ctxEnd < text.length) ctx += "…";
     const before     = text.slice(Math.max(0, idx - 150), idx).toLowerCase();
-    const hasKeyword = /\b(due|deadline|by|no later than|nlt|ntp|submit|required|respond|return|need|complete|deliver|before|expected|must have)\b/.test(before);
+    const hasKeyword = /\b(due|deadline|by|no later than|nlt|ntp|submit|required|respond|return|need|complete|deliver|before|expected|must have|scheduled|target)\b/.test(before);
     seen.add(iso);
     results.push({ iso, display, ctx, hasKeyword });
   }

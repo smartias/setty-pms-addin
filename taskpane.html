@@ -13,9 +13,9 @@
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
-  <!-- canvas-confetti: weekly-streak milestone celebrations. ~5KB. Variable rewards
-       (only on round numbers) drive habit formation more than constant praise. -->
-  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+  <!-- canvas-confetti is loaded lazily on first celebration (see loadConfetti
+       in taskpane.js) so it doesn't slow down pane open. ~5KB on first
+       celebration, then browser-cached. -->
   <style>
     /* Fluent-light palette — designed to feel native inside Outlook.
        Setty red (#C00000) is reserved as a logo accent only, not a UI color. */
