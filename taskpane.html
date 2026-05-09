@@ -274,6 +274,64 @@
       from { opacity: 0; transform: translateY(-2px); }
       to   { opacity: 1; transform: translateY(0); }
     }
+    /* Hidden credits overlay — revealed by 5x click on SETTY PMS logo. */
+    #creditsOverlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 99998;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      animation: credits-overlay-in 0.25s ease-out;
+    }
+    #creditsOverlay.show { display: flex; }
+    .credits-card {
+      background: #fff;
+      border-top: 4px solid var(--setty-red);
+      border-radius: 10px;
+      padding: 22px 26px;
+      max-width: 280px;
+      text-align: center;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+      animation: credits-card-pop 0.45s cubic-bezier(0.2, 1.3, 0.4, 1);
+    }
+    .credits-title {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--setty-red);
+      letter-spacing: 1.5px;
+    }
+    .credits-tagline {
+      font-size: 13px;
+      color: var(--text);
+      font-style: italic;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+    .credits-meta {
+      font-size: 11px;
+      color: var(--text-soft);
+      margin-top: 10px;
+      letter-spacing: 0.5px;
+    }
+    .credits-hint {
+      font-size: 10px;
+      color: var(--text-faint);
+      margin-top: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    @keyframes credits-overlay-in {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+    @keyframes credits-card-pop {
+      from { opacity: 0; transform: scale(0.85) translateY(8px); }
+      to   { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .header-logo { cursor: pointer; user-select: none; }
     /* Celebration toast — appears at the top of the pane on weekly milestone hits.
        Gold gradient + slide-down + pop motion so the moment feels rewarding. */
     #celebrationToast {
@@ -500,6 +558,16 @@
 </head>
 <body>
 <div id="celebrationToast" aria-live="polite"></div>
+<!-- Hidden credits overlay — revealed by clicking the SETTY PMS logo 5x.
+     Pure easter egg, no app function. Click anywhere to dismiss. -->
+<div id="creditsOverlay">
+  <div class="credits-card">
+    <div class="credits-title">SETTY PMS</div>
+    <div class="credits-tagline">Built with hard hats and clipboards.</div>
+    <div class="credits-meta">2026 · Setty &amp; Associates</div>
+    <div class="credits-hint">click anywhere to close</div>
+  </div>
+</div>
 
 <!-- Loading state — visible immediately, hidden once Office.onReady fires -->
 <div id="loadingView" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:12px;">

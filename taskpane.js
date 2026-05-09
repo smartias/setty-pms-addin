@@ -95,6 +95,31 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
+  // 5-click easter egg on the SETTY PMS logo — reveals the credits card.
+  // Counter resets after 3 seconds idle so a curious user has time to discover
+  // the pattern but doesn't accidentally trigger it across casual clicks.
+  let _logoClickCount = 0;
+  let _logoClickTimer = null;
+  const logoEl = document.querySelector(".header-logo");
+  if (logoEl) {
+    logoEl.title = "v" + (window.__appVersion || "");
+    logoEl.onclick = () => {
+      _logoClickCount++;
+      clearTimeout(_logoClickTimer);
+      if (_logoClickCount >= 5) {
+        _logoClickCount = 0;
+        const overlay = document.getElementById("creditsOverlay");
+        if (overlay) overlay.classList.add("show");
+        if (typeof confetti === "function") {
+          confetti({ particleCount: 40, spread: 60, origin: { y: 0.5 }, scalar: 0.7, ...(getSeasonalConfettiOpts() || {}) });
+        }
+        return;
+      }
+      _logoClickTimer = setTimeout(() => { _logoClickCount = 0; }, 3000);
+    };
+  }
+  const credits = document.getElementById("creditsOverlay");
+  if (credits) credits.onclick = () => credits.classList.remove("show");
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -532,6 +557,11 @@ function refreshEmailSavedIndicator(animate = false) {
   if (_pendingDayGreeting) {
     secondaryParts.push(_pendingDayGreeting);
     _pendingDayGreeting = "";
+  }
+  // Same pattern for content/age-aware quips — fires once after the save.
+  if (_pendingContentQuip) {
+    secondaryParts.push(_pendingContentQuip);
+    _pendingContentQuip = "";
   }
 
   if (confirmation) {
@@ -1823,6 +1853,88 @@ function timeOfDayGreeting() {
 
 const LAST_SAVE_DATE_KEY = "setty_pms_last_save_date_v1";
 let _pendingDayGreeting = "";
+let _pendingContentQuip = "";
+
+// Content-aware quips — fire on save when the subject contains specific
+// keywords. ~30% chance per match so they stay surprising. Active voice
+// makes the tool read like it's commenting on the email, not just labeling it.
+const CONTENT_AWARE_QUIPS = [
+  { pattern: /\basap\b/i,                              quip: "👀 the magic word, archived" },
+  { pattern: /\bdeadline\b/i,                          quip: "🎯 deadline noted" },
+  { pattern: /\bthank ?you\b|\bthanks\b/i,             quip: "📩 a thank-you, catalogued" },
+  { pattern: /\burgent\b|\btime[- ]sensitive\b/i,      quip: "🚨 urgency, archived" },
+  { pattern: /\bapprov(ed|al)\b/i,                     quip: "✅ approval, preserved" },
+  { pattern: /\brfi\b|\brfi[- ]?\d+\b/i,               quip: "🔵 RFI logged in the official record" },
+  { pattern: /\bsubmittal\b/i,                         quip: "📋 submittal, tracked" },
+  { pattern: /\bchange order\b|\bco[- ]?\d{2,}\b/i,    quip: "💰 change order, noted" },
+  { pattern: /\bdelay(ed)?\b|\bbehind schedule\b/i,    quip: "⏳ delay, on the record" },
+  { pattern: /\bmeeting\b/i,                           quip: "🪑 meeting evidence captured" },
+  { pattern: /\binvoice\b|\bpayment\b/i,               quip: "💵 financial trail extended" },
+  { pattern: /\bsigned?\b|\bsignature\b/i,             quip: "✒️ signed, sealed, filed" },
+];
+function detectContentQuip(text) {
+  if (!text) return "";
+  for (const { pattern, quip } of CONTENT_AWARE_QUIPS) {
+    if (pattern.test(text)) {
+      // 30% probability per match — rare enough to feel discovered, frequent
+      // enough that users with relevant emails actually see them.
+      return Math.random() < 0.3 ? quip : "";
+    }
+  }
+  return "";
+}
+
+// Age-based quip — saving an email older than ~6 months is rare enough to
+// always fire when it happens. Plays into the project archivist vibe.
+function detectAgeQuip() {
+  if (!emailItem?.dateTimeCreated) return "";
+  const ageDays = (Date.now() - new Date(emailItem.dateTimeCreated).getTime()) / 86400000;
+  if (ageDays >= 180) return "🗿 ancient artifact filed for posterity";
+  return "";
+}
+
+// Seasonal confetti modifiers — applied on top of the base confetti config
+// during celebrations. Snowflakes in December, hearts on Valentine's,
+// patriotic on July 4, etc. Returns null on ordinary days so the standard
+// confetti palette runs. confetti.shapeFromText was added in v1.6+.
+function getSeasonalConfettiOpts() {
+  if (typeof confetti !== "function") return null;
+  const d = new Date();
+  const m = d.getMonth(); // 0-indexed
+  const day = d.getDate();
+  if (m === 11) {
+    // December — snowflakes all month for that holiday vibe.
+    return {
+      colors: ["#ffffff", "#e3f2fd", "#bbdefb", "#90caf9"],
+      shapes: [confetti.shapeFromText({ text: "❄️", scalar: 2 })],
+      scalar: 1.6,
+    };
+  }
+  if (m === 0 && day === 1) {
+    // New Year's Day — gold/silver/pink/cyan party palette.
+    return { colors: ["#ffd700", "#c0c0c0", "#ff6b9d", "#6bd4ff"] };
+  }
+  if (m === 1 && day === 14) {
+    // Valentine's Day — hearts.
+    return {
+      colors: ["#ff3a7a", "#ff6b9d", "#ffb3c6", "#ffffff"],
+      shapes: [confetti.shapeFromText({ text: "❤️", scalar: 2 })],
+      scalar: 2,
+    };
+  }
+  if (m === 6 && day === 4) {
+    // July 4 — red/white/blue stars.
+    return {
+      colors: ["#bf0a30", "#ffffff", "#002868"],
+      shapes: ["star", "circle"],
+    };
+  }
+  if (m === 9 && day === 31) {
+    // Halloween — orange & black.
+    return { colors: ["#ff7518", "#000000", "#8a2be2", "#ffd700"] };
+  }
+  return null;
+}
 function consumeFirstSaveOfDay() {
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -1896,6 +2008,12 @@ function recordSaveAndCelebrate() {
   // Read by refreshEmailSavedIndicator and cleared after one use.
   if (consumeFirstSaveOfDay()) _pendingDayGreeting = timeOfDayGreeting();
 
+  // Content-aware + age-aware quips. Age wins when present — it's a much
+  // rarer event (saving a 6+ month old email) and deserves the spotlight.
+  const ageQuip = detectAgeQuip();
+  const contentQuip = detectContentQuip(emailItem?.subject || "");
+  _pendingContentQuip = ageQuip || contentQuip;
+
   if (isFirstEver) {
     triggerFirstSaveCelebration();
     return; // skip weekly thresholds; first-save is the headline.
@@ -1923,7 +2041,8 @@ function triggerFirstSaveCelebration() {
   if (typeof confetti !== "function") return;
   const duration = 2500;
   const animationEnd = Date.now() + duration;
-  const defaults = { startVelocity: 32, spread: 360, ticks: 80, zIndex: 9999, scalar: 1.1 };
+  const seasonal = getSeasonalConfettiOpts() || {};
+  const defaults = { startVelocity: 32, spread: 360, ticks: 80, zIndex: 9999, scalar: 1.1, ...seasonal };
   const rand = (min, max) => Math.random() * (max - min) + min;
   const interval = setInterval(() => {
     const timeLeft = animationEnd - Date.now();
@@ -1934,7 +2053,7 @@ function triggerFirstSaveCelebration() {
   }, 200);
   // Big finale a beat after the rolling bursts end — mixed shapes for variety.
   setTimeout(() => {
-    confetti({ particleCount: 160, spread: 110, startVelocity: 50, origin: { y: 0.55 }, scalar: 1.3, shapes: ["star", "circle"] });
+    confetti({ particleCount: 160, spread: 110, startVelocity: 50, origin: { y: 0.55 }, scalar: 1.3, shapes: ["star", "circle"], ...seasonal });
   }, duration + 80);
 }
 
@@ -1954,8 +2073,10 @@ function triggerCelebration(message) {
   }
   if (typeof confetti === "function") {
     // Two bursts a beat apart — feels more alive than one big shot.
-    confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85 });
-    setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7 }), 220);
+    // Seasonal opts layer on top (snowflakes in Dec, hearts on Valentine's, etc.)
+    const seasonal = getSeasonalConfettiOpts() || {};
+    confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85, ...seasonal });
+    setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7, ...seasonal }), 220);
   }
 }
 
