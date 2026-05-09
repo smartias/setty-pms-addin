@@ -259,6 +259,21 @@
       border: 1px solid var(--border);
     }
     .quick-links .btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
+    /* Ambient AEC quip line — italic, faded, centered. Pure flavor. Fades in
+       so it feels like an observation, not a notification. */
+    #aecQuipLine {
+      font-size: 11px;
+      font-style: italic;
+      color: var(--text-faint);
+      text-align: center;
+      margin: -6px 0 10px;
+      padding: 0 6px;
+      animation: quip-fade-in 0.6s ease-out;
+    }
+    @keyframes quip-fade-in {
+      from { opacity: 0; transform: translateY(-2px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
     /* Celebration toast — appears at the top of the pane on weekly milestone hits.
        Gold gradient + slide-down + pop motion so the moment feels rewarding. */
     #celebrationToast {
@@ -529,6 +544,8 @@
     <div class="email-subject" id="emailSubject">Loading…</div>
     <div class="email-meta" id="emailMeta"></div>
   </div>
+  <!-- Rare ambient observation. ~8% of email opens. Pure flavor, no info. -->
+  <div id="aecQuipLine" style="display:none;"></div>
 
   <!-- Project suggestion chips — shown when no project tag exists for this thread -->
   <div id="suggestionBlock" class="suggestion-block" style="display:none;">

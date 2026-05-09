@@ -382,6 +382,7 @@ function loadItemContext() {
     setSelectedProject(null, false);
     void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
+    maybeShowAecQuip();
   }
 }
 function getCurrentMessageRestId() {
@@ -525,6 +526,12 @@ function refreshEmailSavedIndicator(animate = false) {
   }
   if (loggedLabels.length) {
     secondaryParts.push(`also logged as ${loggedLabels.join(", ")}`);
+  }
+  // Append the once-per-day greeting if pending. Cleared after one read so it
+  // shows immediately after the save and never again on subsequent re-opens.
+  if (_pendingDayGreeting) {
+    secondaryParts.push(_pendingDayGreeting);
+    _pendingDayGreeting = "";
   }
 
   if (confirmation) {
@@ -1642,12 +1649,121 @@ async function getEmailBodyHtml(token) {
 // celebration. Per-device counter via localStorage; cross-device sync would
 // need a Supabase write per save and isn't worth it for a fun nudge.
 const SAVE_STREAK_KEY = "setty_pms_save_streak_v1";
-const STREAK_THRESHOLDS = [
-  { count: 10,  message: "🎉 10 emails filed this week!" },
-  { count: 25,  message: "🔥 25 this week — strong rhythm!" },
-  { count: 50,  message: "🚀 50 emails — on a roll!" },
-  { count: 100, message: "🏆 100 emails — legendary week!" },
+
+// ─── AEC FLAVOR PACK ────────────────────────────────────────────────────────
+// Personality strings for the add-in. Goal: rare, varied, AEC-aware.
+// Frequent repetition kills the charm, so quips rotate randomly and ambient
+// ones fire at low probability (~8%). Plain "⏳ Saving…" is in the saving pool
+// so ~1 in 8 saves gets the boring version, which keeps the rest feeling like
+// nice surprises rather than wallpaper.
+const SAVING_QUIPS = [
+  "⏳ Saving…",
+  "🏗️ Notarizing the email…",
+  "📐 Calibrating documentation gravity…",
+  "📁 Filing with extreme precision…",
+  "🎯 Threading into the project record…",
+  "📋 Asking the project record very politely…",
+  "🔧 Tightening a metaphorical bolt…",
+  "🗂️ Cross-referencing the master plan…",
 ];
+const EMAIL_OPEN_QUIPS = [
+  "*googly eyes* this one looks important",
+  "*adjusts hard hat*",
+  "*applies clipboard authority*",
+  "*measures email* yep, that's definitely an email",
+  "*examines metadata thoughtfully*",
+  "*target acquired*",
+  "*cross-references the master plan*",
+  "*tightens a metaphorical bolt*",
+  "*nods sagely*",
+  "*consults the AIA standard for this exact moment*",
+  "*sniffs for change orders*",
+];
+const MILESTONE_QUIPS_10 = [
+  "🎉 10 saved! That's a respectable start.",
+  "🎉 10 emails — foundation of project memory laid.",
+  "🎉 10 down — documenting like a court reporter on caffeine.",
+  "🎉 10 saved! Future-You will send a thank-you note.",
+  "🎉 10 emails — measure twice, file once. You're doing both.",
+];
+const MILESTONE_QUIPS_25 = [
+  "🔥 25 this week — strong rhythm!",
+  "🔥 25 saved — architects are jealous of your filing game.",
+  "🔥 25 emails — the project record gods are pleased.",
+  "🔥 25 down — your project history is becoming legendary.",
+  "🔥 25 emails — fixing project memory one save at a time.",
+];
+const MILESTONE_QUIPS_50 = [
+  "🚀 50 emails — on a roll!",
+  "🚀 50 saved! At this rate you'll need a bigger SharePoint folder.",
+  "🚀 50 — basically the project's official scribe at this point.",
+  "🚀 50 — *applies extra clipboard authority*",
+  "🚀 50 emails! Documentation icon status: confirmed.",
+];
+const MILESTONE_QUIPS_100 = [
+  "🏆 100 emails — legendary week!",
+  "🏆 100 saved — you're now the project archivist. Update LinkedIn.",
+  "🏆 100 emails — Setty docs hall of fame.",
+  "🏆 100 — you've crossed from 'PM' to 'librarian'.",
+  "🏆 100 — enough record to write an entire AIA standard.",
+];
+const STREAK_THRESHOLDS = [
+  { count: 10,  pool: MILESTONE_QUIPS_10 },
+  { count: 25,  pool: MILESTONE_QUIPS_25 },
+  { count: 50,  pool: MILESTONE_QUIPS_50 },
+  { count: 100, pool: MILESTONE_QUIPS_100 },
+];
+
+function pickQuip(pool) {
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Time-of-day greeting — first save of the day gets a personalized line
+// appended to the post-save card. Recognizes the reality of consulting hours
+// without nagging.
+function timeOfDayGreeting() {
+  const h = new Date().getHours();
+  if (h >= 5 && h < 10)  return "☕ Morning — first file of the day. Strong start.";
+  if (h >= 10 && h < 12) return "🥐 Late breakfast filing. Solid.";
+  if (h >= 12 && h < 14) return "🥪 Lunchtime documentation. Multitasker.";
+  if (h >= 14 && h < 17) return "📊 Mid-afternoon focus. Respect.";
+  if (h >= 17 && h < 19) return "🌅 Evening filing — wrapping up clean.";
+  if (h >= 19 && h < 22) return "🌙 9-to-9 day? Thanks for the dedication.";
+  if (h >= 22)            return "🦉 Filing past 10pm — admirable. Sleep is also good.";
+  return "🌌 Filing at " + h + ":00? You're a different kind of person. Respect.";
+}
+
+const LAST_SAVE_DATE_KEY = "setty_pms_last_save_date_v1";
+let _pendingDayGreeting = "";
+function consumeFirstSaveOfDay() {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const last = localStorage.getItem(LAST_SAVE_DATE_KEY);
+    if (last !== today) {
+      localStorage.setItem(LAST_SAVE_DATE_KEY, today);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+// Rare ambient observation under the email preview. Low probability (~8%) so
+// it lands like a wink, not wallpaper. Skipped for calendar appointments
+// (currentItemKind === "appointment") since the vibe doesn't fit.
+function maybeShowAecQuip() {
+  const line = document.getElementById("aecQuipLine");
+  if (!line) return;
+  if (!emailItem || currentItemKind === "appointment") {
+    line.style.display = "none";
+    return;
+  }
+  if (Math.random() < 0.08) {
+    line.textContent = pickQuip(EMAIL_OPEN_QUIPS);
+    line.style.display = "block";
+  } else {
+    line.style.display = "none";
+  }
+}
 
 function _weekStartISO() {
   // Monday-anchored ISO week. Anyone working a Sun-Sat week feels off-by-one
@@ -1688,12 +1804,16 @@ function recordSaveAndCelebrate() {
   state.count = (state.count || 0) + 1;
   try { localStorage.setItem(SAVE_STREAK_KEY, JSON.stringify(state)); } catch {}
 
+  // First save of the day — append a small greeting to the post-save card.
+  // Read by refreshEmailSavedIndicator and cleared after one use.
+  if (consumeFirstSaveOfDay()) _pendingDayGreeting = timeOfDayGreeting();
+
   if (isFirstEver) {
     triggerFirstSaveCelebration();
     return; // skip weekly thresholds; first-save is the headline.
   }
   const hit = STREAK_THRESHOLDS.find(t => t.count === state.count);
-  if (hit) triggerCelebration(hit.message);
+  if (hit) triggerCelebration(pickQuip(hit.pool));
 }
 
 // Fireworks-style burst pattern — two columns of bursts firing alternately for
@@ -1983,7 +2103,7 @@ if (existingRecord) {
   refreshEmailSavedIndicator();
   return;
 }
-  setStatus("actionStatus", "info", existingRecord ? "⏳ Re-saving to SharePoint (retrying attachments)…" : "⏳ Saving to SharePoint…");
+  setStatus("actionStatus", "info", pickQuip(SAVING_QUIPS));
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -2077,7 +2197,7 @@ async function _doSaveToProjectRecordOnly() {
     refreshEmailSavedIndicator();
     return;
   }
-  setStatus("actionStatus", "info", "⏳ Saving to project record…");
+  setStatus("actionStatus", "info", pickQuip(SAVING_QUIPS));
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
