@@ -95,13 +95,16 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
-  // 5-click easter egg on the SETTY PMS logo — reveals the credits card.
+  // 5-click easter egg on the SETTY PMS logo — reveals the cornerstone card.
   // Counter resets after 3 seconds idle so a curious user has time to discover
   // the pattern but doesn't accidentally trigger it across casual clicks.
+  // NOTE: there are TWO `.header-logo` elements (one in signInView, one in
+  // mainView), so bind to both via querySelectorAll. Counter is shared across
+  // the two so a user who clicks 3x while signed-out and 2x after signing in
+  // still gets the reveal.
   let _logoClickCount = 0;
   let _logoClickTimer = null;
-  const logoEl = document.querySelector(".header-logo");
-  if (logoEl) {
+  document.querySelectorAll(".header-logo").forEach(logoEl => {
     logoEl.title = "v" + (window.__appVersion || "");
     logoEl.onclick = () => {
       _logoClickCount++;
@@ -117,7 +120,7 @@ function setupEventListeners() {
       }
       _logoClickTimer = setTimeout(() => { _logoClickCount = 0; }, 3000);
     };
-  }
+  });
   const credits = document.getElementById("creditsOverlay");
   if (credits) credits.onclick = () => credits.classList.remove("show");
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
