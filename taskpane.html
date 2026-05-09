@@ -286,6 +286,19 @@
       opacity: 1;
       transform: translateX(-50%) translateY(0) scale(1);
     }
+    /* First-save variant — fires exactly once per user. Goes bigger: rainbow
+       gradient, larger text/padding, deeper shadow. The fireworks confetti
+       pattern in JS does most of the visual heavy lifting; this just makes
+       the toast feel like the headline rather than a footnote. */
+    #celebrationToast.first-save {
+      font-size: 14px;
+      font-weight: 800;
+      padding: 12px 22px;
+      letter-spacing: 0.2px;
+      background: linear-gradient(135deg, #ff6b9d 0%, #ffd86b 35%, #6bd4ff 70%, #b46bff 100%);
+      color: #1a1a1a;
+      box-shadow: 0 10px 32px rgba(255, 107, 157, 0.45), 0 4px 10px rgba(0, 0, 0, 0.2);
+    }
     .status-msg {
       padding: 8px 10px;
       border-radius: 4px;

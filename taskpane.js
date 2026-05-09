@@ -474,7 +474,7 @@ function getLoggedEmailArtifactLabels(project) {
   if (hasMilestone) labels.push("milestone");
   return labels;
 }
-function refreshEmailSavedIndicator() {
+function refreshEmailSavedIndicator(animate = false) {
   const btnSharePoint = document.getElementById("saveSpBtn");
   const btnRecordOnly = document.getElementById("saveRecordBtn");
   const saveRow = document.querySelector(".save-row");
@@ -533,10 +533,13 @@ function refreshEmailSavedIndicator() {
     if (primaryEl) primaryEl.textContent = primary;
     if (secondaryEl) secondaryEl.textContent = secondaryParts.join(" · ");
     confirmation.style.display = "flex";
-    // Re-trigger entry animation each time it appears (e.g., right after save).
+    // Animation only on a fresh save click — silent on email reopen so the card
+    // feels like a stable "saved" state, not a celebration that happens twice.
     confirmation.classList.remove("entering");
-    void confirmation.offsetWidth;
-    confirmation.classList.add("entering");
+    if (animate) {
+      void confirmation.offsetWidth;
+      confirmation.classList.add("entering");
+    }
   }
 
   // Clear the transient status banner — the confirmation card now carries the
@@ -1656,7 +1659,23 @@ function _weekStartISO() {
   return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
 }
 
+// First-ever save gets a one-time over-the-top welcome. Fires exactly once per
+// device (localStorage flag), independent of the weekly streak counter. Marks
+// the *transition* from "haven't done this yet" → "now I'm a person who does this."
+const FIRST_SAVE_KEY = "setty_pms_first_save_done_v1";
+function _isFirstSaveEver() {
+  try { return !localStorage.getItem(FIRST_SAVE_KEY); } catch { return false; }
+}
+function _markFirstSaveDone() {
+  try { localStorage.setItem(FIRST_SAVE_KEY, "1"); } catch {}
+}
+
 function recordSaveAndCelebrate() {
+  // Check first-save BEFORE bumping the weekly counter so the welcome fires
+  // even if this is also weekly-count #1.
+  const isFirstEver = _isFirstSaveEver();
+  if (isFirstEver) _markFirstSaveDone();
+
   const weekStart = _weekStartISO();
   let state = { weekStart, count: 0 };
   try {
@@ -1668,8 +1687,47 @@ function recordSaveAndCelebrate() {
   } catch { /* corrupt storage — start fresh */ }
   state.count = (state.count || 0) + 1;
   try { localStorage.setItem(SAVE_STREAK_KEY, JSON.stringify(state)); } catch {}
+
+  if (isFirstEver) {
+    triggerFirstSaveCelebration();
+    return; // skip weekly thresholds; first-save is the headline.
+  }
   const hit = STREAK_THRESHOLDS.find(t => t.count === state.count);
   if (hit) triggerCelebration(hit.message);
+}
+
+// Fireworks-style burst pattern — two columns of bursts firing alternately for
+// 2.5s, then a finale. The mix of star and circle shapes plus larger scalar
+// makes it visually distinct from the standard milestone celebration.
+function triggerFirstSaveCelebration() {
+  const message = "🎊 First save! Welcome to the project record club 🎊";
+  const toast = document.getElementById("celebrationToast");
+  if (toast) {
+    toast.textContent = message;
+    toast.classList.remove("show", "first-save");
+    void toast.offsetWidth;
+    toast.classList.add("show", "first-save");
+    clearTimeout(triggerCelebration._t);
+    triggerCelebration._t = setTimeout(() => {
+      toast.classList.remove("show", "first-save");
+    }, 5000);
+  }
+  if (typeof confetti !== "function") return;
+  const duration = 2500;
+  const animationEnd = Date.now() + duration;
+  const defaults = { startVelocity: 32, spread: 360, ticks: 80, zIndex: 9999, scalar: 1.1 };
+  const rand = (min, max) => Math.random() * (max - min) + min;
+  const interval = setInterval(() => {
+    const timeLeft = animationEnd - Date.now();
+    if (timeLeft <= 0) { clearInterval(interval); return; }
+    const particleCount = 60 * (timeLeft / duration);
+    confetti({ ...defaults, particleCount, origin: { x: rand(0.1, 0.3), y: rand(0, 0.4) } });
+    confetti({ ...defaults, particleCount, origin: { x: rand(0.7, 0.9), y: rand(0, 0.4) } });
+  }, 200);
+  // Big finale a beat after the rolling bursts end — mixed shapes for variety.
+  setTimeout(() => {
+    confetti({ particleCount: 160, spread: 110, startVelocity: 50, origin: { y: 0.55 }, scalar: 1.3, shapes: ["star", "circle"] });
+  }, duration + 80);
 }
 
 function triggerCelebration(message) {
@@ -2000,7 +2058,7 @@ if (existingRecord) {
       setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
     }
     recordSaveAndCelebrate();
-    refreshEmailSavedIndicator();
+    refreshEmailSavedIndicator(true);
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
   }
@@ -2060,7 +2118,7 @@ async function _doSaveToProjectRecordOnly() {
       setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
     }
     recordSaveAndCelebrate();
-    refreshEmailSavedIndicator();
+    refreshEmailSavedIndicator(true);
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
   }
