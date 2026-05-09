@@ -1582,6 +1582,66 @@ async function getEmailBodyHtml(token) {
 // Logs a clear warning when compression fails non-trivially (i.e., we had real
 // HTML to compress but couldn't), so failures don't silently produce empty
 // bodyHtmlCompressed fields the user later sees as "Live-fetched only".
+// ─── WEEKLY SAVE STREAK ──────────────────────────────────────────────────────
+// Variable rewards on round numbers — most saves get the standard "✓ Filed"
+// confirmation; only milestone counts (10/25/50/100 per week) trigger the
+// celebration. Per-device counter via localStorage; cross-device sync would
+// need a Supabase write per save and isn't worth it for a fun nudge.
+const SAVE_STREAK_KEY = "setty_pms_save_streak_v1";
+const STREAK_THRESHOLDS = [
+  { count: 10,  message: "🎉 10 emails filed this week!" },
+  { count: 25,  message: "🔥 25 this week — strong rhythm!" },
+  { count: 50,  message: "🚀 50 emails — on a roll!" },
+  { count: 100, message: "🏆 100 emails — legendary week!" },
+];
+
+function _weekStartISO() {
+  // Monday-anchored ISO week. Anyone working a Sun-Sat week feels off-by-one
+  // for one day; switch the offset math if the firm prefers Sunday start.
+  const d = new Date();
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const offset = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + offset);
+  return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+}
+
+function recordSaveAndCelebrate() {
+  const weekStart = _weekStartISO();
+  let state = { weekStart, count: 0 };
+  try {
+    const raw = localStorage.getItem(SAVE_STREAK_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.weekStart === weekStart) state = parsed;
+    }
+  } catch { /* corrupt storage — start fresh */ }
+  state.count = (state.count || 0) + 1;
+  try { localStorage.setItem(SAVE_STREAK_KEY, JSON.stringify(state)); } catch {}
+  const hit = STREAK_THRESHOLDS.find(t => t.count === state.count);
+  if (hit) triggerCelebration(hit.message);
+}
+
+function triggerCelebration(message) {
+  const toast = document.getElementById("celebrationToast");
+  if (toast) {
+    toast.textContent = message;
+    // Force reflow so the .show transition fires even if a previous toast
+    // is still in-flight (e.g., rapid back-to-back milestone hits).
+    toast.classList.remove("show");
+    void toast.offsetWidth;
+    toast.classList.add("show");
+    clearTimeout(triggerCelebration._t);
+    triggerCelebration._t = setTimeout(() => {
+      toast.classList.remove("show");
+    }, 2800);
+  }
+  if (typeof confetti === "function") {
+    // Two bursts a beat apart — feels more alive than one big shot.
+    confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85 });
+    setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7 }), 220);
+  }
+}
+
 function compressHtmlAddin(html) {
   if (!html) return "";
   if (typeof pako === "undefined") {
@@ -1888,6 +1948,7 @@ if (existingRecord) {
     } else {
       setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
     }
+    recordSaveAndCelebrate();
     refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
@@ -1947,6 +2008,7 @@ async function _doSaveToProjectRecordOnly() {
     } else {
       setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
     }
+    recordSaveAndCelebrate();
     refreshEmailSavedIndicator();
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);

@@ -13,6 +13,9 @@
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  <!-- canvas-confetti: weekly-streak milestone celebrations. ~5KB. Variable rewards
+       (only on round numbers) drive habit formation more than constant praise. -->
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
   <style>
     /* Fluent-light palette — designed to feel native inside Outlook.
        Setty red (#C00000) is reserved as a logo accent only, not a UI color. */
@@ -205,6 +208,33 @@
       border: 1px solid var(--border);
     }
     .quick-links .btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
+    /* Celebration toast — appears at the top of the pane on weekly milestone hits.
+       Gold gradient + slide-down + pop motion so the moment feels rewarding. */
+    #celebrationToast {
+      position: fixed;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-16px) scale(0.92);
+      background: linear-gradient(135deg, #ffd86b 0%, #f5a623 100%);
+      color: #4a2800;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 9px 18px;
+      border-radius: 999px;
+      box-shadow: 0 6px 18px rgba(245, 166, 35, 0.4), 0 2px 4px rgba(0, 0, 0, 0.15);
+      z-index: 9999;
+      opacity: 0;
+      transition: opacity 0.32s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.42s cubic-bezier(0.2, 1.4, 0.4, 1);
+      pointer-events: none;
+      white-space: nowrap;
+      max-width: calc(100% - 28px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #celebrationToast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0) scale(1);
+    }
     .status-msg {
       padding: 8px 10px;
       border-radius: 4px;
@@ -390,6 +420,7 @@
   </style>
 </head>
 <body>
+<div id="celebrationToast" aria-live="polite"></div>
 
 <!-- Loading state — visible immediately, hidden once Office.onReady fires -->
 <div id="loadingView" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:12px;">
