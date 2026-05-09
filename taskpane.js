@@ -479,10 +479,16 @@ function refreshEmailSavedIndicator() {
   const btnRecordOnly = document.getElementById("saveRecordBtn");
   if (!btnSharePoint || !btnRecordOnly) return;
 
-  // Reset to default state first
+  // Reset to default state first.
+  // SharePoint label includes the attachment count when known — concrete
+  // framing ("3 files") makes the action feel more meaningful than abstract
+  // ("Save"). Fallback to a no-count label when we can't read the array.
   btnSharePoint.disabled = false;
   btnRecordOnly.disabled = false;
-  btnSharePoint.textContent = "📁 Save to SharePoint";
+  const attCount = emailFileAttachmentCount();
+  btnSharePoint.textContent = (attCount && attCount > 0)
+    ? `📁 Save to SharePoint · ${attCount} file${attCount > 1 ? "s" : ""}`
+    : "📁 Save to SharePoint";
   btnRecordOnly.textContent = "🗂️ Save to Project";
 
   if (!selectedProject || !emailItem?.itemId) return;
@@ -507,7 +513,9 @@ function refreshEmailSavedIndicator() {
   if (wasFiledToSharePoint && emailLikelyHasAttachments() === true) {
     // Filed to SharePoint with attachments — re-run is offered to catch any new attachments
     setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix + " Re-run to sync any new attachments.");
-    btnSharePoint.textContent = "↺ Re-sync attachments";
+    btnSharePoint.textContent = (attCount && attCount > 0)
+      ? `↺ Re-sync · ${attCount} file${attCount > 1 ? "s" : ""}`
+      : "↺ Re-sync attachments";
   } else if (wasFiledToSharePoint) {
     setStatus("actionStatus", "success", "✓ Filed to project on " + savedDate + "." + loggedSuffix);
     btnSharePoint.disabled = true;
@@ -541,34 +549,61 @@ function emailLikelyHasAttachments() {
   return null;
 }
 
-// Visual emphasis between the twin save buttons. Both remain clickable; this only
-// nudges which one looks like the "expected" choice based on whether the email
-// has attachments. When the answer is unknown, neither side is biased.
+// Concrete file count for the SharePoint button label. Returns a number when
+// we can read the attachments array, or null when unknown (Office.js timing
+// edge cases). null callers should fall back to a generic label rather than
+// showing "0 files", which would mislead users about what's being saved.
+function emailFileAttachmentCount() {
+  const item = emailItem;
+  if (!item) return null;
+  if (Array.isArray(item.attachments)) {
+    return item.attachments.filter(a =>
+      a.attachmentType === Office.MailboxEnums.AttachmentType.File && !a.isInline
+    ).length;
+  }
+  return null;
+}
+
+// Visibility + emphasis for the twin save buttons.
+// SharePoint save is FOR attachments — when there are none, that path doesn't
+// apply, so the button (and its caption) are hidden entirely and the layout
+// collapses to a single column. When attachments exist, the Project Record
+// button is dimmed to nudge toward SharePoint, which writes to BOTH places.
 function applyEmailFlowEmphasis() {
   const btnSp = document.getElementById("saveSpBtn");
   const btnRecord = document.getElementById("saveRecordBtn");
   const capSp = document.getElementById("saveSpCaption");
   const capRecord = document.getElementById("saveRecordCaption");
+  const row = document.querySelector(".save-row");
+  const capRow = document.querySelector(".save-row-caption");
   if (!btnSp || !btnRecord) return;
 
-  // Reset emphasis and captions each call so previous state doesn't leak
+  // Reset emphasis, visibility, and captions each call so previous state doesn't leak.
   btnSp.classList.remove("btn-deemph");
   btnRecord.classList.remove("btn-deemph");
-  if (capSp) capSp.textContent = "Email + attachments → SharePoint";
-  if (capRecord) capRecord.textContent = "Copy of email → project record";
+  btnSp.style.display = "";
+  if (capSp) capSp.style.display = "";
+  if (capSp) capSp.textContent = "Email + attachments → SharePoint + record";
+  if (capRecord) capRecord.textContent = "Email body → project record only";
+  if (row) row.style.gridTemplateColumns = "1fr 1fr";
+  if (capRow) capRow.style.gridTemplateColumns = "1fr 1fr";
 
-  // No project picked yet — keep both neutral; we don't know what's relevant.
+  // No project picked yet — keep both visible/neutral; we don't know what's relevant.
   if (!selectedProject) return;
 
   const hasAtt = emailLikelyHasAttachments();
-  if (hasAtt === true) {
+  if (hasAtt === false) {
+    // No attachments → SharePoint isn't a meaningful path. Remove it entirely
+    // so there's no wrong button to click. Project Record takes full width.
+    btnSp.style.display = "none";
+    if (capSp) capSp.style.display = "none";
+    if (row) row.style.gridTemplateColumns = "1fr";
+    if (capRow) capRow.style.gridTemplateColumns = "1fr";
+  } else if (hasAtt === true) {
+    // Attachments exist → SharePoint is the recommended path (also writes to record).
     btnRecord.classList.add("btn-deemph");
-    if (capSp) capSp.textContent = "Recommended — has attachments";
-  } else if (hasAtt === false) {
-    btnSp.classList.add("btn-deemph");
-    if (capRecord) capRecord.textContent = "Recommended — no attachments";
   }
-  // hasAtt === null → keep both buttons neutral; we don't know enough to bias.
+  // hasAtt === null → keep both buttons visible and neutral; we don't know enough to bias.
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
@@ -1959,9 +1994,21 @@ async function doSaveToProjectRecordOnly() {
 }
 async function _doSaveToProjectRecordOnly() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  // Soft-gate (not hard-block): if there are attachments, the recommended path is
+  // SharePoint, but some users intentionally want a body-only record (e.g., the
+  // attachments were already filed elsewhere, or they're just procedural junk).
+  // Surface the consequence and let them proceed.
   if (emailLikelyHasAttachments() === true) {
-    setStatus("actionStatus", "error", "This email has attachments. Use 'Save to SharePoint' instead so they get filed.");
-    return;
+    const proceed = window.confirm(
+      "This email has attachments.\n\n" +
+      "Saving to the project record only will file the email body — attachments will NOT be saved anywhere.\n\n" +
+      "Use 'Save to SharePoint' if you want the attachments filed too.\n\n" +
+      "Continue with body-only save?"
+    );
+    if (!proceed) {
+      setStatus("actionStatus", "info", "Save cancelled.");
+      return;
+    }
   }
   const msgId = getCurrentMessageRecordId();
   if (findSavedEmailRecord(selectedProject, msgId)) {
