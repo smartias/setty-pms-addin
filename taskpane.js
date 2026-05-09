@@ -3298,8 +3298,14 @@ function extractDueDates(rawText, emailReceivedDate) {
     const iso = d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
     addResult(iso, m[0] + "  (" + iso + ")", m.index);
   }
-  // Keyword hits first, then chronological
+  // Sort priority: future dates first (past milestones aren't actionable),
+  // then keyword-matched, then chronological. With the top-3 slice in the
+  // chip render, future dates naturally crowd out past ones.
+  const todayISO = new Date().toISOString().slice(0, 10);
   return results.sort((a, b) => {
+    const aFuture = a.iso >= todayISO;
+    const bFuture = b.iso >= todayISO;
+    if (aFuture !== bFuture) return aFuture ? -1 : 1;
     if (a.hasKeyword !== b.hasKeyword) return a.hasKeyword ? -1 : 1;
     return a.iso.localeCompare(b.iso);
   });
