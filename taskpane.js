@@ -3586,6 +3586,46 @@ async function doSaveContact() {
         allClients = [...(allClients || []), newClient];
         renderCompanySuggestions();
       }
+      // Also append to the tagged project's per-project directory if a project
+      // is currently selected. PMS Directory tab reads project.directory and
+      // merges with auto-rolled POCs/subs, so this lands the contact directly
+      // in the project's "people on this job" list. Failure here is non-fatal —
+      // the global client save already succeeded.
+      if (selectedProject) {
+        const emailLc = (email || "").toLowerCase();
+        const dirType = type === "Prime" ? "Prime"
+                      : type === "Client" ? "Client"
+                      : type === "Sub" ? "Sub (Setty's)"
+                      : "Other";
+        const dirEntry = {
+          id: uid(),
+          name,
+          title,
+          email,
+          phone,
+          company: targetCompany,
+          type: dirType,
+          addedAt: new Date().toISOString(),
+          addedBy: msalAccount?.username || "",
+          addedFromEmail: emailItem?.itemId || "",
+          notes: "",
+        };
+        try {
+          await applyLocalChangeAndSave(selectedProject.id, fresh => {
+            const dir = fresh.directory || [];
+            // Dedup by email when present; if no email, allow add (user can
+            // clean up later — the alternative is silently dropping entries
+            // that are otherwise valid).
+            if (emailLc && dir.some(d => (d.email || "").toLowerCase() === emailLc)) {
+              return fresh;
+            }
+            return { ...fresh, directory: [...dir, dirEntry] };
+          });
+        } catch (dirErr) {
+          // Non-fatal; the client save already succeeded.
+          console.warn("[directory] append failed:", dirErr);
+        }
+      }
     } else {
       if (!selectedProject) { setStatus("contactStatus", "error", "Select a project first."); return; }
       const poc = { id: uid(), name, title, email, phone, role: type };
@@ -3610,7 +3650,12 @@ async function doSaveContact() {
     const destLabel = saveTo === "client"
       ? (company || name)
       : ((selectedProject?.projectNumber ? selectedProject.projectNumber + " — " : "") + (selectedProject?.name || "project POC"));
-    setStatus("actionStatus", "success", "✓ Saved " + (name || email) + " to " + destLabel + ".");
+    // When saved to a client AND a project is tagged, the contact also lands
+    // in the project's directory — surface that in the success message so users
+    // know it's findable in PMS without having to check.
+    const alsoInDirectory = saveTo === "client" && selectedProject;
+    const dirSuffix = alsoInDirectory ? " · added to " + (selectedProject.name || "project") + " directory." : "";
+    setStatus("actionStatus", "success", "✓ Saved " + (name || email) + " to " + destLabel + "." + dirSuffix);
     setStatus("contactStatus", "", "");
     showPeopleView();
     return;
