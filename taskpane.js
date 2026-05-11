@@ -2230,7 +2230,7 @@ function buildEmailHtml(bodyHtml) {
     <strong>From:</strong> ${from?.displayName || ""} &lt;${from?.emailAddress || ""}&gt;<br>
     <strong>Date:</strong> ${new Date(emailItem.dateTimeCreated).toLocaleString()}
   </div>`;
-  return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + header + (bodyHtml || "(No body)") + "</body></html>";
+  return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + header + (bodyHtml || "<p style='color:#666;font-style:italic;padding:8px 12px;background:#f5f5f5;border-left:3px solid #ccc;'>No body content &mdash; this email may be a system notification, share invite, or attachment-only message.</p>") + "</body></html>";
 }
 // Upload email.html + any attachments into targetPath. Returns attachment count.
 async function uploadEmailAndAttachments(driveId, token, targetPath) {
@@ -2550,6 +2550,39 @@ async function _doSaveToProjectRecordOnly() {
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
+// Categories that get the full meeting-template page (title + metadata table +
+// Discussion / Decisions / Action Items sections). Everything else uses the
+// email-body builder below — the page IS the email body, with a small header.
+const MEETING_NOTE_CATEGORIES = ["Client Meeting", "Internal Meeting", "Meeting"];
+function isMeetingNoteCategory(cat) { return MEETING_NOTE_CATEGORIES.includes(cat); }
+
+// Email-body OneNote page — used for non-meeting categories (Site Visit,
+// Decision, Issue, Client Communication, Internal, Action Item, General).
+// The email body becomes the page content directly, so embedded images and
+// formatting survive. Optional user-typed note appears above the body as a
+// short "Setty note" header if present.
+function buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, userNote) {
+  const th = "padding:6px 12px;font-weight:bold;background:#f0f0f0;text-align:left;width:130px";
+  const td = "padding:6px 12px";
+  const dateFmt = dateStr ? new Date(dateStr).toLocaleDateString("en-US", {
+    weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit"
+  }) : "";
+  const fromStr = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
+  const safeTitle = escapeOneNoteTextAddin(title);
+  const safeCategory = escapeOneNoteTextAddin(category);
+  const safeUserNote = escapeOneNoteTextAddin(userNote || "");
+  const safeFromStr = escapeOneNoteTextAddin(fromStr);
+  return "<h1>" + safeTitle + "</h1>"
+    + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
+    + (dateFmt   ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
+    + (fromStr   ? "<tr><td style='" + th + "'>From</td><td style='" + td + "'>" + safeFromStr + "</td></tr>" : "")
+    + "<tr><td style='" + th + "'>Type</td><td style='" + td + "'>" + safeCategory + "</td></tr>"
+    + "</table>"
+    + (userNote ? "<h2>Note</h2><p style='font-size:13px'>" + safeUserNote.replace(/\n/g, "<br>") + "</p>" : "")
+    + "<h2>Email</h2>"
+    + (emailBodyHtml || "<p style='color:#666;font-style:italic'>(No body content — this email may be a system notification, share invite, or attachment-only message.)</p>");
+}
+
 function buildAddinMeetingPageHtml(title, category, dateStr, participants, body) {
   const th = "padding:6px 12px;font-weight:bold;background:#f0f0f0;text-align:left;width:130px";
   const td = "padding:6px 12px";
@@ -2585,7 +2618,7 @@ function escapeOneNoteTextAddin(s) {
     .replace(/'/g, "&#39;");
 }
 
-async function createAddinOneNotePage(project, title, body, category, dateStr) {
+async function createAddinOneNotePage(project, title, body, category, dateStr, emailBodyHtml) {
   const useTeams   = !!project.teamsOneNoteNotebookId;
   const notebookId = project.teamsOneNoteNotebookId || project.oneNoteNotebookId;
   // Route to the correct OneNote namespace based on where the notebook lives.
@@ -2638,7 +2671,15 @@ async function createAddinOneNotePage(project, title, body, category, dateStr) {
   ].filter(Boolean).join("");
   const header = `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">${badge}</div>`;
   const safeTitle = escapeOneNoteTextAddin(title);
-  const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)}</body></html>`;
+  // Branch: meeting-type categories get the meeting-template page (with
+  // Discussion / Decisions / Action Items sections); everything else gets
+  // the email-body page where the email IS the content.
+  const fromName  = emailItem?.from?.displayName  || "";
+  const fromEmail = emailItem?.from?.emailAddress || "";
+  const bodyHtml = isMeetingNoteCategory(category)
+    ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)
+    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body);
+  const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${bodyHtml}</body></html>`;
 
   // POST page with retry on 429/503 — Graph throttles OneNote aggressively
   // and the previous code would just fail on the first throttle response,
@@ -2676,7 +2717,11 @@ async function doSaveNote() {
   if (saveInFlight) { setStatus("noteStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const category = document.getElementById("noteCategory").value;
   const body = document.getElementById("noteBody").value.trim();
-  if (!body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
+  const isMeeting = isMeetingNoteCategory(category);
+  // Meeting categories require a typed note body — that's the meeting minutes.
+  // Non-meeting categories use the email body as the OneNote content, so a
+  // typed note becomes optional context above the email body.
+  if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
   // Disable immediately so a slow OneNote round-trip can't trigger a double-save.
   const saveNoteBtn = document.getElementById("saveNoteBtn");
@@ -2704,7 +2749,22 @@ async function doSaveNote() {
           ? new Date(apptStart || Date.now()).toISOString()
           : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
 
-        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr);
+        // For non-meeting categories, the email body IS the OneNote page
+        // content. Fetched once here so embedded data:-URI images and inline
+        // formatting carry into OneNote as-is. cid: references may render
+        // broken in OneNote since they reference Outlook attachments — most
+        // modern Outlook bodies inline images as data URIs, which work.
+        let emailBodyHtml = "";
+        if (!isMeeting) {
+          try {
+            const token = await getToken();
+            emailBodyHtml = await getEmailBodyHtml(token);
+          } catch (e) {
+            console.warn("[note] body fetch failed:", e.message);
+          }
+        }
+
+        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr, emailBodyHtml);
         oneNoteUrl = page.webUrl || "";
       } catch (e) {
         oneNoteErr = e.message;
