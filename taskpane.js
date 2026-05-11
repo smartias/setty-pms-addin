@@ -695,19 +695,28 @@ function applyEmailFlowEmphasis() {
   if (capSp) capSp.style.display = "";
   if (capSp) {
     // Caption shows either the default path description or the chosen custom
-    // folder name. The ✏ link is always rendered so users can opt in / change
-    // without hunting through menus. innerHTML is safe here — all strings are
-    // either constants or sanitized via the rename function before storage.
-    const renameLink = '<a href="#" id="saveSpRenameLink" style="margin-left:6px;color:var(--primary);text-decoration:none;font-weight:600;cursor:pointer;" title="Set a custom folder name (the date prefix is added automatically)">✏ rename</a>';
+    // folder name. Use real DOM elements + addEventListener instead of innerHTML
+    // + anchor onclick — anchors-with-href="#" inside the Outlook task pane
+    // iframe sometimes silently swallow clicks.
+    capSp.textContent = ""; // reset
     if (_customSpFolderName) {
-      const safeName = _customSpFolderName.replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
-      capSp.innerHTML = "Folder: <strong style=\"color:var(--text);\">YYYY_MM_DD " + safeName + "</strong>" + renameLink;
+      const prefix = document.createTextNode("Folder: ");
+      const strong = document.createElement("strong");
+      strong.style.color = "var(--text)";
+      strong.textContent = "YYYY_MM_DD " + _customSpFolderName;
+      capSp.appendChild(prefix);
+      capSp.appendChild(strong);
     } else {
-      capSp.innerHTML = "Email + attachments → SharePoint + record" + renameLink;
+      capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
     }
-    // Wire the click handler each render (innerHTML wipes prior listeners).
-    const renameEl = document.getElementById("saveSpRenameLink");
-    if (renameEl) renameEl.onclick = e => { e.preventDefault(); promptForCustomSpFolderName(); };
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.id = "saveSpRenameLink";
+    renameBtn.textContent = _customSpFolderName ? "✏ change" : "✏ rename";
+    renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
+    renameBtn.style.cssText = "margin-left:8px;color:var(--primary);background:transparent;border:none;padding:0;font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline;";
+    renameBtn.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); promptForCustomSpFolderName(); });
+    capSp.appendChild(renameBtn);
   }
   if (capRecord) capRecord.textContent = "Email body → project record only";
   if (row) row.style.gridTemplateColumns = "1fr 1fr";
