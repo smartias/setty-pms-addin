@@ -262,6 +262,9 @@ function loadItemContext() {
   emailParticipants = [];
   // Per-item ✓ "added this session" marks reset when item changes
   _sessionSavedContactEmails.clear();
+  // Custom SharePoint folder name is per-email; clear when switching emails so
+  // last email's chosen name doesn't accidentally get applied to a new save.
+  _customSpFolderName = "";
   if (!emailItem) return;
   // For appointments, fetch the iCalUId in the background — it's the same across
   // all attendees' mailboxes so we can use it to match notes saved by anyone on the team.
@@ -641,6 +644,36 @@ function emailFileAttachmentCount() {
   return null;
 }
 
+// Custom folder name override for the next SharePoint save. Cleared after the
+// save runs or when the user moves to a different email. Most users never
+// touch this — the ✏ rename link in the SharePoint caption is the only entry
+// point, so the default subject-based naming stays the path of least resistance.
+let _customSpFolderName = "";
+
+// Returns the current cleaned default (date-stripped, sanitized) subject —
+// shown as the pre-filled value in the prompt so the user can edit instead
+// of having to retype.
+function _getDefaultSpFolderSubject() {
+  return (emailItem?.subject || "No Subject")
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 70);
+}
+
+function promptForCustomSpFolderName() {
+  const current = _customSpFolderName || _getDefaultSpFolderSubject();
+  const next = window.prompt(
+    "Folder name (YYYY_MM_DD will be added automatically):\n\n" +
+    "Leave empty or click Cancel to use the email subject.",
+    current
+  );
+  if (next === null) return; // Cancel — no change
+  _customSpFolderName = next.trim();
+  // Re-render emphasis so the caption updates to show the chosen name.
+  applyEmailFlowEmphasis();
+}
+
 // Visibility + emphasis for the twin save buttons.
 // SharePoint save is FOR attachments — when there are none, that path doesn't
 // apply, so the button (and its caption) are hidden entirely and the layout
@@ -660,7 +693,22 @@ function applyEmailFlowEmphasis() {
   btnRecord.classList.remove("btn-deemph");
   btnSp.style.display = "";
   if (capSp) capSp.style.display = "";
-  if (capSp) capSp.textContent = "Email + attachments → SharePoint + record";
+  if (capSp) {
+    // Caption shows either the default path description or the chosen custom
+    // folder name. The ✏ link is always rendered so users can opt in / change
+    // without hunting through menus. innerHTML is safe here — all strings are
+    // either constants or sanitized via the rename function before storage.
+    const renameLink = '<a href="#" id="saveSpRenameLink" style="margin-left:6px;color:var(--primary);text-decoration:none;font-weight:600;cursor:pointer;" title="Set a custom folder name (the date prefix is added automatically)">✏ rename</a>';
+    if (_customSpFolderName) {
+      const safeName = _customSpFolderName.replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+      capSp.innerHTML = "Folder: <strong style=\"color:var(--text);\">YYYY_MM_DD " + safeName + "</strong>" + renameLink;
+    } else {
+      capSp.innerHTML = "Email + attachments → SharePoint + record" + renameLink;
+    }
+    // Wire the click handler each render (innerHTML wipes prior listeners).
+    const renameEl = document.getElementById("saveSpRenameLink");
+    if (renameEl) renameEl.onclick = e => { e.preventDefault(); promptForCustomSpFolderName(); };
+  }
   if (capRecord) capRecord.textContent = "Email body → project record only";
   if (row) row.style.gridTemplateColumns = "1fr 1fr";
   if (capRow) capRow.style.gridTemplateColumns = "1fr 1fr";
@@ -2423,8 +2471,16 @@ if (existingRecord) {
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(emailItem.dateTimeCreated);
+    // Folder name = YYYY_MM_DD + (custom name if user set one, else cleaned subject).
+    // The custom name is also sanitized to strip SharePoint-illegal chars in case
+    // the user typed any. Capped at 70 chars (same as the subject path) to keep
+    // path lengths well under SharePoint's 400-char URL limit.
+    const customCleaned = _customSpFolderName
+      ? _customSpFolderName.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70)
+      : "";
     const safeSubject = (emailItem.subject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
-    const emailFolderName = d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0") + "_" + String(d.getDate()).padStart(2, "0") + " " + safeSubject;
+    const folderTail = customCleaned || safeSubject;
+    const emailFolderName = d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0") + "_" + String(d.getDate()).padStart(2, "0") + " " + folderTail;
     const emailsPath  = await ensureSpFolder(driveId, token, projFolderName, "Emails");
     const targetPath  = await ensureSpFolder(driveId, token, emailsPath, emailFolderName);
     await writeSpMetadataSidecar(driveId, token, targetPath, buildAddinMetadata(selectedProject, "correspondence"));
@@ -2483,6 +2539,9 @@ if (existingRecord) {
     } else {
       setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
     }
+    // One-shot custom name consumed — clear so the next email's save uses
+    // subject-default unless explicitly renamed again.
+    _customSpFolderName = "";
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
   } catch (e) {
