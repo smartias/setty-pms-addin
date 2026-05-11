@@ -649,10 +649,10 @@ function emailFileAttachmentCount() {
 // touch this — the ✏ rename link in the SharePoint caption is the only entry
 // point, so the default subject-based naming stays the path of least resistance.
 let _customSpFolderName = "";
+// Inline-editor state. window.prompt is blocked in Office add-ins, so the
+// rename UI is an inline input that appears inside the pane.
+let _renamingSpFolder = false;
 
-// Returns the current cleaned default (date-stripped, sanitized) subject —
-// shown as the pre-filled value in the prompt so the user can edit instead
-// of having to retype.
 function _getDefaultSpFolderSubject() {
   return (emailItem?.subject || "No Subject")
     .replace(/[\\/:*?"<>|]/g, "-")
@@ -661,16 +661,25 @@ function _getDefaultSpFolderSubject() {
     .slice(0, 70);
 }
 
-function promptForCustomSpFolderName() {
-  const current = _customSpFolderName || _getDefaultSpFolderSubject();
-  const next = window.prompt(
-    "Folder name (YYYY_MM_DD will be added automatically):\n\n" +
-    "Leave empty or click Cancel to use the email subject.",
-    current
-  );
-  if (next === null) return; // Cancel — no change
-  _customSpFolderName = next.trim();
-  // Re-render emphasis so the caption updates to show the chosen name.
+// Opens the inline rename editor by flipping state and re-rendering. The
+// editor itself lives in applyEmailFlowEmphasis since it shares the caption
+// slot with the static text.
+function openSpFolderRenameEditor() {
+  _renamingSpFolder = true;
+  applyEmailFlowEmphasis();
+  // Focus the input on next paint so cursor is ready for typing.
+  setTimeout(() => {
+    const input = document.getElementById("saveSpRenameInput");
+    if (input) { input.focus(); input.select(); }
+  }, 0);
+}
+function commitSpFolderRename(value) {
+  _customSpFolderName = (value || "").trim();
+  _renamingSpFolder = false;
+  applyEmailFlowEmphasis();
+}
+function cancelSpFolderRename() {
+  _renamingSpFolder = false;
   applyEmailFlowEmphasis();
 }
 
@@ -694,39 +703,96 @@ function applyEmailFlowEmphasis() {
   btnSp.style.display = "";
   if (capSp) capSp.style.display = "";
   if (capSp) {
-    // Caption shows either the default path description or the chosen custom
-    // folder name. Use real DOM elements + addEventListener instead of innerHTML
-    // + anchor onclick — anchors-with-href="#" inside the Outlook task pane
-    // iframe sometimes silently swallow clicks.
+    // Caption shows either the default path description, the chosen custom
+    // folder name, or an inline editor. Office.js blocks window.prompt(), so
+    // renaming must happen via embedded DOM controls, not a native modal.
     capSp.textContent = ""; // reset
-    if (_customSpFolderName) {
-      const prefix = document.createTextNode("Folder: ");
-      const strong = document.createElement("strong");
-      strong.style.color = "var(--text)";
-      strong.textContent = "YYYY_MM_DD " + _customSpFolderName;
-      capSp.appendChild(prefix);
-      capSp.appendChild(strong);
-    } else {
-      capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
-    }
-    const renameBtn = document.createElement("button");
-    renameBtn.type = "button";
-    renameBtn.id = "saveSpRenameLink";
-    renameBtn.textContent = _customSpFolderName ? "✏ change" : "✏ rename";
-    renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
-    renameBtn.style.cssText = "margin-left:8px;color:var(--primary);background:transparent;border:none;padding:0;font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline;";
-    renameBtn.addEventListener("click", e => {
-      e.preventDefault();
-      e.stopPropagation();
-      console.log("[rename] button clicked, opening prompt");
-      try {
-        promptForCustomSpFolderName();
-      } catch (err) {
-        console.error("[rename] prompt failed:", err);
-        alert("Couldn't open the rename prompt: " + err.message);
+
+    if (_renamingSpFolder) {
+      // Inline editor: input + Save/Cancel. Date prefix is appended automatically
+      // at save-time, so we only ask for the trailing portion.
+      const label = document.createElement("span");
+      label.textContent = "YYYY_MM_DD ";
+      label.style.cssText = "color:var(--muted);font-size:11px;";
+      capSp.appendChild(label);
+
+      const input = document.createElement("input");
+      input.type = "text";
+      input.id = "saveSpRenameInput";
+      input.value = _customSpFolderName || _getDefaultSpFolderSubject();
+      input.maxLength = 70;
+      input.style.cssText = "width:55%;font-size:11px;padding:2px 4px;border:1px solid var(--primary);border-radius:3px;";
+      capSp.appendChild(input);
+
+      const saveBtn = document.createElement("button");
+      saveBtn.type = "button";
+      saveBtn.textContent = "Save";
+      saveBtn.style.cssText = "margin-left:6px;font-size:11px;padding:2px 6px;border:none;background:var(--primary);color:#fff;border-radius:3px;cursor:pointer;";
+      saveBtn.addEventListener("click", e => {
+        e.preventDefault();
+        e.stopPropagation();
+        commitSpFolderRename(input.value);
+      });
+      capSp.appendChild(saveBtn);
+
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.style.cssText = "margin-left:4px;font-size:11px;padding:2px 6px;border:1px solid #ccc;background:#fff;color:#555;border-radius:3px;cursor:pointer;";
+      cancelBtn.addEventListener("click", e => {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelSpFolderRename();
+      });
+      capSp.appendChild(cancelBtn);
+
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commitSpFolderRename(input.value);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancelSpFolderRename();
+        }
+      });
+
+      if (_customSpFolderName) {
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.textContent = "Clear";
+        clearBtn.title = "Revert to email subject as the folder name";
+        clearBtn.style.cssText = "margin-left:4px;font-size:11px;padding:2px 6px;border:1px solid #ccc;background:#fff;color:#a00;border-radius:3px;cursor:pointer;";
+        clearBtn.addEventListener("click", e => {
+          e.preventDefault();
+          e.stopPropagation();
+          commitSpFolderRename("");
+        });
+        capSp.appendChild(clearBtn);
       }
-    });
-    capSp.appendChild(renameBtn);
+    } else {
+      if (_customSpFolderName) {
+        const prefix = document.createTextNode("Folder: ");
+        const strong = document.createElement("strong");
+        strong.style.color = "var(--text)";
+        strong.textContent = "YYYY_MM_DD " + _customSpFolderName;
+        capSp.appendChild(prefix);
+        capSp.appendChild(strong);
+      } else {
+        capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
+      }
+      const renameBtn = document.createElement("button");
+      renameBtn.type = "button";
+      renameBtn.id = "saveSpRenameLink";
+      renameBtn.textContent = _customSpFolderName ? "✏ change" : "✏ rename";
+      renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
+      renameBtn.style.cssText = "margin-left:8px;color:var(--primary);background:transparent;border:none;padding:0;font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline;";
+      renameBtn.addEventListener("click", e => {
+        e.preventDefault();
+        e.stopPropagation();
+        openSpFolderRenameEditor();
+      });
+      capSp.appendChild(renameBtn);
+    }
   }
   if (capRecord) capRecord.textContent = "Email body → project record only";
   if (row) row.style.gridTemplateColumns = "1fr 1fr";
