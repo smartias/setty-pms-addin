@@ -715,7 +715,17 @@ function applyEmailFlowEmphasis() {
     renameBtn.textContent = _customSpFolderName ? "✏ change" : "✏ rename";
     renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
     renameBtn.style.cssText = "margin-left:8px;color:var(--primary);background:transparent;border:none;padding:0;font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline;";
-    renameBtn.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); promptForCustomSpFolderName(); });
+    renameBtn.addEventListener("click", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      console.log("[rename] button clicked, opening prompt");
+      try {
+        promptForCustomSpFolderName();
+      } catch (err) {
+        console.error("[rename] prompt failed:", err);
+        alert("Couldn't open the rename prompt: " + err.message);
+      }
+    });
     capSp.appendChild(renameBtn);
   }
   if (capRecord) capRecord.textContent = "Email body → project record only";
