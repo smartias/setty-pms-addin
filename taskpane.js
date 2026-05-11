@@ -2551,9 +2551,10 @@ async function _doSaveToProjectRecordOnly() {
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
 // Categories that get the full meeting-template page (title + metadata table +
-// Discussion / Decisions / Action Items sections). Everything else uses the
-// email-body builder below — the page IS the email body, with a small header.
-const MEETING_NOTE_CATEGORIES = ["Client Meeting", "Internal Meeting", "Meeting"];
+// Discussion / Decisions / Action Items sections). These three are structured
+// note types where the user types meeting/visit notes; everything else uses
+// the email-body builder below — the page IS the email body, with a header.
+const MEETING_NOTE_CATEGORIES = ["Client Meeting", "Internal Meeting", "Site Visit"];
 function isMeetingNoteCategory(cat) { return MEETING_NOTE_CATEGORIES.includes(cat); }
 
 // Email-body OneNote page — used for non-meeting categories (Site Visit,
