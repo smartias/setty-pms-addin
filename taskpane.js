@@ -2753,6 +2753,21 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
     + "</table>";
 }
 
+// Convert Graph's dateTime (UTC, often without a trailing Z) into a local
+// wall-clock ISO string for use in <meta name="created">. Without this,
+// OneNote renders UTC values as-is — a 5:30 PM ET meeting shows as 9:30 PM.
+// Same logic / same bug as the PMS importer; keep this in sync with
+// toOneNoteCreatedLocal() in SettyPMS.html if either changes.
+function toAddinOneNoteCreatedLocal(dtString) {
+  if (!dtString) return null;
+  const hasZone = /[Zz]|[+\-]\d\d:?\d\d$/.test(dtString);
+  const isoUtc = hasZone ? dtString : dtString + "Z";
+  const d = new Date(isoUtc);
+  if (isNaN(d.getTime())) return null;
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 // HTML-escape OneNote title / metadata text to prevent breakage on `<`, `&`, etc.
 function escapeOneNoteTextAddin(s) {
   return String(s || "")
@@ -2824,7 +2839,10 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   const bodyHtml = isMeetingNoteCategory(category)
     ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)
     : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body);
-  const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${dateStr || new Date().toISOString()}" /></head><body>${header}${bodyHtml}</body></html>`;
+  // toAddinOneNoteCreatedLocal fixes the UTC-as-local rendering bug; fall
+  // back to a fresh local timestamp if dateStr is missing or unparseable.
+  const createdMeta = toAddinOneNoteCreatedLocal(dateStr) || toAddinOneNoteCreatedLocal(new Date().toISOString()) || new Date().toISOString();
+  const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${createdMeta}" /></head><body>${header}${bodyHtml}</body></html>`;
 
   // POST page with retry on 429/503 — Graph throttles OneNote aggressively
   // and the previous code would just fail on the first throttle response,
