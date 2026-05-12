@@ -2776,10 +2776,13 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
     + projSubtitle
     + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>Meeting Minutes</h1>"
     + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
+    // Bordered box for meeting details — same visual treatment as the PMS
+    // importer. No Notes label / no grey side panel; just a clean polished
+    // block aligned to the page margin.
     + (cleanedBody
-        ? "<table style='border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;margin-bottom:14px'>"
-          + "<tr><td style='" + th + ";width:120px;vertical-align:top'>Notes</td><td style='" + td + "'><pre style='font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;margin:0;color:" + TEXT_DARK + "'>" + cleanedBody + "</pre></td></tr>"
-          + "</table>"
+        ? "<div style='border:1px solid " + GRAY_BORDER + ";background:#FAFAFA;padding:12px 14px;margin-bottom:16px;font-family:Calibri,Arial,sans-serif;font-size:11pt'>"
+          + "<pre style='font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;margin:0;color:" + TEXT_DARK + "'>" + cleanedBody + "</pre>"
+          + "</div>"
         : "")
     + "<h2 style='" + h2 + "'>Discussion</h2><p>&nbsp;</p>"
     + "<h2 style='" + h2 + "'>Decisions</h2><p>&nbsp;</p>"
