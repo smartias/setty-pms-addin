@@ -3739,7 +3739,6 @@ async function doSaveContact() {
   const company = document.getElementById("contactCompany").value.trim();
   const email   = document.getElementById("contactEmail").value.trim();
   const phone   = document.getElementById("contactPhone").value.trim();
-  const type    = document.getElementById("contactType").value;
   const saveTo  = document.getElementById("contactSaveTo").value;
   if (!name && !email) { setStatus("contactStatus", "error", "Name or email required."); return; }
   if (saveInFlight) { setStatus("contactStatus", "info", "⏳ Another save is in progress; please wait."); return; }
@@ -3752,7 +3751,9 @@ async function doSaveContact() {
       // never re-read by PMS — so the contact silently disappeared. Now we
       // upsert the client row directly.
       const targetCompany = (company || name).trim();
-      const contact = { id: uid(), name, title, email, phone, role: type };
+      // role left blank — the user will categorize in PMS Directory where
+      // the full role picker (CONTACT_ROLES) is available.
+      const contact = { id: uid(), name, title, email, phone, role: "" };
       // Find existing client by exact (case-insensitive) name match
       const queryUrl = SUPABASE_URL + "/rest/v1/pms_clients?select=id,client,version";
       const all = await fetch(queryUrl, { headers: SB_HEADERS });
@@ -3779,8 +3780,9 @@ async function doSaveContact() {
         const result = await res.json();
         if (!result || result.length === 0) throw new Error("Client modified by someone else. Retry from Outlook.");
       } else {
-        // New client — INSERT
-        const newClient = { id: uid(), name: targetCompany, type, contacts: [contact], address: "" };
+        // New client — INSERT. Discipline `types` left empty; the user
+        // categorizes in PMS Global Directory (multi-choice picker).
+        const newClient = { id: uid(), name: targetCompany, types: [], contacts: [contact], address: "" };
         const res = await fetch(SUPABASE_URL + "/rest/v1/pms_clients", {
           method: "POST",
           headers: SB_HEADERS,
@@ -3798,10 +3800,8 @@ async function doSaveContact() {
       // the global client save already succeeded.
       if (selectedProject) {
         const emailLc = (email || "").toLowerCase();
-        const dirType = type === "Prime" ? "Prime"
-                      : type === "Client" ? "Client"
-                      : type === "Sub" ? "Sub (Setty's)"
-                      : "Other";
+        // Per-project role left as "Other" — the user assigns the right
+        // role (Prime / Client / SUB to Setty / etc.) in PMS Directory tab.
         const dirEntry = {
           id: uid(),
           name,
@@ -3809,7 +3809,7 @@ async function doSaveContact() {
           email,
           phone,
           company: targetCompany,
-          type: dirType,
+          type: "Other",
           addedAt: new Date().toISOString(),
           addedBy: msalAccount?.username || "",
           addedFromEmail: emailItem?.itemId || "",
