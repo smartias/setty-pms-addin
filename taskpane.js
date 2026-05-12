@@ -16,6 +16,11 @@ const GRAPH_SCOPES = [
   "Notes.ReadWrite",      // needed for OneNote page creation — no admin consent required
   // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
+// Scopes requested ON-DEMAND only — kept out of the default sign-in flow so
+// users don't see a longer consent dialog at first run. First use of the
+// associated feature triggers a one-time per-user consent popup; afterwards
+// the token is cached silently like any other Graph token.
+const CHANNEL_MESSAGE_SCOPES = ["ChannelMessage.Send"];
 const TEAMS_TEAM_ID = "a4c48361-7991-43db-af83-4c854918a760";
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
@@ -855,6 +860,23 @@ async function getToken() {
     return r.accessToken;
   } catch {
     const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
+    return r.accessToken;
+  }
+}
+
+// On-demand token for posting channel messages. Kept separate from getToken()
+// so ChannelMessage.Send isn't bundled into the default sign-in scopes —
+// users see the consent prompt only when they actually click Send-to-Teams.
+async function getChannelMessageToken() {
+  const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+  if (!account) throw new Error("Not signed in");
+  try {
+    const r = await msalApp.acquireTokenSilent({ scopes: CHANNEL_MESSAGE_SCOPES, account });
+    return r.accessToken;
+  } catch {
+    // First call → consent popup. Subsequent silent calls succeed because
+    // the consent is cached on the user's MSAL account.
+    const r = await msalApp.acquireTokenPopup({ scopes: CHANNEL_MESSAGE_SCOPES, account });
     return r.accessToken;
   }
 }
@@ -2805,13 +2827,15 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
 // no need to persist beyond a single Outlook session.
 const _channelEmailCache = {};
 
-// Resolve a Teams channel's email address (provisioning a new one if the
-// channel doesn't have one yet). Idempotent — Graph won't double-provision.
+// READ-ONLY channel email resolution. PMS deliberately doesn't request the
+// ChannelSettings.ReadWrite.All scope needed for `provisionEmail`, so we
+// only read here. If a channel hasn't had its email provisioned yet, the
+// user does it once via Teams ("⋯" menu → "Get email address"); after
+// that the read path returns the address every time.
 async function resolveChannelEmailAddin(project) {
   const channelId = project?.teamsChannelId;
   if (!channelId) return "";
   if (_channelEmailCache[channelId]) return _channelEmailCache[channelId];
-  // Project record may have a cached value from the PMS-side resolver.
   if (project.teamsChannelEmail) {
     _channelEmailCache[channelId] = project.teamsChannelEmail;
     return project.teamsChannelEmail;
@@ -2819,15 +2843,12 @@ async function resolveChannelEmailAddin(project) {
   try {
     const ch = await graphFetch("GET", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}?$select=email`);
     if (ch?.email) { _channelEmailCache[channelId] = ch.email; return ch.email; }
-  } catch (e) { console.warn("[channel email GET]", e.message); }
-  try {
-    const res = await graphFetch("POST", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}/provisionEmail`);
-    const email = res?.email || "";
-    if (email) _channelEmailCache[channelId] = email;
-    return email;
+    throw new Error("__NO_EMAIL__");
   } catch (e) {
-    console.warn("[provisionEmail]", e.message);
-    return "";
+    if (e.message === "__NO_EMAIL__") {
+      throw new Error('Channel has no email yet. In Teams, click "⋯" next to the channel name → "Get email address" → "Copy". That provisions it; the next click here will work.');
+    }
+    throw new Error("Graph: " + e.message);
   }
 }
 
@@ -2844,16 +2865,12 @@ function getCurrentEmailBodyHtml() {
   });
 }
 
-// Send-to-Teams handler. Opens a new Outlook compose form addressed to the
-// project's Teams channel, with the current email's subject and body
-// pre-filled for forwarding. User can edit before sending. Anything that
-// lands at the channel email becomes a post in the Teams channel — the
-// lowest-friction onramp for users who default to email over chat.
-//
-// NOTE: file attachments on the current email don't carry over (Office.js
-// can't programmatically attach itemAttachments into a new compose form).
-// Body forwards as HTML; users who need attachments can use Outlook's
-// built-in Forward and paste the channel email manually.
+// Send-to-Teams handler. Posts the selected email's subject + body directly
+// to the project's Teams channel via Graph (POST .../channels/{id}/messages)
+// using the ChannelMessage.Send scope PMS already has for milestone cards.
+// No email roundtrip → instant delivery. Trade-off: no "Sent" record in
+// Outlook, and file attachments don't transfer (would need a separate
+// upload-to-filesFolder + reference flow, deferred for v2).
 async function sendToTeamsChannel() {
   if (!selectedProject) {
     setStatus("actionStatus", "error", "Select a project first.");
@@ -2863,22 +2880,39 @@ async function sendToTeamsChannel() {
     setStatus("actionStatus", "error", "This project doesn't have a Teams channel set up. Configure it in PMS → Overview → Teams Notifications.");
     return;
   }
-  setStatus("actionStatus", "info", "⏳ Resolving channel email…");
+  if (!emailItem) {
+    setStatus("actionStatus", "error", "No email selected to share.");
+    return;
+  }
+  setStatus("actionStatus", "info", "⏳ Posting to Teams channel…");
   try {
-    const email = await resolveChannelEmailAddin(selectedProject);
-    if (!email) throw new Error("Couldn't resolve channel email — channel may not allow inbound email.");
-    const subject = emailItem?.subject ? "FW: " + emailItem.subject : "";
-    const origBody = await getCurrentEmailBodyHtml();
-    const htmlBody = origBody
-      ? "<p style='color:#666'>--- Forwarded from Outlook ---</p>" + origBody
-      : "";
-    Office.context.mailbox.displayNewMessageForm({
-      toRecipients: [email],
-      subject,
-      htmlBody,
-    });
+    const subject = emailItem.subject || "(no subject)";
+    const fromName  = emailItem.from?.displayName  || "";
+    const fromEmail = emailItem.from?.emailAddress || "";
+    const fromStr   = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
+    const origBody  = await getCurrentEmailBodyHtml();
+    const attCount  = Array.isArray(emailItem.attachments) ? emailItem.attachments.length : 0;
+
+    const safeSubject = escapeOneNoteTextAddin(subject);
+    const safeFrom    = escapeOneNoteTextAddin(fromStr);
+    const messageHtml =
+      `<h3 style="margin:0 0 8px">${safeSubject}</h3>` +
+      (safeFrom ? `<p style="color:#666;font-size:12px;margin:0 0 8px">From: <strong>${safeFrom}</strong></p>` : "") +
+      `<blockquote style="border-left:3px solid #ddd;margin:8px 0;padding:0 0 0 12px">${origBody || "<p><em>(no body)</em></p>"}</blockquote>` +
+      (attCount > 0 ? `<p style="color:#888;font-size:11px;font-style:italic">📎 Original email has ${attCount} attachment${attCount === 1 ? "" : "s"} — share separately if needed.</p>` : "") +
+      `<p style="color:#888;font-size:11px;font-style:italic">Shared from Outlook via PMS Add-in</p>`;
+
+    // Use the on-demand ChannelMessage.Send token (not the default getToken)
+    // so the consent prompt only fires the first time the user posts to a
+    // channel — kept out of the regular sign-in scopes.
+    const channelToken = await getChannelMessageToken();
+    await graphFetch("POST",
+      `/teams/${TEAMS_TEAM_ID}/channels/${selectedProject.teamsChannelId}/messages`,
+      { subject, body: { contentType: "html", content: messageHtml } },
+      channelToken
+    );
     setStatus("actionStatus", "success",
-      "✓ Compose opened — addressed to the Teams channel. Send when ready (attachments don't auto-forward).");
+      "✓ Posted to Teams channel" + (attCount > 0 ? ` (${attCount} attachment${attCount === 1 ? "" : "s"} not transferred)` : ""));
   } catch (e) {
     setStatus("actionStatus", "error", "Send-to-Teams failed: " + e.message);
   }
