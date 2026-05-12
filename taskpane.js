@@ -2706,54 +2706,93 @@ function isMeetingNoteCategory(cat) { return MEETING_NOTE_CATEGORIES.includes(ca
 // The email body becomes the page content directly, so embedded images and
 // formatting survive. Optional user-typed note appears above the body as a
 // short "Setty note" header if present.
-function buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, userNote) {
-  const th = "padding:6px 12px;font-weight:bold;background:#f0f0f0;text-align:left;width:130px";
-  const td = "padding:6px 12px";
+function buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, userNote, project) {
+  // Same print-friendly typography as the meeting template — so all add-in
+  // OneNote pages read as one consistent document family.
+  const NAVY = "#1F3864";
+  const TEXT_DARK = "#222";
+  const GRAY_BORDER = "#BFBFBF";
+  const GRAY_LIGHT = "#F2F2F2";
+  const td = "padding:6px 12px;font-size:11pt;border:1px solid " + GRAY_BORDER;
+  const th = td + ";font-weight:bold;background:" + GRAY_LIGHT;
+  const h2 = "font-family:Calibri,Arial,sans-serif;font-size:14pt;color:" + NAVY +
+             ";border-bottom:1px solid " + GRAY_BORDER + ";padding-bottom:2px;margin-top:18px;margin-bottom:8px";
+
   const dateFmt = dateStr ? new Date(dateStr).toLocaleDateString("en-US", {
     weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit"
   }) : "";
   const fromStr = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
+  const safeTitle = escapeOneNoteTextAddin(title);
   const safeUserNote = escapeOneNoteTextAddin(userNote || "");
   const safeFromStr = escapeOneNoteTextAddin(fromStr);
-  // No H1: OneNote page name already shows the title. No Type row: it
-  // duplicates the OneNote section the page lives in.
+  const safeCategory = escapeOneNoteTextAddin(category || "Note");
+  const safeProjNo = escapeOneNoteTextAddin(project?.projectNumber || "");
+  const safeProjNm = escapeOneNoteTextAddin(project?.name || "");
+  const projSubtitle = (safeProjNo || safeProjNm)
+    ? "<div style='font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#44546A;letter-spacing:.04em;text-transform:uppercase;margin:0 0 4px'>"
+      + safeProjNo + (safeProjNo && safeProjNm ? " · " : "") + safeProjNm + "</div>"
+    : "";
   return ""
-    + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
-    + (dateFmt   ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
-    + (fromStr   ? "<tr><td style='" + th + "'>From</td><td style='" + td + "'>" + safeFromStr + "</td></tr>" : "")
+    + "<div style='max-width:7.5in;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:" + TEXT_DARK + ";line-height:1.5'>"
+    + projSubtitle
+    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>" + safeCategory + "</h1>"
+    + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
+    + "<table style='border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;margin-bottom:14px'>"
+    + (dateFmt ? "<tr><td style='" + th + ";width:120px'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
+    + (fromStr ? "<tr><td style='" + th + ";width:120px'>From</td><td style='" + td + "'>" + safeFromStr + "</td></tr>" : "")
     + "</table>"
-    + (userNote ? "<h2>Note</h2><p style='font-size:13px'>" + safeUserNote.replace(/\n/g, "<br>") + "</p>" : "")
-    + "<h2>Email</h2>"
-    + (emailBodyHtml || "<p style='color:#666;font-style:italic'>(No body content — this email may be a system notification, share invite, or attachment-only message.)</p>");
+    + (userNote ? "<h2 style='" + h2 + "'>Note</h2><p style='font-family:Calibri,Arial,sans-serif;font-size:11pt;margin:0'>" + safeUserNote.replace(/\n/g, "<br>") + "</p>" : "")
+    + "<h2 style='" + h2 + "'>Email</h2>"
+    + (emailBodyHtml || "<p style='font-family:Calibri,Arial,sans-serif;color:#666;font-style:italic'>(No body content — this email may be a system notification, share invite, or attachment-only message.)</p>")
+    + "</div>";
 }
 
-function buildAddinMeetingPageHtml(title, category, dateStr, participants, body) {
-  const th = "padding:6px 12px;font-weight:bold;background:#f0f0f0;text-align:left;width:130px";
-  const td = "padding:6px 12px";
-  const dateFmt = dateStr ? new Date(dateStr).toLocaleDateString("en-US", {
-    weekday: "long", month: "long", day: "numeric", year: "numeric"
-  }) : "";
-  // The body from buildMeetingNoteBody already contains "Meeting details:"
-  // and a bulleted Attendees list, plus auto-generated "Summary:" /
-  // "Action items:" placeholders. Strip the trailing placeholders so they
-  // don't duplicate the H2 sections below; the bulleted attendees stay in
-  // the body, so the page-level Attendees row would only be duplication.
-  // No H1: the OneNote page name (from <title>) already shows the meeting
-  // subject. No Type row: it duplicates the OneNote section the page lives
-  // in (e.g. "Client Meetings").
+function buildAddinMeetingPageHtml(title, category, dateStr, participants, body, project) {
+  // Print-friendly typography — mirrors the PMS importer so OneNote pages
+  // generated from either side look identical. Calibri 11pt body, navy
+  // headings, max-width 7.5in for letter-sized print / paste-to-email.
+  const NAVY = "#1F3864";
+  const TEXT_DARK = "#222";
+  const GRAY_BORDER = "#BFBFBF";
+  const GRAY_LIGHT = "#F2F2F2";
+  const td = "padding:6px 12px;font-size:11pt;border:1px solid " + GRAY_BORDER;
+  const th = td + ";font-weight:bold;background:" + GRAY_LIGHT;
+  const h2 = "font-family:Calibri,Arial,sans-serif;font-size:14pt;color:" + NAVY +
+             ";border-bottom:1px solid " + GRAY_BORDER + ";padding-bottom:2px;margin-top:18px;margin-bottom:8px";
+
+  // Date is already inside the Notes block ("Start: …"), so no Date row.
+  // No H1 / Type / Attendees row — see PMS importer for the reasoning;
+  // the cleanedBody preserves the bulleted attendees list.
   const cleanedBody = stripMeetingBoilerplateAddin(body);
+  const safeTitle  = escapeOneNoteTextAddin(title);
+  const safeProjNo = escapeOneNoteTextAddin(project?.projectNumber || "");
+  const safeProjNm = escapeOneNoteTextAddin(project?.name || "");
+  const projSubtitle = (safeProjNo || safeProjNm)
+    ? "<div style='font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#44546A;letter-spacing:.04em;text-transform:uppercase;margin:0 0 4px'>"
+      + safeProjNo + (safeProjNo && safeProjNm ? " · " : "") + safeProjNm + "</div>"
+    : "";
   return ""
-    + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
-    + (dateFmt    ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
-    + (cleanedBody ? "<tr><td style='" + th + "'>Notes</td><td style='" + td + "'><pre style='font-family:inherit;white-space:pre-wrap;margin:0'>" + cleanedBody + "</pre></td></tr>" : "")
-    + "</table>"
-    + "<h2>Discussion</h2><p>&nbsp;</p>"
-    + "<h2>Decisions</h2><p>&nbsp;</p>"
-    + "<h2>Action Items</h2>"
-    + "<table style='border-collapse:collapse;width:100%'>"
-    + "<tr style='background:#f0f0f0'><th style='" + td + ";text-align:left'>Item</th><th style='" + td + ";text-align:left'>Owner</th><th style='" + td + ";text-align:left'>Due</th></tr>"
+    + "<div style='max-width:7.5in;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:" + TEXT_DARK + ";line-height:1.5'>"
+    + projSubtitle
+    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>Meeting Minutes</h1>"
+    + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
+    + (cleanedBody
+        ? "<table style='border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;margin-bottom:14px'>"
+          + "<tr><td style='" + th + ";width:120px;vertical-align:top'>Notes</td><td style='" + td + "'><pre style='font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;margin:0;color:" + TEXT_DARK + "'>" + cleanedBody + "</pre></td></tr>"
+          + "</table>"
+        : "")
+    + "<h2 style='" + h2 + "'>Discussion</h2><p>&nbsp;</p>"
+    + "<h2 style='" + h2 + "'>Decisions</h2><p>&nbsp;</p>"
+    + "<h2 style='" + h2 + "'>Action Items</h2>"
+    + "<table style='border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;font-size:11pt;margin-top:6px'>"
+    + "<tr style='background:" + NAVY + ";color:#fff'>"
+      + "<th style='padding:6px 12px;text-align:left;font-weight:600;border:1px solid " + NAVY + "'>Item</th>"
+      + "<th style='padding:6px 12px;text-align:left;font-weight:600;border:1px solid " + NAVY + "'>Owner</th>"
+      + "<th style='padding:6px 12px;text-align:left;font-weight:600;border:1px solid " + NAVY + "'>Due</th>"
+    + "</tr>"
     + "<tr><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td></tr>"
-    + "</table>";
+    + "</table>"
+    + "</div>";
 }
 
 // Strip the trailing "Summary:" / "Action items:" placeholder lines from
@@ -2851,8 +2890,8 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   const fromName  = emailItem?.from?.displayName  || "";
   const fromEmail = emailItem?.from?.emailAddress || "";
   const bodyHtml = isMeetingNoteCategory(category)
-    ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body)
-    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body);
+    ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body, project)
+    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body, project);
   // toAddinOneNoteCreatedLocal fixes the UTC-as-local rendering bug; fall
   // back to a fresh local timestamp if dateStr is missing or unparseable.
   const createdMeta = toAddinOneNoteCreatedLocal(dateStr) || toAddinOneNoteCreatedLocal(new Date().toISOString()) || new Date().toISOString();
