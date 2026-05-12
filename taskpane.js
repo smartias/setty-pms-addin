@@ -129,6 +129,7 @@ function setupEventListeners() {
   const spHintLink = document.getElementById("spFolderHintLink");
   if (spHintLink) spHintLink.onclick = (e) => { e.preventDefault(); openSelectedProjectInPms(); };
   document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
+  document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
   document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
@@ -1323,6 +1324,7 @@ function applyPipelineUiRules() {
     "openSpFolderBtn",
     "openDashboardBtn",
     "logNoteBtn",
+    "sendToTeamsBtn",
     "newActionItemBtn",
     "logRfiBtn",
     "logSubBtn",
@@ -2796,6 +2798,90 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
     + "<tr><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td></tr>"
     + "</table>"
     + "</div>";
+}
+
+// In-memory cache so a second click on Send-to-Teams doesn't re-hit Graph
+// for the channel email. Keyed by teamsChannelId. Reset on page reload —
+// no need to persist beyond a single Outlook session.
+const _channelEmailCache = {};
+
+// Resolve a Teams channel's email address (provisioning a new one if the
+// channel doesn't have one yet). Idempotent — Graph won't double-provision.
+async function resolveChannelEmailAddin(project) {
+  const channelId = project?.teamsChannelId;
+  if (!channelId) return "";
+  if (_channelEmailCache[channelId]) return _channelEmailCache[channelId];
+  // Project record may have a cached value from the PMS-side resolver.
+  if (project.teamsChannelEmail) {
+    _channelEmailCache[channelId] = project.teamsChannelEmail;
+    return project.teamsChannelEmail;
+  }
+  try {
+    const ch = await graphFetch("GET", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}?$select=email`);
+    if (ch?.email) { _channelEmailCache[channelId] = ch.email; return ch.email; }
+  } catch (e) { console.warn("[channel email GET]", e.message); }
+  try {
+    const res = await graphFetch("POST", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}/provisionEmail`);
+    const email = res?.email || "";
+    if (email) _channelEmailCache[channelId] = email;
+    return email;
+  } catch (e) {
+    console.warn("[provisionEmail]", e.message);
+    return "";
+  }
+}
+
+// Fetch the current Outlook email's HTML body for forwarding. Returns ""
+// if no email is selected or the API errors.
+function getCurrentEmailBodyHtml() {
+  return new Promise(resolve => {
+    if (!emailItem?.body?.getAsync) { resolve(""); return; }
+    try {
+      emailItem.body.getAsync(Office.CoercionType.Html, r => {
+        resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : "");
+      });
+    } catch (e) { resolve(""); }
+  });
+}
+
+// Send-to-Teams handler. Opens a new Outlook compose form addressed to the
+// project's Teams channel, with the current email's subject and body
+// pre-filled for forwarding. User can edit before sending. Anything that
+// lands at the channel email becomes a post in the Teams channel — the
+// lowest-friction onramp for users who default to email over chat.
+//
+// NOTE: file attachments on the current email don't carry over (Office.js
+// can't programmatically attach itemAttachments into a new compose form).
+// Body forwards as HTML; users who need attachments can use Outlook's
+// built-in Forward and paste the channel email manually.
+async function sendToTeamsChannel() {
+  if (!selectedProject) {
+    setStatus("actionStatus", "error", "Select a project first.");
+    return;
+  }
+  if (!selectedProject.teamsChannelId) {
+    setStatus("actionStatus", "error", "This project doesn't have a Teams channel set up. Configure it in PMS → Overview → Teams Notifications.");
+    return;
+  }
+  setStatus("actionStatus", "info", "⏳ Resolving channel email…");
+  try {
+    const email = await resolveChannelEmailAddin(selectedProject);
+    if (!email) throw new Error("Couldn't resolve channel email — channel may not allow inbound email.");
+    const subject = emailItem?.subject ? "FW: " + emailItem.subject : "";
+    const origBody = await getCurrentEmailBodyHtml();
+    const htmlBody = origBody
+      ? "<p style='color:#666'>--- Forwarded from Outlook ---</p>" + origBody
+      : "";
+    Office.context.mailbox.displayNewMessageForm({
+      toRecipients: [email],
+      subject,
+      htmlBody,
+    });
+    setStatus("actionStatus", "success",
+      "✓ Compose opened — addressed to the Teams channel. Send when ready (attachments don't auto-forward).");
+  } catch (e) {
+    setStatus("actionStatus", "error", "Send-to-Teams failed: " + e.message);
+  }
 }
 
 // Strip the trailing "Summary:" / "Action items:" placeholder lines from

@@ -162,6 +162,13 @@
     .btn-teal:hover:not(:disabled)    { background: #cdebe1; }
     .btn-orange  { background: var(--warn-bg); color: var(--warn); border-color: #f1d875; }
     .btn-orange:hover:not(:disabled)  { background: #ffeaa3; }
+    /* Microsoft-branded action buttons. Solid fills (vs the soft pastel
+       variants above) so they read as primary "this opens a Microsoft app"
+       affordances — matches the visual weight of the Teams / OneNote logos. */
+    .btn-onenote { background: #7719AA; color: #fff; border-color: #7719AA; }
+    .btn-onenote:hover:not(:disabled) { background: #5e147f; }
+    .btn-teams   { background: #6264A7; color: #fff; border-color: #6264A7; }
+    .btn-teams:hover:not(:disabled)   { background: #4f519e; }
     .divider {
       border: none;
       border-top: 1px solid var(--border);
@@ -723,7 +730,8 @@
       <a id="scSharePointLink" href="#" style="display:none;">📂 Open SharePoint folder →</a>
     </div>
   </div>
-  <button class="btn btn-secondary" id="logNoteBtn">📝 Log as Note</button>
+  <button class="btn btn-onenote" id="logNoteBtn">📓 Log as Note</button>
+  <button class="btn btn-teams" id="sendToTeamsBtn">💬 Send to Teams Channel</button>
   <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
 
   <!-- More — collapsed by default; persists open state in localStorage -->
