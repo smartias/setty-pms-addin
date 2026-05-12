@@ -2713,15 +2713,14 @@ function buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEma
     weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit"
   }) : "";
   const fromStr = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
-  const safeTitle = escapeOneNoteTextAddin(title);
-  const safeCategory = escapeOneNoteTextAddin(category);
   const safeUserNote = escapeOneNoteTextAddin(userNote || "");
   const safeFromStr = escapeOneNoteTextAddin(fromStr);
-  return "<h1>" + safeTitle + "</h1>"
+  // No H1: OneNote page name already shows the title. No Type row: it
+  // duplicates the OneNote section the page lives in.
+  return ""
     + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
     + (dateFmt   ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
     + (fromStr   ? "<tr><td style='" + th + "'>From</td><td style='" + td + "'>" + safeFromStr + "</td></tr>" : "")
-    + "<tr><td style='" + th + "'>Type</td><td style='" + td + "'>" + safeCategory + "</td></tr>"
     + "</table>"
     + (userNote ? "<h2>Note</h2><p style='font-size:13px'>" + safeUserNote.replace(/\n/g, "<br>") + "</p>" : "")
     + "<h2>Email</h2>"
@@ -2734,15 +2733,19 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
   const dateFmt = dateStr ? new Date(dateStr).toLocaleDateString("en-US", {
     weekday: "long", month: "long", day: "numeric", year: "numeric"
   }) : "";
-  const attendeeStr = (participants || [])
-    .map(p => (p.displayName || p.emailAddress) + (p.label ? " (" + p.label + ")" : ""))
-    .join(", ");
-  return "<h1>" + title + "</h1>"
+  // The body from buildMeetingNoteBody already contains "Meeting details:"
+  // and a bulleted Attendees list, plus auto-generated "Summary:" /
+  // "Action items:" placeholders. Strip the trailing placeholders so they
+  // don't duplicate the H2 sections below; the bulleted attendees stay in
+  // the body, so the page-level Attendees row would only be duplication.
+  // No H1: the OneNote page name (from <title>) already shows the meeting
+  // subject. No Type row: it duplicates the OneNote section the page lives
+  // in (e.g. "Client Meetings").
+  const cleanedBody = stripMeetingBoilerplateAddin(body);
+  return ""
     + "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px'>"
     + (dateFmt    ? "<tr><td style='" + th + "'>Date</td><td style='" + td + "'>" + dateFmt + "</td></tr>" : "")
-    + "<tr><td style='" + th + "'>Type</td><td style='" + td + "'>" + category + "</td></tr>"
-    + (attendeeStr ? "<tr><td style='" + th + "'>Attendees</td><td style='" + td + "'>" + attendeeStr + "</td></tr>" : "")
-    + (body        ? "<tr><td style='" + th + "'>Notes</td><td style='" + td + "'><pre style='font-family:inherit;white-space:pre-wrap'>" + body + "</pre></td></tr>" : "")
+    + (cleanedBody ? "<tr><td style='" + th + "'>Notes</td><td style='" + td + "'><pre style='font-family:inherit;white-space:pre-wrap;margin:0'>" + cleanedBody + "</pre></td></tr>" : "")
     + "</table>"
     + "<h2>Discussion</h2><p>&nbsp;</p>"
     + "<h2>Decisions</h2><p>&nbsp;</p>"
@@ -2751,6 +2754,17 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body)
     + "<tr style='background:#f0f0f0'><th style='" + td + ";text-align:left'>Item</th><th style='" + td + ";text-align:left'>Owner</th><th style='" + td + ";text-align:left'>Due</th></tr>"
     + "<tr><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td><td style='" + td + "'>&nbsp;</td></tr>"
     + "</table>";
+}
+
+// Strip the trailing "Summary:" / "Action items:" placeholder lines from
+// buildMeetingNoteBody's output. Those are auto-generated headers that
+// duplicate the Discussion / Action Items sections the OneNote page renders
+// below. Keep this mirrored with stripMeetingBoilerplate() in SettyPMS.html.
+function stripMeetingBoilerplateAddin(text) {
+  if (!text) return "";
+  const i = text.search(/\n\s*Summary\s*:/i);
+  if (i >= 0) return text.slice(0, i).trim();
+  return text.trim();
 }
 
 // Convert Graph's dateTime (UTC, often without a trailing Z) into a local
@@ -2822,12 +2836,12 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   if (!section?.id) throw new Error("Could not find or create OneNote section: " + sectionName);
 
   // Metadata badge header (matches SettyPMS style so pages look consistent).
-  // Project number / category escaped — handles `&`, `<`, `>` in unusual project names.
+  // Category badge intentionally omitted — it duplicates the OneNote section
+  // name the page already lives in (e.g. "Client Meetings"). Project number
+  // stays for at-a-glance identification.
   const safeProjNum = escapeOneNoteTextAddin(project.projectNumber || "");
-  const safeCategory = escapeOneNoteTextAddin(category || "");
   const badge = [
     project.projectNumber && `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${safeProjNum}</span>`,
-    category              && `<span style="background:#e8edf2;color:#003865;padding:2px 8px;border-radius:3px;font-size:11px">${safeCategory}</span>`,
   ].filter(Boolean).join("");
   const header = `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">${badge}</div>`;
   const safeTitle = escapeOneNoteTextAddin(title);
