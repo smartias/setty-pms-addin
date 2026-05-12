@@ -2391,9 +2391,78 @@ async function writeProjectShortcut(driveId, folderName, shortcutFileName, targe
   return res.json();
 }
 
-// Install the two project shortcuts (OneNote notebook + PMS deep link) into
-// the project's SharePoint folder root. Skips OneNote if a notebook hasn't
-// been linked yet. Returns a list of installed shortcut names for status UI.
+// Resolve the email address for a project's Teams channel via READ-ONLY
+// Graph access. PMS doesn't request the ChannelSettings.ReadWrite.All
+// scope that `provisionEmail` would need — too much consent friction for
+// what's a one-time-per-channel admin action.
+//
+// Path: GET the channel; if it already has an email, return it. If it
+// doesn't, throw a friendly error telling the user how to provision one
+// in Teams (channel "..." menu → "Get email address"). After they do
+// that once, the next click here succeeds.
+async function resolveChannelEmail(project) {
+  if (!project.teamsChannelId) return "";
+  try {
+    const ch = await graphFetch("GET",
+      `/teams/${TEAMS_TEAM_ID}/channels/${project.teamsChannelId}?$select=email,displayName`);
+    if (ch?.email) return ch.email;
+    throw new Error("__NO_EMAIL__");
+  } catch (e) {
+    if (e.message === "__NO_EMAIL__") {
+      throw new Error('Channel has no email yet. Open the channel in Teams → click "⋯" next to the channel name → "Get email address" → "Copy". That provisions it; the next click here will read it automatically.');
+    }
+    const m = (e.message || "").toLowerCase();
+    if (m.includes("404") || m.includes("not found")) {
+      throw new Error("Channel not found via Graph — confirm Teams Notifications are enabled on this project.");
+    }
+    throw new Error("Graph: " + e.message);
+  }
+}
+
+// Per-type emoji prefix for external-link shortcut filenames. Helps users
+// scan the folder root by spotting the icon for "BIM 360" vs "Procore" etc.
+const LINK_TYPE_ICONS = {
+  "BIM 360":       "🏗",
+  "Matterport":    "🏠",
+  "Client FTP":    "📁",
+  "Procore":       "🔨",
+  "Client Portal": "🌐",
+  "Network Folder": "🗂",  // not installed as .url (UNC paths don't open in browsers)
+  "Other":         "🔗",
+};
+
+// Strip path-illegal characters and collapse whitespace so a user-typed
+// label maps cleanly to a SharePoint filename.
+function sanitizeShortcutName(s) {
+  return (s || "").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
+}
+
+// Stable fingerprint of all installable shortcuts for this project. Used by
+// the SharePointFolderField to detect whether the installed set is out of
+// date (new external link, removed link, notebook URL changed, etc.) and
+// resurface the button when needed.
+// Version tag baked into the fingerprint. Bump it when the install function
+// gains new always-installed shortcuts (Site Report / Field Photos etc.) so
+// projects that previously installed an older shortcut set see the
+// "Refresh Shortcuts" button reappear — otherwise their stale fingerprint
+// would still match and they'd never pick up the new entries.
+const SHORTCUT_INSTALL_VERSION = "v2";
+function projectShortcutFingerprint(project) {
+  const noteUrl = project.teamsOneNoteUrl || project.oneNoteUrl || "";
+  const teamsFolderUrl = project.teamsChannelFolderUrl || "";
+  const channelEmail = project.teamsChannelEmail || "";
+  const ext = (project.externalLinks || [])
+    .filter(l => l && l.url)
+    .map(l => (l.id || "") + ":" + (l.label || "") + ":" + l.url)
+    .sort()
+    .join("|");
+  return SHORTCUT_INSTALL_VERSION + "::" + noteUrl + "::" + teamsFolderUrl + "::" + channelEmail + "::" + ext;
+}
+
+// Install all project shortcuts (OneNote notebook + PMS deep link + every
+// external link) into the project's SharePoint folder root. Network Folder
+// links are skipped because UNC paths can't live inside a .url file. Returns
+// a list of installed shortcut names for status UI.
 async function installProjectShortcuts(project) {
   if (!project.projectFolderUrl) throw new Error("Project folder isn't set up yet — create the SharePoint folder first.");
   const { driveId } = await resolveSpIds();
@@ -2412,7 +2481,68 @@ async function installProjectShortcuts(project) {
   await writeProjectShortcut(driveId, folderName, "🔗 PMS Project.url", pmsUrl);
   installed.push("PMS Project");
 
-  return installed;
+  // Site Report tool, project-scoped — landing page filters to this project,
+  // and "+ New Report" skips the project picker.
+  const siteReportUrl = "https://smartias.github.io/setty-pms/SiteReport.html?project=" + encodeURIComponent(project.id);
+  await writeProjectShortcut(driveId, folderName, "📋 Site Report Generator.url", siteReportUrl);
+  installed.push("Site Report Generator");
+
+  // Field Photos uploader. Not project-scoped via URL param (the tool lists
+  // all projects with SharePoint folders); just a deep link to the app.
+  const fieldPhotosUrl = "https://smartias.github.io/setty-pms/SettyFieldPhotos.html";
+  await writeProjectShortcut(driveId, folderName, "📸 Field Photos.url", fieldPhotosUrl);
+  installed.push("Field Photos");
+
+  // Teams channel's auto-created document library — the "Files" tab on the
+  // Teams channel, intended for working files / chat-attached docs. Distinct
+  // from the project's main SharePoint folder (which we're putting this
+  // shortcut INTO), so users have a one-click bridge from the formal project
+  // folder to the informal working-files area.
+  const teamsFolderUrl = project.teamsChannelFolderUrl || "";
+  if (teamsFolderUrl) {
+    await writeProjectShortcut(driveId, folderName, "💬 Teams Chat - Working Files.url", teamsFolderUrl);
+    installed.push("Teams Chat / Working Files");
+  }
+
+  // Channel email: resolve via Graph if we haven't already. mailto: shortcuts
+  // open a fresh Outlook draft addressed to the channel — anyone who emails
+  // it has their message posted into the Teams channel as a thread. That's
+  // the lowest-friction onramp for users who default to email over chat.
+  let resolvedChannelEmail = project.teamsChannelEmail || "";
+  if (project.teamsChannelId && !resolvedChannelEmail) {
+    try { resolvedChannelEmail = await resolveChannelEmail(project); }
+    catch (e) { console.warn("[shortcuts] channel email lookup failed:", e.message); }
+  }
+  if (resolvedChannelEmail) {
+    await writeProjectShortcut(driveId, folderName, "💌 Email Project Channel.url", "mailto:" + resolvedChannelEmail);
+    installed.push("Email Project Channel");
+  }
+
+  // External project links (BIM 360, Procore, Matterport, Network Folder,
+  // etc.). Filename is "<icon> <label-or-type>.url" so the folder root reads
+  // like a launchpad. Network Folder links use the UNC path as the URL —
+  // this opens File Explorer to the share when clicked from a OneDrive-
+  // synced copy of the project folder. (In the SharePoint web UI clicks
+  // through .url files with UNC targets are blocked by browser security;
+  // that's the synced-folder caveat surfaced in the success message.)
+  for (const link of (project.externalLinks || [])) {
+    if (!link || !link.url) continue;
+    const icon = LINK_TYPE_ICONS[link.type] || LINK_TYPE_ICONS["Other"];
+    const baseName = sanitizeShortcutName(link.label || link.type || "Link");
+    const fileName = `${icon} ${baseName}.url`;
+    try {
+      await writeProjectShortcut(driveId, folderName, fileName, link.url);
+      installed.push(baseName);
+    } catch (e) {
+      // One bad link shouldn't tank the rest — log and continue.
+      console.warn("[shortcuts] " + baseName + " failed: " + e.message);
+    }
+  }
+
+  // Return resolvedChannelEmail so the caller can cache it on the project
+  // record — provisionEmail is a one-time per-channel action we shouldn't
+  // repeat on every install.
+  return { installed, resolvedChannelEmail };
 }
 
 async function createSharePointFolder(project) {
@@ -14093,10 +14223,17 @@ function CalendarImportPanel({ project, onImport }) {
             + projSubtitle
             + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>Meeting Minutes</h1>"
             + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
-            + "<table style='border-collapse:collapse;width:100%;font-family:Calibri,Arial,sans-serif;margin-bottom:14px'>"
-            + (loc ? "<tr><td style='" + thStyle + ";width:120px'>Location</td><td style='" + tdStyle + "'>" + loc + "</td></tr>" : "")
-            + (cleanedPreview ? "<tr><td style='" + thStyle + ";width:120px;vertical-align:top'>Notes</td><td style='" + tdStyle + "'><pre style='font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;margin:0;color:" + TEXT_DARK + "'>" + cleanedPreview + "</pre></td></tr>" : "")
-            + "</table>"
+            // Meeting details rendered as a single bordered box (no Notes
+            // label, no Location row — both are inside the body's "Meeting
+            // details:" section, so the table wrapper was just adding visual
+            // noise and a misaligned left column). Border = polish; left-
+            // aligned to the page margin so the content reads as a clean
+            // document block.
+            + (cleanedPreview
+                ? "<div style='border:1px solid " + GRAY_BORDER + ";background:#FAFAFA;padding:12px 14px;margin-bottom:16px;font-family:Calibri,Arial,sans-serif;font-size:11pt'>"
+                  + "<pre style='font-family:Calibri,Arial,sans-serif;font-size:11pt;white-space:pre-wrap;margin:0;color:" + TEXT_DARK + "'>" + cleanedPreview + "</pre>"
+                + "</div>"
+                : "")
             + "<h2 style='" + h2Style + "'>Discussion</h2><p>&nbsp;</p>"
             + "<h2 style='" + h2Style + "'>Decisions</h2><p>&nbsp;</p>"
             + "<h2 style='" + h2Style + "'>Action Items</h2>"
@@ -17878,8 +18015,38 @@ function QuickAddCompanyModal({ filter, prefill, onSave, onClose }) {
 function TeamsNotificationsField({ project, onUpdate }) {
   const [status, setStatus]   = React.useState("idle"); // idle | creating | error | done
   const [msg,    setMsg]      = React.useState("");
+  const [emailCopyState, setEmailCopyState] = React.useState("idle"); // idle | resolving | copied | error
+  const [emailCopyMsg,   setEmailCopyMsg]   = React.useState("");
   const enabled   = !!project.teamsNotificationsEnabled;
   const channelId = project.teamsChannelId || "";
+
+  // Copy the channel's auto-provisioned email address to the clipboard.
+  // Anything emailed there posts as a thread in the channel — the easiest
+  // onramp for people who default to email over chat. Resolves via Graph
+  // (provisions an email if the channel doesn't have one yet) and caches
+  // the result on the project so subsequent clicks are instant.
+  async function copyChannelEmail() {
+    setEmailCopyState("resolving");
+    setEmailCopyMsg("");
+    try {
+      let email = project.teamsChannelEmail || "";
+      if (!email) {
+        // resolveChannelEmail now throws with a specific error message
+        // (permission denied / not found / private channel / etc.) so we
+        // can show the user what's actually wrong instead of a generic blank.
+        email = await resolveChannelEmail(project);
+        if (!email) throw new Error("No email returned from Graph.");
+        onUpdate({ ...project, teamsChannelEmail: email });
+      }
+      await navigator.clipboard.writeText(email);
+      setEmailCopyState("copied");
+      setEmailCopyMsg("✓ Copied: " + email);
+      setTimeout(() => { setEmailCopyState("idle"); setEmailCopyMsg(""); }, 4000);
+    } catch (e) {
+      setEmailCopyState("error");
+      setEmailCopyMsg("✗ " + e.message);
+    }
+  }
 
   const channelUrl = channelId
     ? `https://teams.microsoft.com/l/channel/${encodeURIComponent(channelId)}/conversations?groupId=${TEAMS_TEAM_ID}&tenantId=f374c024-71c2-48b6-8420-076fff97327c`
@@ -17982,15 +18149,32 @@ function TeamsNotificationsField({ project, onUpdate }) {
         )}
       </div>
 
-      {/* Channel link */}
+      {/* Channel link + Copy Channel Email */}
       {enabled && channelUrl && (
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 18 }}>💬</span>
-          <a href={channelUrl} target="_blank" rel="noopener noreferrer"
-            style={{ fontSize: 12, color: "#2F5496", fontWeight: 600 }}>
-            Open project channel in Teams
-          </a>
-          <span style={{ fontSize: 11, color: P.textDim }}>— {project.projectNumber || project.name}</span>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 18 }}>💬</span>
+            <a href={channelUrl} target="_blank" rel="noopener noreferrer"
+              style={{ fontSize: 12, color: "#2F5496", fontWeight: 600 }}>
+              Open project channel in Teams
+            </a>
+            <span style={{ fontSize: 11, color: P.textDim }}>— {project.projectNumber || project.name}</span>
+            {/* Teams brand purple. Anything emailed to the resolved address
+                lands in the channel as a thread — the easiest path for users
+                who prefer email over chat. */}
+            <button onClick={copyChannelEmail} disabled={emailCopyState === "resolving"}
+              title="Copy the channel's email address. Anything emailed there posts to the Teams channel as a thread."
+              style={{ background: "#6264A7", color: "#fff", border: "none", borderRadius: 6,
+                padding: "4px 10px", fontSize: 11, fontWeight: 600, cursor: emailCopyState === "resolving" ? "wait" : "pointer", whiteSpace: "nowrap", marginLeft: "auto" }}>
+              {emailCopyState === "resolving" ? "⏳ Resolving…" : "💌 Copy Channel Email"}
+            </button>
+          </div>
+          {emailCopyMsg && (
+            <div style={{ fontSize: 11, paddingLeft: 26,
+              color: emailCopyState === "copied" ? "#375623" : emailCopyState === "error" ? P.red : P.textDim }}>
+              {emailCopyMsg}
+            </div>
+          )}
         </div>
       )}
 
@@ -18524,16 +18708,41 @@ function SharePointFolderField({ project, onUpdate, onEagerSave }) {
 
   const url = project.projectFolderUrl || "";
   const hasFolder = !!url;
-  const hasNotebook = !!(project.teamsOneNoteUrl || project.oneNoteUrl);
+  const currentFingerprint = projectShortcutFingerprint(project);
+  const installedFingerprint = project.shortcutsFingerprint || "";
+  // Fingerprint covers OneNote URL AND every external link's id/label/url.
+  // Adding, editing, or removing any link makes the fingerprint drift from
+  // the saved value, which resurfaces the button as "Refresh Shortcuts".
+  const shortcutsCurrent = !!project.shortcutsInstalledAt && installedFingerprint === currentFingerprint;
+  const showShortcutsButton = hasFolder && !shortcutsCurrent;
+  const shortcutBtnLabel = project.shortcutsInstalledAt
+    ? "📌 Refresh Shortcuts"
+    : "📌 Install Shortcuts";
+  const currentNoteUrl = project.teamsOneNoteUrl || project.oneNoteUrl || "";
 
   async function installShortcuts() {
     setScStatus("installing");
     setScMsg("");
     try {
-      const installed = await installProjectShortcuts(project);
+      const { installed, resolvedChannelEmail } = await installProjectShortcuts(project);
       setScStatus("done");
-      setScMsg("✓ Installed: " + installed.join(", ")
-        + (!hasNotebook ? " (OneNote notebook not linked yet — re-run after linking to add it)" : ""));
+      setScMsg("✓ Installed " + installed.length + " shortcut" + (installed.length === 1 ? "" : "s")
+        + (!currentNoteUrl ? " (OneNote not linked yet — re-run after linking)" : ""));
+      // Project state to persist: install timestamp, fingerprint (so the
+      // button hides automatically), AND the channel email if we just
+      // resolved one (avoids re-provisioning on the next install).
+      const patchedProject = {
+        ...project,
+        shortcutsInstalledAt: new Date().toISOString(),
+        teamsChannelEmail: resolvedChannelEmail || project.teamsChannelEmail || "",
+      };
+      // Recompute the fingerprint AFTER patching teamsChannelEmail so the
+      // saved fingerprint reflects the channel email we just installed
+      // (otherwise the next render sees email-now-set + email-not-in-fp
+      // and immediately re-shows the button).
+      patchedProject.shortcutsFingerprint = projectShortcutFingerprint(patchedProject);
+      if (onEagerSave) await onEagerSave(patchedProject);
+      else onUpdate("shortcutsInstalledAt", patchedProject.shortcutsInstalledAt);
     } catch (e) {
       setScStatus("error");
       setScMsg("✗ " + e.message);
@@ -18618,13 +18827,13 @@ function SharePointFolderField({ project, onUpdate, onEagerSave }) {
           named <strong>{[(project.projectNumber || "").trim(), (project.name || "").trim()].filter(Boolean).join(" - ") || "Project Number - Project Name"}</strong>
         </div>
       )}
-      {hasFolder && (
+      {showShortcutsButton && (
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
           <button onClick={installShortcuts} disabled={scStatus === "installing"}
-            title="Add .url shortcuts to the OneNote notebook and PMS project page at the root of this SharePoint folder. Safe to re-run — overwrites existing shortcuts."
+            title="Add .url shortcuts to the OneNote notebook and PMS project page at the root of this SharePoint folder. Auto-hides once installed; reappears if the notebook URL changes."
             style={{ background: P.bg, border: `1px solid ${P.border}`, borderRadius: 6,
               color: P.textDim, cursor: scStatus === "installing" ? "wait" : "pointer", fontSize: 11, padding: "4px 10px", whiteSpace: "nowrap" }}>
-            {scStatus === "installing" ? "⏳ Installing…" : "📌 Install Shortcuts (OneNote · PMS)"}
+            {scStatus === "installing" ? "⏳ Installing…" : shortcutBtnLabel}
           </button>
           {scMsg && (
             <span style={{ fontSize: 11, color: scStatus === "done" ? P.green : scStatus === "error" ? P.red : P.textDim }}>
