@@ -3751,9 +3751,12 @@ async function doSaveContact() {
       // never re-read by PMS — so the contact silently disappeared. Now we
       // upsert the client row directly.
       const targetCompany = (company || name).trim();
-      // role left blank — the user will categorize in PMS Directory where
-      // the full role picker (CONTACT_ROLES) is available.
-      const contact = { id: uid(), name, title, email, phone, role: "" };
+      // Per-contact role removed from the schema (was redundant once company
+      // discipline + per-project relationship were split). `lastContacted` is
+      // stamped here so every Outlook-driven capture auto-updates recency —
+      // the field no longer needs manual entry in PMS.
+      const today = new Date().toISOString().slice(0, 10);
+      const contact = { id: uid(), name, title, email, phone, lastContacted: today };
       // Find existing client by exact (case-insensitive) name match
       const queryUrl = SUPABASE_URL + "/rest/v1/pms_clients?select=id,client,version";
       const all = await fetch(queryUrl, { headers: SB_HEADERS });
@@ -3763,11 +3766,21 @@ async function doSaveContact() {
       if (existing) {
         const ec = existing.client;
         ec.contacts = ec.contacts || [];
-        if (contactExistsInList(ec.contacts, email, name)) {
-          setStatus("contactStatus", "info", "Contact already exists for this client. No duplicate was added.");
-          return;
+        const dupIdx = ec.contacts.findIndex(c => {
+          const e = (c.email || "").trim().toLowerCase();
+          const n = (c.name || "").trim().toLowerCase();
+          const targetE = (email || "").trim().toLowerCase();
+          const targetN = (name || "").trim().toLowerCase();
+          if (targetE && e && e === targetE) return true;
+          return !targetE && targetN && n === targetN;
+        });
+        if (dupIdx >= 0) {
+          // Don't duplicate — just bump lastContacted on the existing record so
+          // recency stays accurate even when the same person emails repeatedly.
+          ec.contacts = ec.contacts.map((c, i) => i === dupIdx ? { ...c, lastContacted: today } : c);
+        } else {
+          ec.contacts = [...ec.contacts, contact];
         }
-        ec.contacts = [...ec.contacts, contact];
         // Optimistic-version PATCH
         const patchUrl = SUPABASE_URL + "/rest/v1/pms_clients?id=eq." + encodeURIComponent(existing.id) +
                          "&version=eq." + existing.version;
@@ -3833,7 +3846,7 @@ async function doSaveContact() {
       }
     } else {
       if (!selectedProject) { setStatus("contactStatus", "error", "Select a project first."); return; }
-      const poc = { id: uid(), name, title, email, phone, role: type };
+      const poc = { id: uid(), name, title, email, phone };
       // V2: per-project save with version check via applyLocalChangeAndSave.
       // Already routes through pms_projects with optimistic concurrency.
       await applyLocalChangeAndSave(selectedProject.id, fresh => {
