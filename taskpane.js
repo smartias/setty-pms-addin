@@ -21,7 +21,8 @@ const GRAPH_SCOPES = [
 // associated feature triggers a one-time per-user consent popup; afterwards
 // the token is cached silently like any other Graph token.
 const CHANNEL_MESSAGE_SCOPES = ["ChannelMessage.Send"];
-const TEAMS_TEAM_ID = "a4c48361-7991-43db-af83-4c854918a760";
+const TEAMS_TEAM_ID   = "a4c48361-7991-43db-af83-4c854918a760";
+const TEAMS_TENANT_ID = "f374c024-71c2-48b6-8420-076fff97327c";
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
@@ -61,6 +62,7 @@ let _spIds = { siteId: SP_SITE_ID_HARDCODED, driveId: SP_DRIVE_ID_HARDCODED };
 const LAST_ACCOUNT_STORAGE_KEY = "settyPms:lastMsalAccountHomeId";
 const EMAIL_PROJECT_MAP_STORAGE_KEY = "settyPms:emailProjectMap";
 const EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY = "settyPms:conversationProjectMap";
+const TEAMS_SENT_MAP_STORAGE_KEY = "settyPms:teamsChannelSentMap";
 const EMAIL_THREAD_TAGS_TABLE = "pms_email_thread_tags";
 const PROJECT_EMAILS_TABLE = "pms_project_emails";
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -263,6 +265,7 @@ function loadItemContext() {
   itemContextGeneration++;
   const myGen = itemContextGeneration;
   emailItem = Office.context.mailbox.item;
+  refreshTeamsBtn();
   currentConversationId = "";
   currentItemICalUId = "";
   emailParticipants = [];
@@ -2871,6 +2874,36 @@ function getCurrentEmailBodyHtml() {
 // No email roundtrip → instant delivery. Trade-off: no "Sent" record in
 // Outlook, and file attachments don't transfer (would need a separate
 // upload-to-filesFolder + reference flow, deferred for v2).
+function getTeamsSentMap() {
+  try { return JSON.parse(localStorage.getItem(TEAMS_SENT_MAP_STORAGE_KEY) || "{}"); } catch { return {}; }
+}
+function markEmailSentToTeams(channelId) {
+  const msgId = getCurrentMessageRestId();
+  if (!msgId) return;
+  const map = getTeamsSentMap();
+  map[msgId] = { channelId, teamId: TEAMS_TEAM_ID };
+  localStorage.setItem(TEAMS_SENT_MAP_STORAGE_KEY, JSON.stringify(map));
+}
+function refreshTeamsBtn() {
+  const btn = document.getElementById("sendToTeamsBtn");
+  if (!btn) return;
+  const msgId = getCurrentMessageRestId();
+  const state = msgId ? getTeamsSentMap()[msgId] : null;
+  if (state?.channelId) {
+    const url = `https://teams.microsoft.com/l/channel/${encodeURIComponent(state.channelId)}/_?groupId=${state.teamId}&tenantId=${TEAMS_TENANT_ID}`;
+    btn.textContent = "🔗 Open Teams Channel";
+    btn.title = "This email was shared to Teams — click to open the channel";
+    btn.onclick = () => openExternalUrl(url);
+    btn.classList.remove("btn-teams");
+    btn.classList.add("btn-teams-sent");
+  } else {
+    btn.textContent = "💬 Send to Teams Channel";
+    btn.title = "";
+    btn.onclick = sendToTeamsChannel;
+    btn.classList.add("btn-teams");
+    btn.classList.remove("btn-teams-sent");
+  }
+}
 async function sendToTeamsChannel() {
   if (!selectedProject) {
     setStatus("actionStatus", "error", "Select a project first.");
@@ -2911,6 +2944,8 @@ async function sendToTeamsChannel() {
       { subject, body: { contentType: "html", content: messageHtml } },
       channelToken
     );
+    markEmailSentToTeams(selectedProject.teamsChannelId);
+    refreshTeamsBtn();
     setStatus("actionStatus", "success",
       "✓ Posted to Teams channel" + (attCount > 0 ? ` (${attCount} attachment${attCount === 1 ? "" : "s"} not transferred)` : ""));
   } catch (e) {
