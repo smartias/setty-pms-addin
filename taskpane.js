@@ -1627,7 +1627,7 @@ const SUGGESTION_WEIGHTS = {
   projectNumberInSubject: 10,
   perNameTokenInSubject:   2,
   acronymInSubject:        3,
-  senderDomainMatchClient: 1,
+  senderDomainMatchClient: 4,
 };
 const SUGGESTION_MIN_SCORE = 2;
 const SUGGESTION_MAX_RESULTS = 3;
