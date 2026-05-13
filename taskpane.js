@@ -1782,7 +1782,11 @@ async function renderDateSuggestions() {
 
   // Hide chips when there's no project to attach a milestone to.
   // Also skip in compose-mode appointments and when no email is loaded.
+  // Internal emails (from @setty.com) never carry client-facing milestone dates.
   if (!selectedProject || !emailItem || currentItemKind === "appointment") {
+    block.style.display = "none"; chips.innerHTML = ""; return;
+  }
+  if ((emailFromAddress || "").toLowerCase().endsWith("@setty.com")) {
     block.style.display = "none"; chips.innerHTML = ""; return;
   }
 
