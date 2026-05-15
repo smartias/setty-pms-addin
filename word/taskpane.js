@@ -36,12 +36,33 @@ let spCurrentPath = "";
 let spProjectRootPath = "";
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-Office.onReady(async (info) => {
-  if (info.host !== Office.HostType.Word) {
-    document.body.innerHTML = '<p style="color:#f87171;padding:16px;font-family:sans-serif">This add-in only runs in Word.</p>';
-    return;
-  }
+// Surface any unhandled error directly into the pane so a startup crash never
+// leaves the user staring at a blank black box. Without this, an early throw
+// (before any view is shown) produces a silent failure with no UI feedback.
+function showFatalError(label, err) {
   try {
+    const msg = (err && (err.message || err.toString())) || "(no detail)";
+    const stack = (err && err.stack) ? "\n\n" + err.stack : "";
+    document.body.innerHTML =
+      '<div style="padding:16px;font-family:Segoe UI,sans-serif;color:#f87171;background:#1a1a1a;height:100vh;font-size:12px;overflow:auto">'
+      + '<div style="font-weight:700;margin-bottom:8px">⚠ Setty PMS Filer — startup error</div>'
+      + '<div style="color:#fff;margin-bottom:8px">' + label + '</div>'
+      + '<pre style="white-space:pre-wrap;color:#fbbf24;font-size:11px;margin:0">' + msg + stack + '</pre>'
+      + '</div>';
+  } catch {}
+}
+window.addEventListener("error", (e) => showFatalError("Uncaught error", e.error || e.message));
+window.addEventListener("unhandledrejection", (e) => showFatalError("Unhandled promise rejection", e.reason));
+
+Office.onReady(async (info) => {
+  // Host check removed — manifest already restricts this add-in to Word, and
+  // the previous check could swap the body for an invisible message in some
+  // hosts where info.host doesn't strict-equal Office.HostType.Word.
+  console.log("[Setty PMS Filer] Office.onReady fired, info.host =", info && info.host);
+  try {
+    if (typeof msal === "undefined") {
+      throw new Error("MSAL bundle did not load (../msal-browser.min.js). Check that the file is published next to /word/ on GitHub Pages.");
+    }
     msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
     await msalApp.initialize();
     const accounts = msalApp.getAllAccounts();
@@ -55,6 +76,7 @@ Office.onReady(async (info) => {
     }
     setupListeners();
   } catch (e) {
+    console.error("[Setty PMS Filer] startup failed:", e);
     showView("signInView");
     setStatus("signInStatus", "error", "Startup error: " + e.message);
   }
