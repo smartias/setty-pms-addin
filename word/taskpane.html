@@ -178,6 +178,32 @@
     .sp-folder-row.up { color: var(--muted); }
     .sp-empty { color: var(--muted); font-size: 11px; padding: 4px 6px; }
     .sp-loading { color: var(--muted); font-size: 11px; padding: 4px 6px; font-style: italic; }
+    .save-section {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 14px;
+      background: rgba(255,255,255,0.02);
+    }
+    .save-section-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .save-section-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .save-section-sub code {
+      background: var(--panel);
+      padding: 1px 5px;
+      border-radius: 2px;
+      font-size: 10px;
+    }
   </style>
 </head>
 <body>
@@ -201,31 +227,34 @@
       </div>
 
       <div class="field">
-        <label for="titleInput">OneNote page title</label>
-        <input type="text" id="titleInput" placeholder="Page title" />
-      </div>
-
-      <div class="field">
         <label for="searchInput">Project</label>
         <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
         <div class="project-list" id="projectList"></div>
       </div>
 
-      <div class="field" style="margin-bottom:10px">
-        <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:12px;color:var(--text);cursor:pointer">
-          <input type="checkbox" id="alsoSaveSpChk" style="margin:0" />
-          Also save the original .docx to SharePoint
-        </label>
-        <div id="spPicker" class="sp-picker" style="display:none">
-          <div class="sp-breadcrumbs" id="spBreadcrumbs"></div>
-          <div class="sp-folders" id="spFolders"></div>
+      <div class="save-section">
+        <div class="save-section-title">Save to OneNote</div>
+        <div class="save-section-sub">Saves a PDF printout to the project notebook's <strong>Documents</strong> section.</div>
+        <div class="field">
+          <label for="titleInput">OneNote page title</label>
+          <input type="text" id="titleInput" placeholder="Page title" />
         </div>
+        <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
+        <div id="oneNoteStatus" class="status"></div>
+        <div id="oneNoteLink" class="footer-link"></div>
       </div>
 
-      <button id="saveBtn" disabled>Send to OneNote</button>
-      <div id="saveStatus" class="status"></div>
-      <div id="oneNoteLink" class="footer-link"></div>
-      <div id="spLink" class="footer-link"></div>
+      <div class="save-section">
+        <div class="save-section-title">Save to SharePoint</div>
+        <div class="save-section-sub">Saves the original <code>.docx</code> file. Pick the destination folder below.</div>
+        <div id="spPicker" class="sp-picker">
+          <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project to enable folder browsing.</div>
+          <div class="sp-folders" id="spFolders"></div>
+        </div>
+        <button id="saveSpBtn" disabled style="margin-top:8px">Save to SharePoint</button>
+        <div id="spStatus" class="status"></div>
+        <div id="spLink" class="footer-link"></div>
+      </div>
 
       <div style="margin-top:16px;text-align:center">
         <button id="signOutBtn" class="btn-secondary">Sign out</button>

@@ -60,28 +60,28 @@ Office.onReady(async (info) => {
 });
 
 function setupListeners() {
-  document.getElementById("signInBtn").onclick  = doSignIn;
-  document.getElementById("signOutBtn").onclick = doSignOut;
-  document.getElementById("saveBtn").onclick    = doSaveToOneNote;
+  document.getElementById("signInBtn").onclick     = doSignIn;
+  document.getElementById("signOutBtn").onclick    = doSignOut;
+  document.getElementById("saveOneNoteBtn").onclick = doSaveToOneNote;
+  document.getElementById("saveSpBtn").onclick      = doSaveToSharePoint;
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
-  document.getElementById("alsoSaveSpChk").addEventListener("change", onSpCheckboxChange);
 }
 
-async function onSpCheckboxChange() {
-  const picker = document.getElementById("spPicker");
-  const checked = document.getElementById("alsoSaveSpChk").checked;
-  if (!checked) { picker.style.display = "none"; return; }
+// Refresh SP picker for the currently-selected project (or empty it if none).
+// Called whenever selectedProject changes.
+async function refreshSpPickerForProject() {
+  const folders = document.getElementById("spFolders");
+  const crumbs = document.getElementById("spBreadcrumbs");
   if (!selectedProject) {
-    setStatus("saveStatus", "error", "Pick a project first, then choose a SharePoint folder.");
-    document.getElementById("alsoSaveSpChk").checked = false;
+    crumbs.textContent = "Pick a project to enable folder browsing.";
+    folders.innerHTML = "";
     return;
   }
   if (!selectedProject.projectFolderUrl) {
-    setStatus("saveStatus", "error", "This project has no SharePoint folder linked. Create one in the PMS first.");
-    document.getElementById("alsoSaveSpChk").checked = false;
+    crumbs.textContent = "This project has no SharePoint folder linked.";
+    folders.innerHTML = '<div class="sp-empty">Create one in the PMS first to enable saving here.</div>';
     return;
   }
-  picker.style.display = "block";
   spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl) || "";
   spCurrentPath = spProjectRootPath;
   await renderSpPicker();
@@ -295,7 +295,8 @@ function applyAutoSuggest() {
   if (scored.length && scored[0].score >= 5) {
     selectedProject = scored[0].p;
     renderProjectList(scored.map(s => s.p.id));
-    updateSaveButton();
+    updateSaveButtons();
+    refreshSpPickerForProject();
   }
 }
 
@@ -332,21 +333,22 @@ function renderProjectList(suggestedIds = []) {
       const id = row.getAttribute("data-id");
       selectedProject = allProjects.find(p => p.id === id) || null;
       renderProjectList(suggestedIds);
-      updateSaveButton();
-      // Re-init folder picker if it was open — it's pointing into the old project.
-      if (document.getElementById("alsoSaveSpChk").checked) {
-        onSpCheckboxChange();
-      }
+      updateSaveButtons();
+      refreshSpPickerForProject();
     };
   });
 }
 
-function updateSaveButton() {
-  const btn = document.getElementById("saveBtn");
-  btn.disabled = !selectedProject || saveInFlight;
-  btn.textContent = selectedProject
-    ? `Send to OneNote → ${selectedProject.projectNumber || selectedProject.name}`
-    : "Send to OneNote";
+function updateSaveButtons() {
+  const oneBtn = document.getElementById("saveOneNoteBtn");
+  const spBtn  = document.getElementById("saveSpBtn");
+  const projTag = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
+  oneBtn.disabled = !selectedProject || saveInFlight;
+  oneBtn.textContent = "Save to OneNote" + projTag;
+  // SharePoint requires a project AND a linked SharePoint folder
+  const spReady = !!(selectedProject && selectedProject.projectFolderUrl);
+  spBtn.disabled = !spReady || saveInFlight;
+  spBtn.textContent = "Save to SharePoint" + (spReady ? projTag : "");
 }
 
 // ─── DOCX EXPORT ──────────────────────────────────────────────────────────────
@@ -534,72 +536,58 @@ async function postPdfPrintoutToOneNote(project, pageTitle, pdfBlob) {
   throw lastErr || new Error("OneNote page creation failed");
 }
 
-// ─── SAVE FLOW ────────────────────────────────────────────────────────────────
+// ─── SAVE FLOWS ───────────────────────────────────────────────────────────────
 async function doSaveToOneNote() {
-  if (!selectedProject) { setStatus("saveStatus", "error", "Pick a project first."); return; }
+  if (!selectedProject) { setStatus("oneNoteStatus", "error", "Pick a project first."); return; }
   if (saveInFlight) return;
   saveInFlight = true;
-  updateSaveButton();
+  updateSaveButtons();
   document.getElementById("oneNoteLink").innerHTML = "";
-  document.getElementById("spLink").innerHTML = "";
-  const alsoSp = document.getElementById("alsoSaveSpChk").checked;
   const titleInput = document.getElementById("titleInput");
   const pageTitle = (titleInput.value || "").trim() || docFilename.replace(/\.[^.]+$/, "");
-  let oneNotePage = null;
-  let spItem = null;
-  let oneNoteErr = null;
-  let spErr = null;
-
   try {
-    // PDF export — needed for OneNote regardless of SharePoint choice.
-    setStatus("saveStatus", "info", "⏳ Exporting document as PDF…");
+    setStatus("oneNoteStatus", "info", "⏳ Exporting document as PDF…");
     const pdfBlob = await getDocumentAsPdfBlob();
-
-    // Optional SharePoint upload happens in parallel with OneNote post —
-    // they're independent and both involve large network round-trips.
-    const onePromise = postPdfPrintoutToOneNote(selectedProject, pageTitle, pdfBlob)
-      .then(p => { oneNotePage = p; })
-      .catch(e => { oneNoteErr = e; });
-
-    let spPromise = Promise.resolve();
-    if (alsoSp) {
-      setStatus("saveStatus", "info", "⏳ Sending to OneNote and SharePoint…");
-      spPromise = (async () => {
-        const docxBlob = await getDocumentAsDocxBlob();
-        spItem = await uploadDocxToSharePoint(selectedProject, docxBlob, docFilename, spCurrentPath);
-      })().catch(e => { spErr = e; });
-    } else {
-      setStatus("saveStatus", "info", "⏳ Sending to OneNote…");
-    }
-
-    await Promise.all([onePromise, spPromise]);
-
-    // Compose status from both outcomes
-    const okParts = [];
-    const errParts = [];
-    if (oneNotePage) okParts.push("OneNote"); else if (oneNoteErr) errParts.push("OneNote: " + oneNoteErr.message);
-    if (alsoSp && spItem) okParts.push("SharePoint"); else if (spErr) errParts.push("SharePoint: " + spErr.message);
-
-    if (okParts.length && !errParts.length) {
-      setStatus("saveStatus", "success", "✓ Saved to " + okParts.join(" + "));
-    } else if (okParts.length && errParts.length) {
-      setStatus("saveStatus", "error", "Partial: saved to " + okParts.join(", ") + ". Failed — " + errParts.join("; "));
-    } else {
-      setStatus("saveStatus", "error", errParts.join("; ") || "Save failed");
-    }
-    if (oneNotePage?.webUrl) {
+    setStatus("oneNoteStatus", "info", "⏳ Sending to OneNote…");
+    const page = await postPdfPrintoutToOneNote(selectedProject, pageTitle, pdfBlob);
+    setStatus("oneNoteStatus", "success", "✓ Saved to OneNote");
+    if (page.webUrl) {
       document.getElementById("oneNoteLink").innerHTML =
-        `<a href="${oneNotePage.webUrl}" target="_blank">📓 Open in OneNote</a>`;
-    }
-    if (spItem?.webUrl) {
-      document.getElementById("spLink").innerHTML =
-        `<a href="${spItem.webUrl}" target="_blank">📁 Open in SharePoint (${escapeHtml(spItem.name)})</a>`;
+        `<a href="${page.webUrl}" target="_blank">📓 Open in OneNote</a>`;
     }
   } catch (e) {
-    setStatus("saveStatus", "error", e.message);
+    setStatus("oneNoteStatus", "error", e.message);
   } finally {
     saveInFlight = false;
-    updateSaveButton();
+    updateSaveButtons();
+  }
+}
+
+async function doSaveToSharePoint() {
+  if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
+  if (!selectedProject.projectFolderUrl) {
+    setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
+    return;
+  }
+  if (saveInFlight) return;
+  saveInFlight = true;
+  updateSaveButtons();
+  document.getElementById("spLink").innerHTML = "";
+  try {
+    setStatus("spStatus", "info", "⏳ Exporting document…");
+    const docxBlob = await getDocumentAsDocxBlob();
+    setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
+    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, docFilename, spCurrentPath);
+    setStatus("spStatus", "success", "✓ Saved to SharePoint");
+    if (item.webUrl) {
+      document.getElementById("spLink").innerHTML =
+        `<a href="${item.webUrl}" target="_blank">📁 Open in SharePoint (${escapeHtml(item.name)})</a>`;
+    }
+  } catch (e) {
+    setStatus("spStatus", "error", e.message);
+  } finally {
+    saveInFlight = false;
+    updateSaveButtons();
   }
 }
 
