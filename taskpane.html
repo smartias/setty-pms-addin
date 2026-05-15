@@ -185,6 +185,36 @@
       margin-bottom: 4px;
     }
     .save-row .btn { margin-bottom: 0; }
+    /* Quick text + templates grid — 2x2, compact, copies to clipboard */
+    .quick-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      margin-bottom: 6px;
+    }
+    .btn-quick {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 11px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      text-align: center;
+      line-height: 1.2;
+      min-height: 28px;
+      font-family: inherit;
+    }
+    .btn-quick:hover:not(:disabled) { background: var(--surface-2); border-color: var(--primary); }
+    .btn-quick:disabled { opacity: 0.5; cursor: not-allowed; }
+    .quick-section-label {
+      font-size: 10px;
+      color: var(--text-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin: 8px 0 4px;
+      font-weight: 600;
+    }
     .save-row-caption {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -749,6 +779,25 @@
       <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
     </div>
   </details>
+
+  <!-- Quick text + templates — copy text to clipboard for pasting into a reply.
+       Stays visible at the bottom; no manifest scope changes since this is
+       just the browser clipboard API, not Outlook compose access. -->
+  <div class="quick-section-label">✉ Quick text</div>
+  <div class="quick-grid">
+    <button class="btn-quick" data-tpl="ack">Received</button>
+    <button class="btn-quick" data-tpl="attached">Attached</button>
+    <button class="btn-quick" data-tpl="checking-schedule">Checking schedule</button>
+    <button class="btn-quick" data-tpl="fee-schedule">Fee Schedule</button>
+  </div>
+  <div class="quick-section-label">✉ Templates</div>
+  <div class="quick-grid">
+    <button class="btn-quick" data-tpl="schedule-update">✉ Schedule Update</button>
+    <button class="btn-quick" data-tpl="intro">✉ Project Introduction</button>
+    <button class="btn-quick" data-tpl="onhold">✉ Project On Hold</button>
+    <button class="btn-quick" data-tpl="sitesurvey">✉ Site Survey Request</button>
+  </div>
+  <div id="quickTextStatus" class="status" style="display:none"></div>
 </div>
 
 <!-- Note View -->

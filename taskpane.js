@@ -168,6 +168,11 @@ function setupEventListeners() {
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
   document.getElementById("openDashboardBtn").onclick = openPmsDashboard;
+  // Quick text + templates — clipboard-based, no Outlook compose API needed.
+  // Event delegation on the parent: click any .btn-quick → copy its template.
+  document.querySelectorAll(".btn-quick").forEach(btn => {
+    btn.onclick = () => copyTemplateToClipboard(btn.getAttribute("data-tpl"), btn);
+  });
   document.getElementById("clearProjectTagBtn").onclick = () => { void clearProjectTagForCurrentEmail(); };
   // RFI mode toggles
   document.getElementById("rfiModeNew").onclick      = () => setRfiMode("new");
@@ -4187,4 +4192,181 @@ function setStatus(elId, type, msg) {
   if (!el) return;
   el.className = "status-msg" + (msg ? " show " + type : "");
   el.textContent = msg;
+}
+
+// ─── QUICK TEXT + EMAIL TEMPLATES ─────────────────────────────────────────────
+// Clipboard-based: each button copies its template text so the user can paste
+// it into a reply. No Outlook compose API needed — works in read mode without
+// any manifest scope changes. Templates carry [Project Name] tokens which get
+// replaced from selectedProject when one is selected.
+const QUICK_TEMPLATES = {
+  // Short one-liners
+  "ack":               () => "Received, we will take a look and get back to you.",
+  "attached":          () => "Please find the attached. Let me know if you have any questions.",
+  "checking-schedule": () => "We will take a look at our schedule and get back to you.",
+  "fee-schedule":      () => formatFeeScheduleSnippet(selectedProject),
+  // Long form templates — verbatim from PMS EMAIL_TEMPLATES (SettyPMS.html).
+  "schedule-update":   () => fillProjectTokens(TPL_SCHEDULE_UPDATE,   selectedProject),
+  "intro":             () => fillProjectTokens(TPL_PROJECT_INTRO,     selectedProject),
+  "onhold":            () => fillProjectTokens(TPL_PROJECT_ONHOLD,    selectedProject),
+  "sitesurvey":        () => fillProjectTokens(TPL_SITE_SURVEY,       selectedProject),
+};
+
+const TPL_SCHEDULE_UPDATE = `Dear [Client Contact],
+
+I hope this message finds you well. I wanted to take a moment to share the current project schedule for [Project Name], along with our anticipated milestone dates. Keeping you informed and aligned throughout the project is a priority for our team, and we want to ensure you have full visibility into where things stand.
+
+Below is a summary of the key project milestones:
+
+[Schedule]
+
+Please note that these dates represent our current projections and may be subject to adjustment based on project conditions, design coordination needs, or information received. We will keep you informed of any changes as they arise.
+
+If you have any questions about the schedule, would like to discuss timeline adjustments, or need additional detail on any of the upcoming milestones, please don't hesitate to reach out. We're here to support a smooth and successful project delivery.
+
+Thank you for your continued partnership — we truly value the opportunity to work with you on this project.
+
+Warm regards,
+[Your Name]
+[Your Title]
+Setty
+[Phone Number] | [Email Address]`;
+
+const TPL_PROJECT_INTRO = `Dear [Client Contact],
+
+On behalf of our entire team, we would like to thank you for the opportunity to work with you on the [Project Name] project. We are excited to be part of the team and look forward to supporting the project's success from start to finish.
+
+I will be serving as the Project Manager and primary point of contact for the project. Please feel free to reach out to me directly with any questions, coordination items, or project-related needs as we move forward.
+
+Below is the core project team and their respective disciplines:
+
+[Team Members]
+
+Our goal is to provide responsive communication, proactive coordination, and a smooth project experience throughout the duration of the work.
+
+If at any time you have questions, concerns, or need additional assistance, please also feel free to contact Sara Arias or Danny Kang. They are always available to help ensure the project continues moving successfully and that any concerns are addressed promptly.
+
+We appreciate the opportunity to work with you and look forward to a successful collaboration.
+
+Warm regards,
+[Your Name]
+[Your Title]
+Setty
+[Phone Number] | [Email Address]`;
+
+const TPL_PROJECT_ONHOLD = `Dear [Client Contact],
+
+I hope you are doing well.
+
+At this time, work on the [Project Name] project is currently on hold pending receipt of the following information/items:
+
+  • [Outstanding Item #1]
+  • [Outstanding Item #2]
+  • [Outstanding Item #3]
+
+These items are required in order for our team to proceed with the next phase of work and maintain coordination with the project schedule.
+
+Once the requested information is received, we will resume work promptly and provide an updated schedule for remaining deliverables as needed.
+
+Please let us know if you would like to discuss any of the outstanding items or if there are any questions regarding the information required.
+
+Thank you,
+[Your Name]
+[Title]
+Setty
+[Phone Number] | [Email Address]`;
+
+const TPL_SITE_SURVEY = `Dear [Client Contact],
+
+Our team would like to schedule our site survey for the [Project Name] project. The pre-design site survey is a critical step for our team; it's crucial that we begin our work with the most accurate and complete view of the existing systems. Below are some of the critical components of our site visit to keep in mind as we schedule the work.
+
+1 – Existing Plans:
+Before our team visits the site, we want to verify first that we have every available existing Mechanical, Electrical, Plumbing and Fire Protection Drawing, especially any that might contain riser and one line diagrams and mechanical spaces. If there are any studies, maintenance records or other documentation on the existing systems that could be made available to us to review prior to being onsite, that will be incredibly valuable. In addition, if you have an "AS-BUILT" architectural plan and RCP from any recent site verification work, please share that with us — we can use it to take field notes and denote any critical dimensions. If sufficient existing information is not available, we should discuss options for additional site investigation time for this project and the limits of our investigations.
+
+2 – Limits of Investigation:
+Please note, we will not be doing any invasive investigations, such as opening floors and walls or electrical panel covers, testing equipment or tracing. Our team will do limited above-the-ceiling verification only if the ceilings are accessible and a ladder is made available for our use. If the team feels that this project warrants a higher degree of detail, we should discuss options for follow-up invasive field investigation or specialty field documentation options, such as 3D scanning.
+
+3 – On-Site Access:
+Our team will need access to all mechanical, electrical and plumbing utility spaces and possibly the roof. Ideally, a maintenance or facilities person who is familiar with the systems can be made available to walk with us, let us in to the needed spaces, and answer our questions while our team is on site.
+
+Warm regards,
+[Your Name]
+[Your Title]
+Setty
+[Phone Number] | [Email Address]`;
+
+// Replace [Project Name] / [Project Number] / [Client Contact] tokens when a
+// project is selected. Other tokens (e.g. [Your Name]) are left as-is for the
+// user to fill in by hand.
+function fillProjectTokens(text, project) {
+  if (!project) return text;
+  return text
+    .replace(/\[Project Name\]/g,   project.name || "[Project Name]")
+    .replace(/\[Project Number\]/g, project.projectNumber || "[Project Number]");
+}
+
+// Build a "Here is the current Fee Schedule" block from project.phases.
+// Phases come from PMS as { code, name, fee }; only billable rows are listed
+// (matches how the PMS surfaces the fee schedule in its invoice tooling).
+function formatFeeScheduleSnippet(project) {
+  const intro = "Here is the current Fee Schedule";
+  if (!project) {
+    return intro + ":\n\n[Select a project in the add-in to auto-fill the fee schedule.]";
+  }
+  const phases = (project.phases || []).filter(p => p.billable !== false && (p.fee || 0) > 0);
+  if (!phases.length) {
+    return `${intro} for ${project.name || project.projectNumber || ""}:\n\n[Fee schedule has not been finalized yet in PMS.]`;
+  }
+  const lines = phases.map(p => {
+    const fee = "$" + Math.round(p.fee || 0).toLocaleString();
+    return `  • ${p.name || p.code}: ${fee}`;
+  });
+  const total = phases.reduce((a, p) => a + (p.fee || 0), 0);
+  const totalStr = "$" + Math.round(total).toLocaleString();
+  const header = project.projectNumber
+    ? `${intro} for ${project.projectNumber} – ${project.name || ""}:`
+    : `${intro}:`;
+  return `${header}\n\n${lines.join("\n")}\n\nTotal: ${totalStr}`;
+}
+
+async function copyTemplateToClipboard(key, btnEl) {
+  const builder = QUICK_TEMPLATES[key];
+  if (!builder) return;
+  const text = builder();
+  try {
+    await navigator.clipboard.writeText(text);
+    showQuickStatus(`✓ Copied — paste into your email (Ctrl+V)`, "success");
+    // Brief visual confirmation on the button itself — matches the "Copied ✓"
+    // affordance the PMS TemplatesPanel uses for the same kind of action.
+    if (btnEl) {
+      const orig = btnEl.textContent;
+      btnEl.textContent = "✓ Copied";
+      setTimeout(() => { btnEl.textContent = orig; }, 1200);
+    }
+  } catch (e) {
+    showQuickStatus("Copy failed: " + e.message, "error");
+  }
+}
+
+function showQuickStatus(msg, type) {
+  const el = document.getElementById("quickTextStatus");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = "block";
+  el.style.padding = "6px 10px";
+  el.style.marginTop = "6px";
+  el.style.borderRadius = "4px";
+  el.style.fontSize = "11px";
+  if (type === "success") {
+    el.style.background = "#e6f4ea";
+    el.style.color = "#137333";
+    el.style.border = "1px solid #b6e3b6";
+  } else {
+    el.style.background = "#fce8e6";
+    el.style.color = "#a50e0e";
+    el.style.border = "1px solid #f1b0b0";
+  }
+  // Auto-hide after 2.5s — non-modal, just a confirmation toast.
+  clearTimeout(showQuickStatus._t);
+  showQuickStatus._t = setTimeout(() => { el.style.display = "none"; }, 2500);
 }
