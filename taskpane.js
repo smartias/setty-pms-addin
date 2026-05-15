@@ -84,11 +84,14 @@ Office.onReady(async (info) => {
       showView("signInView");
     }
     setupEventListeners();
+    applyComposeModeUiGuard();
     // When the task pane is pinned, Office swaps mailbox.item silently as the user
     // clicks different emails. ItemChanged fires each time — reload the pane context.
+    // The compose-mode guard re-runs here too because Reply/Forward swaps the item
+    // from a Read-mode message to an Edit-mode draft.
     Office.context.mailbox.addHandlerAsync(
       Office.EventType.ItemChanged,
-      () => { showView("mainView"); loadItemContext(); }
+      () => { showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
     );
     loadItemContext();
   } catch (e) {
@@ -97,6 +100,44 @@ Office.onReady(async (info) => {
     setStatus("signInStatus", "error", "Startup error: " + e.message);
   }
 });
+// In Compose mode (the user hit Reply / Forward / New) the email isn't sent
+// yet, so the file-to-SharePoint / log-as-note / log-as-RFI / etc. flows
+// don't apply. Hide everything except the project picker (still useful as
+// context) and the Quick Text + Templates section (the only Compose-relevant
+// feature). Detection: in Compose mode `mailbox.item.to` is a Recipients
+// object with setAsync(); in Read mode it's an array of EmailAddressDetails.
+function isComposeMode() {
+  try {
+    const item = Office.context.mailbox && Office.context.mailbox.item;
+    return !!(item && item.to && typeof item.to.setAsync === "function");
+  } catch { return false; }
+}
+function applyComposeModeUiGuard() {
+  const compose = isComposeMode();
+  document.body.classList.toggle("compose-mode", compose);
+  // Hide in Compose: there's no sent email yet to file or log.
+  const hiddenInCompose = [
+    "saveSpBtn", "saveRecordBtn", "saveConfirmation",
+    "logNoteBtn", "sendToTeamsBtn", "newActionItemBtn",
+    "moreActions", "oneNoteLinkBanner",
+    "dateSuggestionBlock",
+  ];
+  // Hide in Read: templates only make sense while composing a reply.
+  const hiddenInRead = ["quickTemplatesSection"];
+  for (const id of hiddenInCompose) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = compose ? "none" : "";
+  }
+  for (const id of hiddenInRead) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = compose ? "" : "none";
+  }
+  // Save-row + caption sit in divs without ids — find via class.
+  const saveRow = document.querySelector(".save-row");
+  const saveRowCaption = document.querySelector(".save-row-caption");
+  if (saveRow)        saveRow.style.display        = compose ? "none" : "";
+  if (saveRowCaption) saveRowCaption.style.display = compose ? "none" : "";
+}
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
   document.getElementById("signOutBtn").onclick    = doSignOut;
@@ -264,6 +305,14 @@ function buildMeetingNoteBody(item) {
 }
 
 function loadItemContext() {
+  // Compose-mode short-circuit: there's no sent email to read, and the item
+  // properties have different shapes (e.g. subject is a Subject object with
+  // getAsync, not a string). Skip the entire context load — the templates
+  // section doesn't need email metadata.
+  if (isComposeMode()) {
+    emailItem = null;
+    return;
+  }
   // Bump the generation. All async work below captures `myGen` at start and
   // bails out before writing module state if the generation has advanced
   // (= user clicked a different email mid-fetch).

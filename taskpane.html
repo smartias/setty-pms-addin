@@ -781,23 +781,26 @@
   </details>
 
   <!-- Quick text + templates — copy text to clipboard for pasting into a reply.
-       Stays visible at the bottom; no manifest scope changes since this is
-       just the browser clipboard API, not Outlook compose access. -->
-  <div class="quick-section-label">✉ Quick text</div>
-  <div class="quick-grid">
-    <button class="btn-quick" data-tpl="ack">Received</button>
-    <button class="btn-quick" data-tpl="attached">Attached</button>
-    <button class="btn-quick" data-tpl="checking-schedule">Checking schedule</button>
-    <button class="btn-quick" data-tpl="fee-schedule">Fee Schedule</button>
+       Wrapped in #quickTemplatesSection so the JS guard can show/hide it as a
+       single unit. Only visible in Compose mode (Reply / Forward / New) since
+       that's the only context where the templates are useful. -->
+  <div id="quickTemplatesSection">
+    <div class="quick-section-label">✉ Quick text</div>
+    <div class="quick-grid">
+      <button class="btn-quick" data-tpl="ack">Received</button>
+      <button class="btn-quick" data-tpl="attached">Attached</button>
+      <button class="btn-quick" data-tpl="checking-schedule">Checking schedule</button>
+      <button class="btn-quick" data-tpl="fee-schedule">Fee Schedule</button>
+    </div>
+    <div class="quick-section-label">✉ Templates</div>
+    <div class="quick-grid">
+      <button class="btn-quick" data-tpl="schedule-update">✉ Schedule Update</button>
+      <button class="btn-quick" data-tpl="intro">✉ Project Introduction</button>
+      <button class="btn-quick" data-tpl="onhold">✉ Project On Hold</button>
+      <button class="btn-quick" data-tpl="sitesurvey">✉ Site Survey Request</button>
+    </div>
+    <div id="quickTextStatus" class="status" style="display:none"></div>
   </div>
-  <div class="quick-section-label">✉ Templates</div>
-  <div class="quick-grid">
-    <button class="btn-quick" data-tpl="schedule-update">✉ Schedule Update</button>
-    <button class="btn-quick" data-tpl="intro">✉ Project Introduction</button>
-    <button class="btn-quick" data-tpl="onhold">✉ Project On Hold</button>
-    <button class="btn-quick" data-tpl="sitesurvey">✉ Site Survey Request</button>
-  </div>
-  <div id="quickTextStatus" class="status" style="display:none"></div>
 </div>
 
 <!-- Note View -->
