@@ -24,6 +24,7 @@ const TARGET_SECTION_NAME = "Documents"; // fixed section per product decision
 let msalApp = null;
 let msalAccount = null;
 let allProjects = [];
+let allClients = []; // global directory — used by the POC picker
 let selectedProject = null;
 let docFilename = "";
 let docFirstPageText = "";
@@ -60,11 +61,15 @@ Office.onReady(async (info) => {
 });
 
 function setupListeners() {
-  document.getElementById("signInBtn").onclick     = doSignIn;
-  document.getElementById("signOutBtn").onclick    = doSignOut;
+  document.getElementById("signInBtn").onclick      = doSignIn;
+  document.getElementById("signOutBtn").onclick     = doSignOut;
   document.getElementById("saveOneNoteBtn").onclick = doSaveToOneNote;
   document.getElementById("saveSpBtn").onclick      = doSaveToSharePoint;
+  document.getElementById("insertNameBtn").onclick   = () => doInsertField("name");
+  document.getElementById("insertNumberBtn").onclick = () => doInsertField("number");
+  document.getElementById("insertPocToggleBtn").onclick = togglePocPicker;
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
+  document.getElementById("pocSearch").addEventListener("input", renderPocList);
 }
 
 // Refresh SP picker for the currently-selected project (or empty it if none).
@@ -195,18 +200,28 @@ async function loadProjects() {
       const cached = JSON.parse(raw);
       if (cached.savedAt && (Date.now() - cached.savedAt) < PROJECTS_CACHE_TTL_MS) {
         allProjects = cached.projects || [];
+        allClients  = cached.clients  || [];
       }
     }
   } catch {}
 
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS });
-    if (res.ok) {
-      const rows = await res.json();
-      if (rows && rows.length > 0) {
-        allProjects = rows.map(r => r.project).filter(p => p && !p.archived);
+    const [pRes, cRes] = await Promise.all([
+      fetch(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }),
+      fetch(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }),
+    ]);
+    if (pRes.ok) {
+      const pRows = await pRes.json();
+      if (pRows && pRows.length > 0) {
+        allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
+        if (cRes.ok) {
+          const cRows = await cRes.json();
+          allClients = (cRows || []).map(r => r.client).filter(Boolean);
+        }
         try {
-          localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify({ projects: allProjects, savedAt: Date.now() }));
+          localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify({
+            projects: allProjects, clients: allClients, savedAt: Date.now()
+          }));
         } catch {}
         return;
       }
@@ -216,10 +231,11 @@ async function loadProjects() {
   }
   // Legacy fallback
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", { headers: SB_HEADERS });
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", { headers: SB_HEADERS });
     const rows = await res.json();
     if (rows?.[0]?.projects) {
       allProjects = rows[0].projects.filter(p => !p.archived);
+      allClients  = rows[0].clients || [];
     }
   } catch (e) {
     console.error("Failed to load projects:", e);
@@ -335,6 +351,11 @@ function renderProjectList(suggestedIds = []) {
       renderProjectList(suggestedIds);
       updateSaveButtons();
       refreshSpPickerForProject();
+      // Reset POC picker — its list depends on the selected project
+      document.getElementById("pocPicker").style.display = "none";
+      document.getElementById("pocSearch").value = "";
+      setStatus("insertStatus", "info", "");
+      document.getElementById("insertStatus").className = "status";
     };
   });
 }
@@ -349,6 +370,12 @@ function updateSaveButtons() {
   const spReady = !!(selectedProject && selectedProject.projectFolderUrl);
   spBtn.disabled = !spReady || saveInFlight;
   spBtn.textContent = "Save to SharePoint" + (spReady ? projTag : "");
+  // Insert buttons — all three require a project. POC also needs the picker
+  // closed-state to be reset when the project changes.
+  const hasProject = !!selectedProject;
+  document.getElementById("insertNameBtn").disabled       = !hasProject;
+  document.getElementById("insertNumberBtn").disabled     = !hasProject;
+  document.getElementById("insertPocToggleBtn").disabled  = !hasProject;
 }
 
 // ─── DOCX EXPORT ──────────────────────────────────────────────────────────────
@@ -534,6 +561,139 @@ async function postPdfPrintoutToOneNote(project, pageTitle, pdfBlob) {
     throw new Error("OneNote " + res.status + ": " + errText.slice(0, 300));
   }
   throw lastErr || new Error("OneNote page creation failed");
+}
+
+// ─── INSERT FLOWS ─────────────────────────────────────────────────────────────
+async function insertHtmlAtCursor(html) {
+  await Word.run(async (ctx) => {
+    const sel = ctx.document.getSelection();
+    sel.insertHtml(html, Word.InsertLocation.replace);
+    await ctx.sync();
+  });
+}
+
+async function doInsertField(which) {
+  if (!selectedProject) return;
+  const text = which === "number"
+    ? (selectedProject.projectNumber || "")
+    : (selectedProject.name || "");
+  if (!text) {
+    setStatus("insertStatus", "error", `Project has no ${which === "number" ? "number" : "name"}.`);
+    return;
+  }
+  try {
+    await insertHtmlAtCursor(escapeHtml(text));
+    setStatus("insertStatus", "success", `✓ Inserted ${which === "number" ? "project number" : "project name"}`);
+  } catch (e) {
+    setStatus("insertStatus", "error", "Insert failed: " + e.message);
+  }
+}
+
+function togglePocPicker() {
+  const picker = document.getElementById("pocPicker");
+  const open = picker.style.display !== "none";
+  if (open) {
+    picker.style.display = "none";
+  } else {
+    picker.style.display = "block";
+    document.getElementById("pocSearch").value = "";
+    renderPocList();
+    document.getElementById("pocSearch").focus();
+  }
+}
+
+// Build a unified POC list. Project people appear first (group: "On this
+// project"), followed by the global directory minus anyone already in the
+// project list (deduped by lowercase email).
+function buildPocList() {
+  const projectPeople = (selectedProject?.directory || []).map(d => ({
+    name: d.name || "",
+    title: d.title || "",
+    email: d.email || "",
+    phone: d.phone || "",
+    company: d.company || "",
+    group: "On this project",
+  }));
+  const projectEmails = new Set(
+    projectPeople.map(p => (p.email || "").toLowerCase()).filter(Boolean)
+  );
+  const others = [];
+  for (const client of allClients || []) {
+    for (const c of (client.contacts || [])) {
+      const emailLc = (c.email || "").toLowerCase();
+      if (emailLc && projectEmails.has(emailLc)) continue;
+      others.push({
+        name: c.name || "",
+        title: c.title || "",
+        email: c.email || "",
+        phone: c.phone || "",
+        company: client.name || "",
+        group: "Directory",
+      });
+    }
+  }
+  return [...projectPeople, ...others];
+}
+
+function renderPocList() {
+  const q = (document.getElementById("pocSearch").value || "").trim().toLowerCase();
+  const list = document.getElementById("pocList");
+  const all = buildPocList();
+  const filtered = all.filter(p => {
+    if (!q) return true;
+    return p.name.toLowerCase().includes(q)
+        || p.company.toLowerCase().includes(q)
+        || p.email.toLowerCase().includes(q)
+        || p.title.toLowerCase().includes(q);
+  });
+  if (!filtered.length) {
+    list.innerHTML = '<div class="poc-empty">No people match. Add contacts via the Outlook add-in or PMS Directory.</div>';
+    return;
+  }
+  // Capped at 100 results — user should refine the search if they need more.
+  const capped = filtered.slice(0, 100);
+  let html = "";
+  let lastGroup = "";
+  capped.forEach((p, i) => {
+    if (p.group !== lastGroup) {
+      html += `<div class="poc-group-header">${escapeHtml(p.group)}</div>`;
+      lastGroup = p.group;
+    }
+    const meta = [p.title, p.company].filter(Boolean).join(" · ");
+    html += `<div class="poc-row" data-i="${i}">
+      <div class="poc-name">${escapeHtml(p.name) || "<em>(no name)</em>"}</div>
+      <div class="poc-meta">${escapeHtml(meta)}${p.email ? " · " + escapeHtml(p.email) : ""}</div>
+    </div>`;
+  });
+  list.innerHTML = html;
+  list.querySelectorAll(".poc-row").forEach(row => {
+    row.onclick = () => {
+      const idx = parseInt(row.getAttribute("data-i"), 10);
+      doInsertPocBlock(capped[idx]);
+    };
+  });
+}
+
+async function doInsertPocBlock(person) {
+  // 4-line letter recipient block. <br> instead of <p> keeps the lines tight
+  // (paragraphs introduce extra spacing that looks wrong in a recipient block).
+  const lines = [person.name, person.title, person.company, person.email]
+    .filter(Boolean)
+    .map(escapeHtml);
+  if (!lines.length) {
+    setStatus("insertStatus", "error", "This contact has no fields to insert.");
+    return;
+  }
+  const html = lines.join("<br>");
+  try {
+    await insertHtmlAtCursor(html);
+    setStatus("insertStatus", "success", `✓ Inserted ${person.name || "contact"}`);
+    // Collapse the picker after a successful insert — keeps the sidebar tidy
+    // and the user typically inserts one POC per letter.
+    document.getElementById("pocPicker").style.display = "none";
+  } catch (e) {
+    setStatus("insertStatus", "error", "Insert failed: " + e.message);
+  }
 }
 
 // ─── SAVE FLOWS ───────────────────────────────────────────────────────────────

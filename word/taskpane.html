@@ -204,6 +204,51 @@
       border-radius: 2px;
       font-size: 10px;
     }
+    .insert-row {
+      display: flex;
+      gap: 6px;
+    }
+    .btn-insert {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 8px 10px;
+      flex: 1;
+    }
+    .btn-insert:hover:not(:disabled) {
+      background: #2d2d2d;
+      border-color: var(--accent);
+    }
+    .poc-list {
+      max-height: 200px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+      margin-top: 6px;
+    }
+    .poc-group-header {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 6px 10px 2px;
+      background: rgba(0,0,0,0.2);
+      border-bottom: 1px solid var(--border);
+    }
+    .poc-row {
+      padding: 7px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .poc-row:last-child { border-bottom: none; }
+    .poc-row:hover { background: #2d2d2d; }
+    .poc-row .poc-name { font-weight: 600; }
+    .poc-row .poc-meta { color: var(--muted); font-size: 11px; }
+    .poc-empty { padding: 10px; color: var(--muted); font-size: 11px; text-align: center; }
   </style>
 </head>
 <body>
@@ -230,6 +275,21 @@
         <label for="searchInput">Project</label>
         <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
         <div class="project-list" id="projectList"></div>
+      </div>
+
+      <div class="save-section">
+        <div class="save-section-title">Insert</div>
+        <div class="save-section-sub">Insert text from the selected project at your cursor.</div>
+        <div class="insert-row">
+          <button id="insertNameBtn" class="btn-insert" disabled>Project Name</button>
+          <button id="insertNumberBtn" class="btn-insert" disabled>Project Number</button>
+        </div>
+        <button id="insertPocToggleBtn" class="btn-insert" disabled style="margin-top:6px;width:100%">Insert POC Block…</button>
+        <div id="pocPicker" style="display:none;margin-top:8px">
+          <input type="search" id="pocSearch" placeholder="Search by name, company, email…" autocomplete="off" />
+          <div class="poc-list" id="pocList"></div>
+        </div>
+        <div id="insertStatus" class="status"></div>
       </div>
 
       <div class="save-section">
