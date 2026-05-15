@@ -38,6 +38,12 @@
         <RequestedHeight>450</RequestedHeight>
       </DesktopSettings>
     </Form>
+    <Form xsi:type="ItemEdit">
+      <DesktopSettings>
+        <SourceLocation DefaultValue="https://smartias.github.io/setty-pms-addin/taskpane.html"/>
+        <RequestedHeight>450</RequestedHeight>
+      </DesktopSettings>
+    </Form>
   </FormSettings>
 
   <Permissions>ReadWriteMailbox</Permissions>
@@ -278,7 +284,6 @@
                     <Action xsi:type="ShowTaskpane">
                       <TaskpaneId>ButtonIdMsgComposeV11</TaskpaneId>
                       <SourceLocation resid="Taskpane.Url"/>
-                      <SupportsPinning>true</SupportsPinning>
                     </Action>
                   </Control>
                 </Group>
