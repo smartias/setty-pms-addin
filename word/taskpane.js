@@ -512,7 +512,7 @@ function spDrivePath(spFolderUrl) {
   if (!spFolderUrl || !spFolderUrl.startsWith(base)) return null;
   return decodeURIComponent(spFolderUrl.slice(base.length));
 }
-async function uploadDocxToSharePoint(project, docxBlob, filename, targetPathOverride) {
+async function uploadFileToSharePoint(project, blob, filename, contentType, targetPathOverride) {
   if (!project.projectFolderUrl) {
     throw new Error("Project has no SharePoint folder linked. Create one in the PMS first.");
   }
@@ -528,11 +528,8 @@ async function uploadDocxToSharePoint(project, docxBlob, filename, targetPathOve
     + ":/content?@microsoft.graph.conflictBehavior=rename";
   const res = await fetch(url, {
     method: "PUT",
-    headers: {
-      "Authorization": "Bearer " + token,
-      "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    },
-    body: docxBlob,
+    headers: { "Authorization": "Bearer " + token, "Content-Type": contentType },
+    body: blob,
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
@@ -540,6 +537,14 @@ async function uploadDocxToSharePoint(project, docxBlob, filename, targetPathOve
   }
   const item = await res.json();
   return { name: item.name, webUrl: item.webUrl };
+}
+
+function uploadDocxToSharePoint(project, blob, filename, targetPathOverride) {
+  return uploadFileToSharePoint(
+    project, blob, filename,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    targetPathOverride
+  );
 }
 
 // ─── PDF EXPORT ───────────────────────────────────────────────────────────────
@@ -828,14 +833,24 @@ async function doSaveToSharePoint() {
   document.getElementById("spLink").innerHTML = "";
   try {
     setStatus("spStatus", "info", "⏳ Exporting document…");
-    const docxBlob = await getDocumentAsDocxBlob();
-    setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
+    const [docxBlob, pdfBlob] = await Promise.all([
+      getDocumentAsDocxBlob(),
+      getDocumentAsPdfBlob(),
+    ]);
+
+    setStatus("spStatus", "info", "⏳ Uploading .docx to SharePoint…");
     const item = await uploadDocxToSharePoint(selectedProject, docxBlob, docFilename, spCurrentPath);
-    setStatus("spStatus", "success", "✓ Saved to SharePoint");
-    if (item.webUrl) {
-      document.getElementById("spLink").innerHTML =
-        `<a href="${item.webUrl}" target="_blank">📁 Open in SharePoint (${escapeHtml(item.name)})</a>`;
-    }
+
+    setStatus("spStatus", "info", "⏳ Uploading PDF to SharePoint…");
+    const pdfFilename = docFilename.replace(/\.docx$/i, "") + ".pdf";
+    const pdfItem = await uploadFileToSharePoint(
+      selectedProject, pdfBlob, pdfFilename, "application/pdf", spCurrentPath
+    );
+
+    setStatus("spStatus", "success", "✓ Saved .docx and PDF to SharePoint");
+    document.getElementById("spLink").innerHTML =
+      `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>` +
+      `&nbsp;&nbsp;<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
   } catch (e) {
     setStatus("spStatus", "error", e.message);
   } finally {
