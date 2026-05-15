@@ -71,6 +71,34 @@ function setupListeners() {
   document.getElementById("insertPocToggleBtn").onclick = togglePocPicker;
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
   document.getElementById("pocSearch").addEventListener("input", renderPocList);
+  document.getElementById("pillChangeLink").onclick    = expandProjectPicker;
+  document.getElementById("titleEditLink").onclick     = () => toggleOpt("titleEdit", "titleInput");
+  document.getElementById("spFolderEditLink").onclick  = () => toggleOpt("spFolderEdit");
+}
+
+// Collapse the search + list into the compact pill once a project is chosen.
+function collapseProjectPickerToPill() {
+  if (!selectedProject) return;
+  document.getElementById("projectSearchWrap").style.display = "none";
+  document.getElementById("projectPill").style.display = "flex";
+  document.getElementById("pillProjectNumber").textContent = selectedProject.projectNumber || "";
+  document.getElementById("pillProjectName").textContent   = selectedProject.name || "";
+}
+function expandProjectPicker() {
+  document.getElementById("projectSearchWrap").style.display = "block";
+  document.getElementById("projectPill").style.display = "none";
+  const s = document.getElementById("searchInput");
+  s.value = "";
+  s.focus();
+  renderProjectList();
+}
+
+function toggleOpt(editId, focusId) {
+  const el = document.getElementById(editId);
+  el.classList.toggle("active");
+  if (el.classList.contains("active") && focusId) {
+    document.getElementById(focusId).focus();
+  }
 }
 
 // Refresh SP picker for the currently-selected project (or empty it if none).
@@ -78,14 +106,17 @@ function setupListeners() {
 async function refreshSpPickerForProject() {
   const folders = document.getElementById("spFolders");
   const crumbs = document.getElementById("spBreadcrumbs");
+  const summary = document.getElementById("spFolderCurrent");
   if (!selectedProject) {
     crumbs.textContent = "Pick a project to enable folder browsing.";
     folders.innerHTML = "";
+    summary.textContent = "(pick a project)";
     return;
   }
   if (!selectedProject.projectFolderUrl) {
     crumbs.textContent = "This project has no SharePoint folder linked.";
     folders.innerHTML = '<div class="sp-empty">Create one in the PMS first to enable saving here.</div>';
+    summary.textContent = "(no SharePoint folder)";
     return;
   }
   spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl) || "";
@@ -105,6 +136,9 @@ async function renderSpPicker() {
     .concat(parts.map((p, i) => ` / <span data-depth="${i + 1}">${escapeHtml(p)}</span>`))
     .join("");
   crumbs.innerHTML = "Save to: " + crumbHtml;
+  // Mirror the current folder into the compact summary line above the picker.
+  document.getElementById("spFolderCurrent").textContent =
+    parts.length ? parts.join(" / ") : "project root";
   crumbs.querySelectorAll("span").forEach(s => {
     s.onclick = async () => {
       const depth = parseInt(s.getAttribute("data-depth"), 10);
@@ -250,8 +284,14 @@ async function loadDocumentContext() {
     .split(/[\\/]/).pop() || "Untitled.docx";
   document.getElementById("docFilename").textContent = docFilename;
   // Pre-fill page title with filename minus extension
+  const defaultTitle = docFilename.replace(/\.[^.]+$/, "");
   const titleInput = document.getElementById("titleInput");
-  titleInput.value = docFilename.replace(/\.[^.]+$/, "");
+  titleInput.value = defaultTitle;
+  document.getElementById("titleCurrent").textContent = defaultTitle;
+  // Keep the summary line in sync as the user edits the title.
+  titleInput.addEventListener("input", () => {
+    document.getElementById("titleCurrent").textContent = titleInput.value || "(empty — will use filename)";
+  });
 
   // First-page text via Word.run — used by the auto-suggest scorer.
   // Capped at the first ~2000 chars; project numbers/names typically appear
@@ -311,9 +351,9 @@ function applyAutoSuggest() {
     .sort((a, b) => b.score - a.score);
   if (scored.length && scored[0].score >= 5) {
     selectedProject = scored[0].p;
-    renderProjectList(scored.map(s => s.p.id));
     updateSaveButtons();
     refreshSpPickerForProject();
+    collapseProjectPickerToPill();
   }
 }
 
@@ -349,14 +389,18 @@ function renderProjectList(suggestedIds = []) {
     row.onclick = () => {
       const id = row.getAttribute("data-id");
       selectedProject = allProjects.find(p => p.id === id) || null;
-      renderProjectList(suggestedIds);
       updateSaveButtons();
       refreshSpPickerForProject();
+      collapseProjectPickerToPill();
       // Reset POC picker — its list depends on the selected project
       document.getElementById("pocPicker").style.display = "none";
       document.getElementById("pocSearch").value = "";
       setStatus("insertStatus", "info", "");
       document.getElementById("insertStatus").className = "status";
+      // Collapse any open option editors when project changes — their state
+      // (title input, folder picker) is project-specific and would be stale.
+      document.getElementById("titleEdit").classList.remove("active");
+      document.getElementById("spFolderEdit").classList.remove("active");
     };
   });
 }
@@ -376,6 +420,7 @@ function updateSaveButtons() {
   const hasProject = !!selectedProject;
   document.getElementById("insertNameBtn").disabled       = !hasProject;
   document.getElementById("insertNumberBtn").disabled     = !hasProject;
+  document.getElementById("insertClientBtn").disabled     = !hasProject;
   document.getElementById("insertPocToggleBtn").disabled  = !hasProject;
 }
 

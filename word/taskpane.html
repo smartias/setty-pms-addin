@@ -249,7 +249,49 @@
     .poc-row .poc-name { font-weight: 600; }
     .poc-row .poc-meta { color: var(--muted); font-size: 11px; }
     .poc-empty { padding: 10px; color: var(--muted); font-size: 11px; text-align: center; }
-  </style>
+    /* Compact selected-project pill */
+    .project-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .project-pill .pn { color: var(--accent); font-weight: 700; }
+    .project-pill .nm { flex: 1; color: var(--text); }
+    .project-pill .change-link {
+      color: var(--accent);
+      cursor: pointer;
+      font-size: 11px;
+      text-decoration: underline;
+    }
+    /* Save row — two buttons side by side at the top */
+    .save-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .save-row button { flex: 1; padding: 9px 8px; font-size: 12px; }
+    /* Tight option line under each save button (title for OneNote, folder for SP) */
+    .opt-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      padding: 4px 2px;
+      flex-wrap: wrap;
+    }
+    .opt-line .opt-current { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .opt-line .opt-link { color: var(--accent); cursor: pointer; text-decoration: underline; flex-shrink: 0; }
+    .opt-edit { display: none; margin-top: 4px; }
+    .opt-edit.active { display: block; }
+    /* Section heading reused but tighter */
+    .section-tight { margin-top: 14px; }
+    .section-tight .save-section-title { margin-bottom: 6px; }
 </head>
 <body>
   <div class="header">
@@ -271,23 +313,64 @@
         <div class="filename" id="docFilename">Loading…</div>
       </div>
 
-      <div class="field">
-        <label for="searchInput">Project</label>
-        <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
-        <div class="project-list" id="projectList"></div>
+      <!-- Project: search + list (visible until selection), then collapses to a compact pill -->
+      <div id="projectPickerWrap">
+        <div id="projectSearchWrap" class="field">
+          <label for="searchInput">Project</label>
+          <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
+          <div class="project-list" id="projectList"></div>
+        </div>
+        <div id="projectPill" class="project-pill" style="display:none">
+          <span class="pn" id="pillProjectNumber"></span>
+          <span class="nm" id="pillProjectName"></span>
+          <span class="change-link" id="pillChangeLink">change</span>
+        </div>
       </div>
 
-      <div class="save-section">
-        <div class="save-section-title">Insert</div>
-        <div class="save-section-sub">Insert text from the selected project at your cursor.</div>
+      <!-- Save row — two buttons side by side, prominent and at the top -->
+      <div class="save-row">
+        <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
+        <button id="saveSpBtn" disabled>Save to SharePoint</button>
+      </div>
+
+      <!-- Compact options under the save row: title for OneNote, folder for SP -->
+      <div class="opt-line">
+        <span>📓 Title:</span>
+        <span class="opt-current" id="titleCurrent">—</span>
+        <span class="opt-link" id="titleEditLink">edit</span>
+      </div>
+      <div class="opt-edit" id="titleEdit">
+        <input type="text" id="titleInput" placeholder="Page title" />
+      </div>
+
+      <div class="opt-line">
+        <span>📁 Folder:</span>
+        <span class="opt-current" id="spFolderCurrent">project root</span>
+        <span class="opt-link" id="spFolderEditLink">change</span>
+      </div>
+      <div class="opt-edit" id="spFolderEdit">
+        <div class="sp-picker" style="margin-top:0">
+          <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
+          <div class="sp-folders" id="spFolders"></div>
+        </div>
+      </div>
+
+      <div id="oneNoteStatus" class="status"></div>
+      <div id="oneNoteLink" class="footer-link"></div>
+      <div id="spStatus" class="status"></div>
+      <div id="spLink" class="footer-link"></div>
+
+      <!-- Insert: smaller, lower in the pane since saves are the primary action -->
+      <div class="section-tight">
+        <div class="save-section-title">Insert at cursor</div>
         <div class="insert-row">
           <button id="insertNameBtn" class="btn-insert" disabled>Project Name</button>
           <button id="insertNumberBtn" class="btn-insert" disabled>Project Number</button>
         </div>
         <div class="insert-row" style="margin-top:6px">
           <button id="insertClientBtn" class="btn-insert" disabled>Client Name</button>
+          <button id="insertPocToggleBtn" class="btn-insert" disabled>POC Block…</button>
         </div>
-        <button id="insertPocToggleBtn" class="btn-insert" disabled style="margin-top:6px;width:100%">Insert POC Block…</button>
         <div id="pocPicker" style="display:none;margin-top:8px">
           <input type="search" id="pocSearch" placeholder="Search by name, company, email…" autocomplete="off" />
           <div class="poc-list" id="pocList"></div>
@@ -295,31 +378,7 @@
         <div id="insertStatus" class="status"></div>
       </div>
 
-      <div class="save-section">
-        <div class="save-section-title">Save to OneNote</div>
-        <div class="save-section-sub">Saves a PDF printout to the project notebook's <strong>Documents</strong> section.</div>
-        <div class="field">
-          <label for="titleInput">OneNote page title</label>
-          <input type="text" id="titleInput" placeholder="Page title" />
-        </div>
-        <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
-        <div id="oneNoteStatus" class="status"></div>
-        <div id="oneNoteLink" class="footer-link"></div>
-      </div>
-
-      <div class="save-section">
-        <div class="save-section-title">Save to SharePoint</div>
-        <div class="save-section-sub">Saves the original <code>.docx</code> file. Pick the destination folder below.</div>
-        <div id="spPicker" class="sp-picker">
-          <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project to enable folder browsing.</div>
-          <div class="sp-folders" id="spFolders"></div>
-        </div>
-        <button id="saveSpBtn" disabled style="margin-top:8px">Save to SharePoint</button>
-        <div id="spStatus" class="status"></div>
-        <div id="spLink" class="footer-link"></div>
-      </div>
-
-      <div style="margin-top:16px;text-align:center">
+      <div style="margin-top:14px;text-align:center">
         <button id="signOutBtn" class="btn-secondary">Sign out</button>
       </div>
     </div>
