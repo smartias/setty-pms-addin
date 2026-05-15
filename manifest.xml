@@ -44,6 +44,7 @@
 
   <Rule xsi:type="RuleCollection" Mode="Or">
     <Rule xsi:type="ItemIs" ItemType="Message" FormType="Read"/>
+    <Rule xsi:type="ItemIs" ItemType="Message" FormType="Edit"/>
     <Rule xsi:type="ItemIs" ItemType="Appointment" FormType="Read"/>
   </Rule>
 
@@ -121,6 +122,29 @@
                   </Icon>
                   <Action xsi:type="ShowTaskpane">
                     <TaskpaneId>ButtonIdApptAtt</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url"/>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+          <ExtensionPoint xsi:type="MessageComposeCommandSurface">
+            <OfficeTab id="TabDefault">
+              <Group id="msgComposeGroup">
+                <Label resid="GroupLabel"/>
+                <Control xsi:type="Button" id="msgComposeOpenPaneButton">
+                  <Label resid="TaskpaneButton.Label"/>
+                  <Supertip>
+                    <Title resid="TaskpaneButton.Label"/>
+                    <Description resid="TaskpaneButton.Tooltip"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16x16"/>
+                    <bt:Image size="32" resid="Icon.32x32"/>
+                    <bt:Image size="80" resid="Icon.80x80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>ButtonIdMsgCompose</TaskpaneId>
                     <SourceLocation resid="Taskpane.Url"/>
                   </Action>
                 </Control>
@@ -225,6 +249,34 @@
                     </Icon>
                     <Action xsi:type="ShowTaskpane">
                       <TaskpaneId>ButtonIdApptAttV11</TaskpaneId>
+                      <SourceLocation resid="Taskpane.Url"/>
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+            <!-- Compose surface — keeps the pane open when the user hits Reply.
+                 In Compose mode the pane shows only the Quick Text + Templates
+                 section (save buttons hide via JS guard) since there's no
+                 sent email yet to file. -->
+            <ExtensionPoint xsi:type="MessageComposeCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="msgComposeGroupV11">
+                  <Label resid="GroupLabel"/>
+                  <Control xsi:type="Button" id="msgComposeOpenPaneButtonV11">
+                    <Label resid="TaskpaneButton.Label"/>
+                    <Supertip>
+                      <Title resid="TaskpaneButton.Label"/>
+                      <Description resid="TaskpaneButton.Tooltip"/>
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16"/>
+                      <bt:Image size="32" resid="Icon.32x32"/>
+                      <bt:Image size="80" resid="Icon.80x80"/>
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <TaskpaneId>ButtonIdMsgComposeV11</TaskpaneId>
                       <SourceLocation resid="Taskpane.Url"/>
                       <SupportsPinning>true</SupportsPinning>
                     </Action>
