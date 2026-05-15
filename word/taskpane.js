@@ -725,21 +725,32 @@ function renderPocList() {
 }
 
 async function doInsertPocBlock(person) {
-  // 4-line letter recipient block. <br> instead of <p> keeps the lines tight
-  // (paragraphs introduce extra spacing that looks wrong in a recipient block).
   const lines = [person.name, person.title, person.company, person.email]
-    .filter(Boolean)
-    .map(escapeHtml);
+    .filter(Boolean);
   if (!lines.length) {
     setStatus("insertStatus", "error", "This contact has no fields to insert.");
     return;
   }
-  const html = lines.join("<br>");
   try {
-    await insertHtmlAtCursor(html);
+    // One paragraph per line, then force single spacing + left alignment on
+    // the inserted paragraphs. <br> would inherit the doc's Normal-style line
+    // spacing (often 1.5 or 2.0), so we use <p> + explicit overrides instead.
+    const html = lines.map(l => `<p>${escapeHtml(l)}</p>`).join("");
+    await Word.run(async (ctx) => {
+      const sel = ctx.document.getSelection();
+      const range = sel.insertHtml(html, Word.InsertLocation.replace);
+      range.paragraphs.load("items");
+      await ctx.sync();
+      range.paragraphs.items.forEach(p => {
+        p.alignment       = Word.Alignment.left;
+        p.spaceBefore     = 0;
+        p.spaceAfter      = 0;
+        p.lineUnitBefore  = 0;
+        p.lineUnitAfter   = 0;
+      });
+      await ctx.sync();
+    });
     setStatus("insertStatus", "success", `✓ Inserted ${person.name || "contact"}`);
-    // Collapse the picker after a successful insert — keeps the sidebar tidy
-    // and the user typically inserts one POC per letter.
     document.getElementById("pocPicker").style.display = "none";
   } catch (e) {
     setStatus("insertStatus", "error", "Insert failed: " + e.message);
