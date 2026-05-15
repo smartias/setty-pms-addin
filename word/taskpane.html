@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Setty PMS — Print to OneNote</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="../msal-browser.min.js"></script>
+  <style>
+    :root {
+      --navy: #003865;
+      --navy-light: #0a4a7a;
+      --bg: #1a1a1a;
+      --panel: #232323;
+      --border: #3a3a3a;
+      --text: #f5f5f5;
+      --muted: #999;
+      --accent: #4a9eff;
+      --success: #4ade80;
+      --error: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .header {
+      background: var(--navy);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header-logo {
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      font-size: 14px;
+    }
+    .header-sub {
+      font-size: 11px;
+      color: rgba(255,255,255,0.7);
+      margin-left: auto;
+    }
+    .container { padding: 16px; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .doc-info {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      font-size: 12px;
+    }
+    .doc-info .label { color: var(--muted); font-size: 11px; }
+    .doc-info .filename { font-weight: 600; word-break: break-all; }
+    label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    input[type="text"], input[type="search"] {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    .field { margin-bottom: 14px; }
+    .project-list {
+      max-height: 260px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+    }
+    .project-row {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .project-row:last-child { border-bottom: none; }
+    .project-row:hover { background: #2d2d2d; }
+    .project-row.selected { background: var(--navy-light); }
+    .project-row.suggested { border-left: 3px solid var(--accent); }
+    .project-row .pn { color: var(--accent); font-weight: 600; font-size: 11px; }
+    .project-row .nm { font-size: 12px; }
+    .project-row .cl { color: var(--muted); font-size: 11px; }
+    button {
+      background: var(--navy);
+      color: #fff;
+      border: none;
+      padding: 10px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      width: 100%;
+      font-family: inherit;
+    }
+    button:hover:not(:disabled) { background: var(--navy-light); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-weight: 400;
+      font-size: 12px;
+      padding: 6px 10px;
+      width: auto;
+    }
+    .status {
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      display: none;
+    }
+    .status.info    { display: block; background: #1e3a5f; color: #93c5fd; }
+    .status.success { display: block; background: #14532d; color: var(--success); }
+    .status.error   { display: block; background: #3f1d1d; color: var(--error); }
+    .suggested-badge {
+      background: var(--accent);
+      color: #000;
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 2px;
+      margin-left: 6px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+    .footer-link {
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .footer-link a { color: var(--accent); }
+    .sp-picker {
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+      padding: 8px 10px;
+    }
+    .sp-breadcrumbs {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      word-break: break-all;
+    }
+    .sp-breadcrumbs span { color: var(--accent); cursor: pointer; }
+    .sp-breadcrumbs span:hover { text-decoration: underline; }
+    .sp-folders {
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .sp-folder-row {
+      padding: 5px 6px;
+      cursor: pointer;
+      font-size: 12px;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sp-folder-row:hover { background: #2d2d2d; }
+    .sp-folder-row.up { color: var(--muted); }
+    .sp-empty { color: var(--muted); font-size: 11px; padding: 4px 6px; }
+    .sp-loading { color: var(--muted); font-size: 11px; padding: 4px 6px; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-logo">SETTY PMS</div>
+    <div class="header-sub">Word → OneNote</div>
+  </div>
+
+  <div class="container">
+
+    <div id="signInView" class="view">
+      <p style="color:var(--muted);font-size:12px;">Sign in with your Setty Microsoft account to send this document to a project.</p>
+      <button id="signInBtn">Sign in</button>
+      <div id="signInStatus" class="status"></div>
+    </div>
+
+    <div id="mainView" class="view">
+      <div class="doc-info">
+        <div class="label">DOCUMENT</div>
+        <div class="filename" id="docFilename">Loading…</div>
+      </div>
+
+      <div class="field">
+        <label for="titleInput">OneNote page title</label>
+        <input type="text" id="titleInput" placeholder="Page title" />
+      </div>
+
+      <div class="field">
+        <label for="searchInput">Project</label>
+        <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
+        <div class="project-list" id="projectList"></div>
+      </div>
+
+      <div class="field" style="margin-bottom:10px">
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:12px;color:var(--text);cursor:pointer">
+          <input type="checkbox" id="alsoSaveSpChk" style="margin:0" />
+          Also save the original .docx to SharePoint
+        </label>
+        <div id="spPicker" class="sp-picker" style="display:none">
+          <div class="sp-breadcrumbs" id="spBreadcrumbs"></div>
+          <div class="sp-folders" id="spFolders"></div>
+        </div>
+      </div>
+
+      <button id="saveBtn" disabled>Send to OneNote</button>
+      <div id="saveStatus" class="status"></div>
+      <div id="oneNoteLink" class="footer-link"></div>
+      <div id="spLink" class="footer-link"></div>
+
+      <div style="margin-top:16px;text-align:center">
+        <button id="signOutBtn" class="btn-secondary">Sign out</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="taskpane.js"></script>
+</body>
+</html>
