@@ -51,8 +51,19 @@ function showFatalError(label, err) {
       + '</div>';
   } catch {}
 }
-window.addEventListener("error", (e) => showFatalError("Uncaught error", e.error || e.message));
-window.addEventListener("unhandledrejection", (e) => showFatalError("Unhandled promise rejection", e.reason));
+// Only trip the fatal-error panel for errors that look like they came from
+// our own code, not from Office.js telemetry noise in a plain browser context.
+function looksLikeOurError(err) {
+  const text = String((err && (err.message || err.stack)) || err || "");
+  if (/Office\.js|outside of Office client|telemetryservice|message channel closed/i.test(text)) return false;
+  return true;
+}
+window.addEventListener("error", (e) => {
+  if (looksLikeOurError(e.error || e.message)) showFatalError("Uncaught error", e.error || e.message);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  if (looksLikeOurError(e.reason)) showFatalError("Unhandled promise rejection", e.reason);
+});
 
 Office.onReady(async (info) => {
   // Host check removed — manifest already restricts this add-in to Word, and
