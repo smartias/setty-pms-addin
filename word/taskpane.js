@@ -67,6 +67,7 @@ function setupListeners() {
   document.getElementById("saveSpBtn").onclick      = doSaveToSharePoint;
   document.getElementById("insertNameBtn").onclick   = () => doInsertField("name");
   document.getElementById("insertNumberBtn").onclick = () => doInsertField("number");
+  document.getElementById("insertClientBtn").onclick = () => doInsertField("client");
   document.getElementById("insertPocToggleBtn").onclick = togglePocPicker;
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
   document.getElementById("pocSearch").addEventListener("input", renderPocList);
@@ -574,16 +575,20 @@ async function insertHtmlAtCursor(html) {
 
 async function doInsertField(which) {
   if (!selectedProject) return;
-  const text = which === "number"
-    ? (selectedProject.projectNumber || "")
-    : (selectedProject.name || "");
+  const fieldMap = {
+    name:   { value: selectedProject.name,          label: "project name"   },
+    number: { value: selectedProject.projectNumber, label: "project number" },
+    client: { value: selectedProject.clientName,    label: "client name"    },
+  };
+  const f = fieldMap[which];
+  const text = (f?.value || "").trim();
   if (!text) {
-    setStatus("insertStatus", "error", `Project has no ${which === "number" ? "number" : "name"}.`);
+    setStatus("insertStatus", "error", `Project has no ${f?.label || which}.`);
     return;
   }
   try {
     await insertHtmlAtCursor(escapeHtml(text));
-    setStatus("insertStatus", "success", `✓ Inserted ${which === "number" ? "project number" : "project name"}`);
+    setStatus("insertStatus", "success", `✓ Inserted ${f.label}`);
   } catch (e) {
     setStatus("insertStatus", "error", "Insert failed: " + e.message);
   }
