@@ -457,6 +457,20 @@ function updateSaveButtons() {
   document.getElementById("insertPocToggleBtn").disabled  = !hasProject;
 }
 
+// ─── SLICE DECODE ─────────────────────────────────────────────────────────────
+// Office.js returns slice data as Base64 strings on Office on the web and some
+// desktop builds. Passing those strings directly into new Blob() produces a
+// text file, not binary — Word then rejects the upload as unreadable.
+function decodeSliceData(data) {
+  if (typeof data === "string") {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  return data instanceof Uint8Array ? data : new Uint8Array(data);
+}
+
 // ─── DOCX EXPORT ──────────────────────────────────────────────────────────────
 // Office.FileType.Compressed returns the doc in its native format (a .docx is
 // already a zip). Same slice-assembly pattern as the PDF export.
@@ -477,7 +491,7 @@ async function getDocumentAsDocxBlob() {
             file.closeAsync();
             return reject(new Error("getSliceAsync (docx) failed at " + idx));
           }
-          slices[idx] = sliceRes.value.data;
+          slices[idx] = decodeSliceData(sliceRes.value.data);
           received++;
           if (received === sliceCount) {
             file.closeAsync();
@@ -547,7 +561,7 @@ async function getDocumentAsPdfBlob() {
             file.closeAsync();
             return reject(new Error("getSliceAsync failed at " + idx));
           }
-          slices[idx] = sliceRes.value.data; // Uint8Array
+          slices[idx] = decodeSliceData(sliceRes.value.data);
           received++;
           if (received === sliceCount) {
             file.closeAsync();
