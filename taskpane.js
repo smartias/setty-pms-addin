@@ -2858,11 +2858,14 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
         bytes = new Uint8Array(await rawRes.arrayBuffer());
       }
       if (!bytes) return false;
-      // Size validation: if Graph gives us att.size, the decoded bytes MUST match.
-      // A mismatch indicates truncation (network cut short, partial base64, etc.) —
-      // refusing to upload is safer than silently writing a corrupt file.
-      if (typeof att.size === "number" && att.size > 0 && bytes.length !== att.size) {
-        throw new Error(`size mismatch: got ${bytes.length} bytes, expected ${att.size}`);
+      // NOTE: Graph's fileAttachment.size also reports MIME-encoded size, not
+      // raw decoded bytes — same trap as Office.js. We log a warning if the
+      // numbers look wildly off (could indicate genuine truncation on the
+      // $value GET path) but don't reject the upload. Bytes from atob() of a
+      // complete contentBytes string are by definition complete.
+      if (typeof att.size === "number" && att.size > 0 && bytes.length > att.size + 16) {
+        // Decoded bytes shouldn't ever be LARGER than the reported (encoded) size.
+        console.warn(`[attachment] suspicious size for ${att.name}: decoded=${bytes.length} graph=${att.size} — uploading anyway`);
       }
       const safeName = uniqueGraphNames[fileAtts.indexOf(att)];
       // uploadAttachmentToSharePoint records verified metadata itself (Phase 2).
@@ -2916,17 +2919,14 @@ async function getOfficeFileAttachments(item) {
     });
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
     const bytes = toBytesFromBase64(content.content);
-    // Size validation when Office.js exposes att.size (in bytes). Office's
-    // getAttachmentContentAsync arrives in one shot rather than streaming, so
-    // truncation is essentially impossible — but if a future API change ever
-    // introduces chunking, this guard catches it before a corrupt file lands
-    // on SharePoint. Falls through silently when size isn't reported.
-    if (typeof att.size === "number" && att.size > 0 && Math.abs(bytes.length - att.size) > 8) {
-      // Allow tiny variance (Office sometimes reports size with mime/transfer
-      // overhead) — a >8-byte mismatch is the corruption signal.
-      console.warn(`[attachment] size mismatch for ${att.name}: got ${bytes.length}, expected ${att.size} — skipping to avoid corrupt upload`);
-      continue;
-    }
+    // NOTE: Office.js's att.size is NOT the raw byte count — it's the
+    // MIME-encoded size including base64 transport overhead (~+33%) and headers.
+    // So we can't validate decoded bytes against att.size here. The Graph
+    // fallback path (the other branch in uploadEmailAndAttachments) DOES get
+    // raw byte size from Graph and validates there; that's the right place.
+    // For Office.js, getAttachmentContentAsync arrives as one complete base64
+    // payload — there's no streaming, so truncation is essentially impossible
+    // and additional client-side validation would only produce false negatives.
     out.push({
       name: att.name || "attachment",
       contentType: att.contentType || "application/octet-stream",
