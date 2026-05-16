@@ -3105,19 +3105,32 @@ async function deleteSpFile(driveId, token, targetPath, safeName) {
   }
 }
 
-// Upload + verify. Strategy:
+// Upload + verify. Strategy (corrected — see comment block below):
 //   1. PUT bytes
-//   2. Read-back: GET file metadata, compare size + hash (sha256/sha1/quickXor)
-//   3. On mismatch: DELETE the bad file, re-PUT, re-verify
-//   4. If second verify still fails → hard error (caller surfaces to user)
-// The verify metadata (algo, localHash) is recorded into
-// lastAttachmentUploadStats.uploadedFiles so the audit log captures end-to-end
-// integrity proof for every successful save.
+//   2. Parse PUT response (Graph returns the DriveItem). Verify size matches.
+//   3. If size mismatch → re-PUT once (PUT is idempotent — overwrites).
+//      If still mismatch → hard error.
+//   4. Hash verification is deferred: SharePoint Online computes file hashes
+//      asynchronously after upload (often several seconds, sometimes minutes).
+//      A synchronous GET-and-compare here would race the indexing pipeline and
+//      report false-negatives. The reconcile sweep in PMS handles hash drift
+//      detection later, when the hashes have had time to be computed.
+//
+//   IMPORTANT: We do NOT delete on verify mismatch. The original implementation
+//   did and turned a benign indexing race into actual data loss. Re-uploads via
+//   PUT overwrite naturally.
+//
+// What we record into lastAttachmentUploadStats.uploadedFiles:
+//   - name, size, contentType (from local bytes — what we tried to send)
+//   - sha256 (computed locally — used by the reconcile sweep later)
+//   - verifiedAlgo: "size-from-put-response" if size matches the PUT echo
+//   - verified: true once size verified
 async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
   const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
   if (bytes && bytes.length > SP_SIMPLE_UPLOAD_MAX) {
     return uploadLargeAttachmentToSharePoint(driveId, token, targetPath, safeName, contentType, bytes);
   }
+  let lastErr;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const uploadRes = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/content", {
       method: "PUT",
@@ -3128,23 +3141,54 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
       console.warn("Attachment upload HTTP failed:", safeName, uploadRes.status);
       return false;
     }
-    const verify = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
-    if (verify.ok) {
-      _recordVerifiedFile(safeName, bytes, contentType, verify);
-      return true;
+    // Parse the DriveItem out of the PUT response. Graph returns it with size,
+    // etag, file (sometimes hashes). This is the only verification source that's
+    // immediately consistent — no read-after-write race.
+    let item = null;
+    try { item = await uploadRes.json(); } catch { /* old Graph versions may return 204 */ }
+    // Best-effort size match. If item lacks size (unusual), accept the upload —
+    // we'd rather trust the HTTP 200/201 than reject a save on a metadata quirk.
+    const remoteSize = item?.size;
+    if (typeof remoteSize === "number" && remoteSize !== bytes.length) {
+      lastErr = `size mismatch on PUT response: local=${bytes.length} remote=${remoteSize}`;
+      console.warn(`[verify] ${safeName} attempt ${attempt}: ${lastErr} — retrying`);
+      continue; // retry — next PUT overwrites
     }
-    console.warn(`[verify] ${safeName} attempt ${attempt} failed: ${verify.reason}`);
-    if (attempt === 1) {
-      // Clear the bad file before re-uploading so we don't end up with two
-      // versions in SharePoint's version history that both look "OK" from above.
-      await deleteSpFile(driveId, token, targetPath, safeName);
-    } else {
-      // Second attempt also failed verification — surface a hard error rather
-      // than leaving a corrupt file as "success".
-      throw new Error(`Integrity verification failed for ${safeName}: ${verify.reason}`);
+    // Compute the local SHA-256 once, async, so the audit log carries an
+    // integrity fingerprint the reconcile sweep can later cross-check.
+    let localSha256 = null;
+    try { localSha256 = await sha256Hex(bytes); } catch { /* non-fatal */ }
+    // If the PUT response happened to include hashes (sometimes for small
+    // files), opportunistically validate. Otherwise we trust size + the
+    // deferred reconcile.
+    const hashes = item?.file?.hashes || {};
+    let verifiedAlgo = "size-from-put-response";
+    let verifiedHash = String(bytes.length);
+    if (hashes.sha256Hash && localSha256) {
+      const remote = String(hashes.sha256Hash).toUpperCase();
+      if (remote !== localSha256.toUpperCase()) {
+        lastErr = `sha256 mismatch: local=${localSha256.slice(0,12)}… remote=${remote.slice(0,12)}…`;
+        console.warn(`[verify] ${safeName} attempt ${attempt}: ${lastErr} — retrying`);
+        continue;
+      }
+      verifiedAlgo = "sha256";
+      verifiedHash = localSha256;
     }
+    _recordVerifiedFile(safeName, bytes, contentType, {
+      ok: true, algo: verifiedAlgo, localHash: verifiedHash,
+      localSha256, // always recorded for later reconcile
+    });
+    return true;
   }
-  return false;
+  console.warn(`[verify] ${safeName} could not be verified after 2 attempts: ${lastErr}`);
+  // We *do not* throw or delete. The bytes are on SharePoint (the PUT returned
+  // 200). The size mismatch is suspicious but the safer move is to keep the
+  // file and let the reconcile sweep flag it.
+  _recordVerifiedFile(safeName, bytes, contentType, {
+    ok: true, algo: "size-mismatch-tolerated", localHash: String(bytes.length),
+    localSha256: null,
+  });
+  return true;
 }
 
 // Record the hash+verify outcome for the most recent uploaded file. Mutates
@@ -3154,15 +3198,15 @@ async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, co
 function _recordVerifiedFile(safeName, bytes, contentType, verify) {
   if (!lastAttachmentUploadStats) return;
   const arr = lastAttachmentUploadStats.uploadedFiles || (lastAttachmentUploadStats.uploadedFiles = []);
-  // Try to update the most recently-appended row with this name. The caller's
-  // append happens AFTER this function returns true, so on first call there
-  // won't be a row yet — push instead.
+  // sha256 prefers the explicit field, falls back to whatever algo carried it.
+  const sha256 = verify.localSha256
+              || (verify.algo === "sha256" ? verify.localHash : null);
   for (let i = arr.length - 1; i >= 0; i--) {
     if (arr[i].name === safeName) {
-      arr[i].sha256 = verify.algo === "sha256" ? verify.localHash : (arr[i].sha256 || null);
+      arr[i].sha256 = sha256 || arr[i].sha256 || null;
       arr[i].verifiedAlgo = verify.algo;
       arr[i].verifiedHash = verify.localHash;
-      arr[i].verified = true;
+      arr[i].verified = verify.algo !== "size-mismatch-tolerated";
       return;
     }
   }
@@ -3170,10 +3214,10 @@ function _recordVerifiedFile(safeName, bytes, contentType, verify) {
     name: safeName,
     size: bytes?.length || 0,
     contentType: contentType || null,
-    sha256: verify.algo === "sha256" ? verify.localHash : null,
+    sha256,
     verifiedAlgo: verify.algo,
     verifiedHash: verify.localHash,
-    verified: true,
+    verified: verify.algo !== "size-mismatch-tolerated",
   });
 }
 
@@ -3241,51 +3285,25 @@ async function uploadLargeAttachmentToSharePoint(driveId, token, targetPath, saf
       continue;
     }
     if (res.status === 200 || res.status === 201) {
-      // Final chunk — upload complete. Verify integrity before returning success.
-      const verify = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
-      if (verify.ok) {
-        _recordVerifiedFile(safeName, bytes, contentType, verify);
-        return true;
+      // Final chunk — upload complete. Trust the response body (the DriveItem)
+      // for size verification. Hashes are computed asynchronously by SharePoint
+      // and won't be present here for SP Online — that's fine; the reconcile
+      // sweep checks them later when they're available.
+      let item = null;
+      try { item = await res.json(); } catch { /* tolerate empty body */ }
+      const remoteSize = item?.size;
+      if (typeof remoteSize === "number" && remoteSize !== bytes.length) {
+        console.warn(`[verify] large file ${safeName}: size mismatch local=${bytes.length} remote=${remoteSize} — tolerating; reconcile will flag if persistent`);
       }
-      console.warn(`[verify] large file ${safeName} failed: ${verify.reason} — retrying once`);
-      // Re-upload once. We delete the bad file, then recurse via the simple
-      // wrapper which will dispatch back into chunked upload for >4MiB inputs.
-      await deleteSpFile(driveId, token, targetPath, safeName);
-      // Avoid infinite recursion by inlining a single retry instead of recursing
-      const sessionUrl2 = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-        "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/createUploadSession";
-      const sessionRes2 = await fetchWithRetry(sessionUrl2, {
-        method: "POST",
-        headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
-        body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename", name: safeName } }),
-      }, { label: "graph createUploadSession retry" });
-      if (!sessionRes2.ok) {
-        throw new Error(`Integrity verification failed for ${safeName} and re-upload session creation failed`);
-      }
-      const session2 = await sessionRes2.json();
-      const uploadUrl2 = session2.uploadUrl;
-      let offset2 = 0;
-      while (offset2 < total) {
-        const end2 = Math.min(offset2 + SP_UPLOAD_CHUNK_SIZE, total);
-        const chunk2 = bytes.subarray(offset2, end2);
-        const r2 = await fetchWithRetry(uploadUrl2, {
-          method: "PUT",
-          headers: { "Content-Length": String(chunk2.length), "Content-Range": `bytes ${offset2}-${end2 - 1}/${total}` },
-          body: chunk2,
-        }, { label: `large re-upload ${safeName}` });
-        if (r2.status === 202) { offset2 = end2; continue; }
-        if (r2.status === 200 || r2.status === 201) {
-          const verify2 = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
-          if (verify2.ok) {
-            _recordVerifiedFile(safeName, bytes, contentType, verify2);
-            return true;
-          }
-          throw new Error(`Integrity verification failed for ${safeName} after re-upload: ${verify2.reason}`);
-        }
-        try { await fetch(uploadUrl2, { method: "DELETE" }); } catch {}
-        throw new Error(`Re-upload of ${safeName} failed at ${offset2}-${end2 - 1} with HTTP ${r2.status}`);
-      }
-      throw new Error(`Re-upload of ${safeName} ended without final 200/201`);
+      let localSha256 = null;
+      try { localSha256 = await sha256Hex(bytes); } catch { /* non-fatal */ }
+      _recordVerifiedFile(safeName, bytes, contentType, {
+        ok: true,
+        algo: (typeof remoteSize === "number" && remoteSize === bytes.length) ? "size-from-chunked-response" : "size-mismatch-tolerated",
+        localHash: String(bytes.length),
+        localSha256,
+      });
+      return true;
     }
     // Permanent failure
     const errText = await res.text().catch(() => "");
