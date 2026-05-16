@@ -325,6 +325,9 @@ function loadItemContext() {
   emailParticipants = [];
   // Per-item ✓ "added this session" marks reset when item changes
   _sessionSavedContactEmails.clear();
+  // Drop the per-item Graph caches (email body, etc.) so a different item
+  // can't accidentally serve cached body HTML from the previous one. Cheap.
+  if (typeof clearEmailBodyCache === "function") clearEmailBodyCache();
   // Custom SharePoint folder name is per-email; clear when switching emails so
   // last email's chosen name doesn't accidentally get applied to a new save.
   _customSpFolderName = "";
@@ -907,13 +910,18 @@ async function onSignedIn() {
   await loadProjects();
   await restoreProjectSelectionForCurrentEmail();
   updateProjectQuickLinks();
+  // Surface any saves that didn't complete on a previous session.
+  try { showPendingFilingBanner(); } catch (e) { console.warn("[filing-queue] banner render failed:", e.message); }
 }
-async function getToken() {
+async function getToken(forceRefresh = false) {
   const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
   if (!account) throw new Error("Not signed in");
   msalAccount = account;
   try {
-    const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account });
+    // forceRefresh bypasses MSAL's cached AT — used after a 401 to recover
+    // from server-side token revocation or clock-skew issues that the local
+    // cache thinks are still valid.
+    const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account, forceRefresh });
     return r.accessToken;
   } catch {
     const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
@@ -1003,8 +1011,8 @@ async function loadProjects() {
   // authoritative and the legacy row becomes a static safety net.
   try {
     const [pRes, cRes] = await Promise.all([
-      fetch(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }),
-      fetch(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }),
+      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }, { label: "sb loadProjects v2 projects" }),
+      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }, { label: "sb loadProjects v2 clients" }),
     ]);
     if (pRes.ok && cRes.ok) {
       const pRows = await pRes.json();
@@ -1035,9 +1043,9 @@ async function loadProjects() {
   }
   // Legacy fallback
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", {
+    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", {
       headers: SB_HEADERS,
-    });
+    }, { label: "sb loadProjects legacy" });
     const rows = await res.json();
     if (!rows || !rows[0]) return;
     allProjects = (rows[0].projects || []).filter(p => !p.archived);
@@ -1048,11 +1056,11 @@ async function loadProjects() {
   }
 }
 async function saveToSupabase(updatedProjects) {
-  await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
+  await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
     method: "PATCH",
     headers: SB_HEADERS,
     body: JSON.stringify({ projects: updatedProjects, updated_at: new Date().toISOString() }),
-  });
+  }, { label: "sb saveToSupabase" });
 }
 
 // ─── V2 SAVE GUARD (per-project rows + optimistic concurrency) ───────────────
@@ -1081,7 +1089,7 @@ const _projectVersionCache = new Map();
 
 async function fetchFreshProjectV2(projectId) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(projectId) + "&select=project,version";
-  const res = await fetch(url, { headers: SB_HEADERS });
+  const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb fetchFreshProject" });
   if (!res.ok) throw new Error("pms_projects GET HTTP " + res.status);
   const rows = await res.json();
   if (!rows || rows.length === 0) return null; // not migrated yet
@@ -1092,7 +1100,7 @@ async function fetchFreshProjectV2(projectId) {
 async function saveProjectRowV2(project, expectedVersion) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(project.id) +
               "&version=eq." + expectedVersion;
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "PATCH",
     headers: { ...SB_HEADERS, "Prefer": "return=representation" },
     body: JSON.stringify({
@@ -1100,7 +1108,7 @@ async function saveProjectRowV2(project, expectedVersion) {
       version: expectedVersion + 1,
       updated_at: new Date().toISOString(),
     }),
-  });
+  }, { label: "sb saveProjectRow" });
   if (!res.ok) throw new Error("pms_projects PATCH HTTP " + res.status);
   const result = await res.json();
   if (!result || result.length === 0) {
@@ -1120,9 +1128,9 @@ async function saveProjectRowV2(project, expectedVersion) {
 async function legacyApplyLocalChangeAndSave(projectId, mutateProject) {
   let freshProjects;
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", {
+    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects", {
       headers: SB_HEADERS,
-    });
+    }, { label: "sb legacyApply read" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const rows = await res.json();
     freshProjects = (rows?.[0]?.projects) || [];
@@ -1149,7 +1157,7 @@ let _migrationKnownComplete = false;
 async function _checkAddinMigrationStatus() {
   if (_migrationKnownComplete) return true;
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.migration_status&select=data", { headers: SB_HEADERS });
+    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.migration_status&select=data", { headers: SB_HEADERS }, { label: "sb migration status", maxAttempts: 2 });
     if (!res.ok) return false;
     const rows = await res.json();
     if (rows?.[0]?.data?.v1_complete) {
@@ -1205,11 +1213,11 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
     try {
       const mutated = mutateProject({ id: projectId });
       if (!mutated?.id) throw new Error("mutator returned invalid project");
-      const res = await fetch(SUPABASE_URL + "/rest/v1/pms_projects", {
+      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects", {
         method: "POST",
         headers: SB_HEADERS,
         body: JSON.stringify({ id: projectId, project: mutated, version: 1, updated_at: new Date().toISOString() }),
-      });
+      }, { label: "sb pms_projects insert" });
       if (!res.ok) throw new Error("pms_projects POST HTTP " + res.status);
       _projectVersionCache.set(projectId, 1);
       allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
@@ -1249,11 +1257,11 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
   // was missing from the search index. The email is still in the project
   // record (saved by applyLocalChangeAndSave above), just not indexed for
   // PMS-side search until a re-save.
-  const res = await fetch(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE, {
+  const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE, {
     method: "POST",
     headers: { ...SB_HEADERS, Prefer: "return=minimal" },
     body: JSON.stringify(row),
-  });
+  }, { label: "sb project_emails insert" });
   if (!res.ok) {
     const errText = await res.text();
     throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
@@ -1262,6 +1270,219 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
 }
+
+// ─── FILING INTEGRITY: AUDIT LOG ─────────────────────────────────────────────
+// Every filing operation (Save SP, Log RFI, Log Submittal, Log Note, …) writes
+// a row to pms_filing_log so we have a permanent record of WHAT was filed,
+// WHERE, and WHETHER VERIFICATION SUCCEEDED. The log is the foundation for
+// (a) the reconcile sweep that PMS runs on open and (b) the resume-from-crash
+// path in the failed-upload queue.
+//
+// Logging is fire-and-forget: a logging failure must NEVER block a save. We
+// always console.warn but never throw to the caller.
+const FILING_LOG_TABLE = "pms_filing_log";
+const CLIENT_VERSION_STRING = (typeof window !== "undefined" && window.__appVersion) ? String(window.__appVersion) : "addin";
+
+function _getCurrentUserEmail() {
+  try { return msalAccount?.username || ""; } catch { return ""; }
+}
+
+// Write a single audit-log row. `record` shape:
+//   {
+//     project_id:     "<uuid>",                              // required
+//     msg_id:         "<itemId>" | null,
+//     operation:      "email-sp" | "rfi-new" | …,            // required
+//     sp_folder_url:  "<url>" | null,
+//     files:          [{ name, size, sha256, contentType, verified }],
+//     email_subject:  "<subject>",
+//     status:         "success" | "verified" | "failed" | "partial" | "queued" | "retrying",  // required
+//     error:          "<message>" | null,
+//     retried:        <int>,
+//   }
+async function logFilingOp(record) {
+  if (!record || !record.project_id || !record.operation || !record.status) {
+    console.warn("[filing-log] dropped malformed record:", record);
+    return null;
+  }
+  const row = {
+    project_id:     record.project_id,
+    msg_id:         record.msg_id || null,
+    operation:      record.operation,
+    sp_folder_url:  record.sp_folder_url || null,
+    files:          record.files || null,
+    email_subject:  record.email_subject || null,
+    status:         record.status,
+    error:          record.error ? String(record.error).slice(0, 1000) : null,
+    user_email:     _getCurrentUserEmail(),
+    client_version: CLIENT_VERSION_STRING,
+    retried:        record.retried || 0,
+  };
+  try {
+    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + FILING_LOG_TABLE, {
+      method: "POST",
+      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+      body: JSON.stringify(row),
+    }, { label: "sb filing-log insert", maxAttempts: 2 });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.warn("[filing-log] insert failed:", res.status, txt.slice(0, 200));
+      return null;
+    }
+    return true;
+  } catch (e) {
+    console.warn("[filing-log] insert threw (non-fatal):", e.message);
+    return null;
+  }
+}
+
+// Convenience: GET recent filing-log rows for a project. Used by the reconcile
+// sweep in PMS (not the add-in), but kept here so the row shape stays in sync.
+async function fetchRecentFilingLog(projectId, sinceIso) {
+  try {
+    const sinceClause = sinceIso ? "&created_at=gte." + encodeURIComponent(sinceIso) : "";
+    const url = SUPABASE_URL + "/rest/v1/" + FILING_LOG_TABLE +
+      "?project_id=eq." + encodeURIComponent(projectId) +
+      "&order=created_at.desc" +
+      sinceClause +
+      "&limit=200";
+    const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb filing-log fetch", maxAttempts: 2 });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (e) {
+    console.warn("[filing-log] fetch failed:", e.message);
+    return [];
+  }
+}
+
+// ─── FILING INTEGRITY: CRASH-RECOVERY QUEUE ─────────────────────────────────
+// localStorage map of saves currently in flight. We can't rely on the audit
+// log alone to detect interrupted saves — if the browser/tab crashes between
+// the PUT and the log-row insert, no row ever lands. So at the start of every
+// save flow we add an entry to this map; on success we delete it. On taskpane
+// open, any leftover entries indicate "a save was interrupted — retry it."
+//
+// Entry shape: { queueId, project_id, project_name, msg_id, operation,
+//                email_subject, started_at, attempts }
+// Map shape: { [queueId]: entry }
+const FILING_QUEUE_KEY = "settyPms:filingQueue";
+
+function _readFilingQueue() {
+  try { return JSON.parse(localStorage.getItem(FILING_QUEUE_KEY) || "{}"); } catch { return {}; }
+}
+function _writeFilingQueue(q) {
+  try { localStorage.setItem(FILING_QUEUE_KEY, JSON.stringify(q)); } catch (e) {
+    console.warn("[filing-queue] write failed:", e.message);
+  }
+}
+
+function enqueueFilingIntent(entry) {
+  if (!entry || !entry.project_id || !entry.operation) return null;
+  const queueId = entry.queueId || (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7));
+  const q = _readFilingQueue();
+  q[queueId] = {
+    queueId,
+    project_id:    entry.project_id,
+    project_name:  entry.project_name || "",
+    msg_id:        entry.msg_id || null,
+    operation:     entry.operation,
+    email_subject: entry.email_subject || "",
+    started_at:    new Date().toISOString(),
+    attempts:      (q[queueId]?.attempts || 0) + 1,
+  };
+  _writeFilingQueue(q);
+  return queueId;
+}
+
+function dequeueFilingIntent(queueId) {
+  if (!queueId) return;
+  const q = _readFilingQueue();
+  if (q[queueId]) {
+    delete q[queueId];
+    _writeFilingQueue(q);
+  }
+}
+
+// Returns array of entries that have been pending too long ("orphaned"). The
+// definition of "too long" is a generous 60s — anything older than that on
+// taskpane open is almost certainly a crash from a previous session, not an
+// in-flight save from the current one.
+function getOrphanedFilingIntents() {
+  const q = _readFilingQueue();
+  const now = Date.now();
+  const out = [];
+  for (const id in q) {
+    const entry = q[id];
+    const age = now - new Date(entry.started_at).getTime();
+    if (age > 60 * 1000) out.push(entry);
+  }
+  return out;
+}
+
+// Best-effort: prune entries older than 7 days. They're stale enough that the
+// user has presumably moved on; we don't want to nag forever.
+function pruneAncientFilingIntents() {
+  const q = _readFilingQueue();
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  let changed = false;
+  for (const id in q) {
+    if (new Date(q[id].started_at).getTime() < cutoff) {
+      delete q[id];
+      changed = true;
+    }
+  }
+  if (changed) _writeFilingQueue(q);
+}
+
+// Banner UI: show pending entries on the main view with a Dismiss button.
+// We deliberately don't auto-resume — the user has to consciously open the
+// email and click Save again. That avoids surprising re-uploads and keeps
+// the recovery path simple (no Graph-only fetch + reconstruction logic).
+function showPendingFilingBanner() {
+  pruneAncientFilingIntents();
+  const pending = getOrphanedFilingIntents();
+  const banner = document.getElementById("filingPendingBanner");
+  if (!banner) {
+    // First-time render — inject the banner into the DOM
+    const mainView = document.getElementById("mainView");
+    if (!mainView) return;
+    const el = document.createElement("div");
+    el.id = "filingPendingBanner";
+    el.style.cssText = "display:none;background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:8px 12px;margin:8px 12px;border-radius:6px;font-size:12px;";
+    mainView.insertBefore(el, mainView.firstChild);
+  }
+  const b = document.getElementById("filingPendingBanner");
+  if (pending.length === 0) { b.style.display = "none"; return; }
+  const lines = pending.slice(0, 5).map(e =>
+    `<div style="margin:4px 0">⚠ <strong>${e.operation}</strong> · ${(e.email_subject || "(no subject)").replace(/</g, "&lt;").slice(0, 60)} — interrupted ${_relativeTime(e.started_at)}</div>`
+  );
+  const moreNote = pending.length > 5 ? `<div style="margin-top:4px;opacity:0.7">…and ${pending.length - 5} more</div>` : "";
+  b.innerHTML = `
+    <div style="font-weight:600;margin-bottom:4px">${pending.length} previous save${pending.length === 1 ? "" : "s"} did not complete</div>
+    ${lines.join("")}
+    ${moreNote}
+    <div style="margin-top:6px;display:flex;gap:8px">
+      <button id="filingBannerDismiss" style="font-size:11px;padding:3px 9px;border:1px solid #d97706;background:#fff;border-radius:4px;cursor:pointer">Dismiss all</button>
+      <span style="font-size:11px;opacity:0.7;align-self:center">Open the email in Outlook and click Save again to retry.</span>
+    </div>
+  `;
+  b.style.display = "";
+  const dismissBtn = document.getElementById("filingBannerDismiss");
+  if (dismissBtn) {
+    dismissBtn.onclick = () => {
+      _writeFilingQueue({});
+      b.style.display = "none";
+    };
+  }
+}
+
+function _relativeTime(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60 * 1000) return "just now";
+  if (ms < 60 * 60 * 1000) return Math.floor(ms / 60000) + "m ago";
+  if (ms < 24 * 60 * 60 * 1000) return Math.floor(ms / 3600000) + "h ago";
+  return Math.floor(ms / 86400000) + "d ago";
+}
+
 function getEmailProjectMap() {
   try {
     return JSON.parse(localStorage.getItem(EMAIL_PROJECT_MAP_STORAGE_KEY) || "{}");
@@ -1928,17 +2149,61 @@ function getClientByEmail(email) {
     return !!domain && contacts.some(ct => (ct.email || "").toLowerCase().endsWith("@" + domain));
   }) || null;
 }
+// ─── TRANSIENT-FAILURE RETRY HELPER ──────────────────────────────────────────
+// Single shared exponential-backoff wrapper. Retries network failures, 429,
+// 503, 504. Honors Retry-After if Graph or Supabase provides it. Capped at
+// 15s per wait so the taskpane never appears hung.
+async function fetchWithRetry(url, init, opts = {}) {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const label = opts.label || "fetch";
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, init);
+      if (res.status === 429 || res.status === 503 || res.status === 504) {
+        if (attempt === maxAttempts) return res;
+        const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
+        const wait = retryAfter > 0
+          ? Math.min(15000, retryAfter * 1000)
+          : Math.min(15000, 500 * Math.pow(2, attempt));
+        console.warn(`[retry:${label}] ${res.status} — waiting ${wait}ms (attempt ${attempt}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt === maxAttempts) throw e;
+      const wait = Math.min(15000, 500 * Math.pow(2, attempt));
+      console.warn(`[retry:${label}] network error — waiting ${wait}ms (attempt ${attempt}/${maxAttempts}): ${e.message}`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastErr || new Error(`${label}: exhausted retries`);
+}
+
 // ─── GRAPH HELPERS ────────────────────────────────────────────────────────────
 async function graphFetch(method, path, body, token) {
   const t = token || await getToken();
-  const res = await fetch("https://graph.microsoft.com/v1.0" + path, {
+  const makeReq = (tok) => fetchWithRetry("https://graph.microsoft.com/v1.0" + path, {
     method,
     headers: {
-      "Authorization": "Bearer " + t,
+      "Authorization": "Bearer " + tok,
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
-  });
+  }, { label: "graph " + method });
+
+  let res = await makeReq(t);
+  // 401 → force-refresh token + retry once. Long-running saves (slow VPN,
+  // big attachments) can outlive MSAL's ~45 min token TTL — without this
+  // refresh, the save fails with a useless "Graph 401" near the end.
+  if (res.status === 401) {
+    try {
+      const fresh = await getToken(true);
+      res = await makeReq(fresh);
+    } catch { /* fall through to error path below */ }
+  }
   if (!res.ok) {
     const err = await res.text();
     throw new Error("Graph " + res.status + ": " + err.slice(0, 200));
@@ -1949,13 +2214,37 @@ async function resolveSpIds() {
   // IDs are hardcoded — no Graph API call needed, no Sites.Read.All required.
   return _spIds;
 }
+// Per-itemId cache for getEmailBodyHtml. Same email saved twice (e.g., retry
+// after a transient error) skips the second Graph round-trip — big win on
+// retry paths and double-action flows (Save SP then Log as Note in succession).
+// Cleared on item switch (loadItemContext).
+const _emailBodyCache = new Map();
+function clearEmailBodyCache() { _emailBodyCache.clear(); }
 async function getEmailBodyHtml(token) {
   try {
     const msgId = Office.context.mailbox.item.itemId;
+    if (_emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
     const restId = Office.context.mailbox.convertToRestId(msgId, Office.MailboxEnums.RestVersion.v2_0);
     const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token);
-    return data?.body?.content || "";
+    const body = data?.body?.content || "";
+    if (body) _emailBodyCache.set(msgId, body);
+    return body;
   } catch { return ""; }
+}
+
+// In-memory idempotency cache for OneNote page creation (5-minute TTL).
+// Prevents duplicate pages when a 5xx response masks a server-side success
+// and the retry loop reposts. Keyed by url + html-prefix hash.
+const _addinOneNoteCache = new Map();
+const ADDIN_ONENOTE_DEDUP_TTL_MS = 5 * 60 * 1000;
+function _hashOneNoteReq(url, html) {
+  let h = 2166136261;
+  const s = url + "|" + html.slice(0, 2000);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
 }
 
 // Phase 3: compress HTML email body to base64 deflate before storing in the
@@ -2441,18 +2730,34 @@ function spDrivePath(spFolderUrl) {
   return decodeURIComponent(spFolderUrl.slice(base.length));
 }
 // Build the email HTML file content from the current emailItem
-function buildEmailHtml(bodyHtml) {
-  const from = emailItem.from;
+// `item` is the Office mailbox-item snapshot captured by the caller. Falls
+// back to the module global when undefined for legacy callers.
+function buildEmailHtml(bodyHtml, item) {
+  const src = item || emailItem;
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[c]);
+  const from = src?.from;
   const header = `<div style="font-family:sans-serif;font-size:12px;padding:12px 16px;border-bottom:1px solid #ddd;margin-bottom:16px">
-    <strong>Subject:</strong> ${emailItem.subject || ""}<br>
-    <strong>From:</strong> ${from?.displayName || ""} &lt;${from?.emailAddress || ""}&gt;<br>
-    <strong>Date:</strong> ${new Date(emailItem.dateTimeCreated).toLocaleString()}
+    <strong>Subject:</strong> ${esc(src?.subject)}<br>
+    <strong>From:</strong> ${esc(from?.displayName)} &lt;${esc(from?.emailAddress)}&gt;<br>
+    <strong>Date:</strong> ${esc(new Date(src?.dateTimeCreated).toLocaleString())}
   </div>`;
   return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + header + (bodyHtml || "<p style='color:#666;font-style:italic;padding:8px 12px;background:#f5f5f5;border-left:3px solid #ccc;'>No body content &mdash; this email may be a system notification, share invite, or attachment-only message.</p>") + "</body></html>";
 }
 // Upload email.html + any attachments into targetPath. Returns attachment count.
-async function uploadEmailAndAttachments(driveId, token, targetPath) {
-  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [] };
+//
+// `itemSnapshot` MUST be the Office mailbox item captured by the caller before
+// any awaits. Without it, this function would read the module-level `emailItem`
+// global which Office may have silently swapped (pinned-pane item switch),
+// causing attachment bytes from a *different* email to be uploaded under the
+// current email's folder. That's the worst kind of corruption — looks right,
+// is wrong.
+async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapshot) {
+  const item = itemSnapshot || emailItem; // fallback for legacy callers
+  // uploadedFiles[]: per-file metadata for the audit log. Each successful upload
+  // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
+  // sha256 + verified once read-back lands.
+  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [] };
   const bodyHtml = await getEmailBodyHtml(token);
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
@@ -2461,14 +2766,11 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
     {
       method: "PUT",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
-      body: buildEmailHtml(bodyHtml),
+      body: buildEmailHtml(bodyHtml, item),
     }
   );
 
   // Quick-Win #3: parallelize attachment uploads with bounded concurrency.
-  // Graph throttles aggressively above ~5 parallel writes per session; 3 is
-  // a safe ceiling that gives meaningful speedup (~3x for emails with 5+
-  // attachments) without triggering 429 backoff.
   const ATTACHMENT_CONCURRENCY = 3;
   async function uploadInBatches(items, doUpload) {
     const failures = [];
@@ -2477,23 +2779,52 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
       const batch = items.slice(i, i + ATTACHMENT_CONCURRENCY);
       const results = await Promise.allSettled(batch.map(doUpload));
       results.forEach((r, idx) => {
-        const item = batch[idx];
+        const it = batch[idx];
         if (r.status === "fulfilled" && r.value) succeeded++;
-        else failures.push((item.name || "attachment") + (r.status === "rejected" ? " (" + (r.reason?.message || "error").slice(0, 60) + ")" : ""));
+        else failures.push((it.name || "attachment") + (r.status === "rejected" ? " (" + (r.reason?.message || "error").slice(0, 60) + ")" : ""));
       });
     }
     return { succeeded, failures };
   }
 
+  // De-collision: within a batch, if two attachments would produce the same
+  // sanitized filename (or collide with the reserved "email.html"), suffix
+  // the later ones with " (2)", " (3)", etc. Without this, a second image.png
+  // would silently overwrite the first.
+  function uniquifyNames(names) {
+    const taken = new Set(["email.html"]);
+    return names.map(rawName => {
+      const safe = (rawName || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
+      if (!taken.has(safe)) { taken.add(safe); return safe; }
+      const dot = safe.lastIndexOf(".");
+      const stem = dot > 0 ? safe.slice(0, dot) : safe;
+      const ext  = dot > 0 ? safe.slice(dot) : "";
+      for (let n = 2; n < 1000; n++) {
+        const candidate = `${stem} (${n})${ext}`;
+        if (!taken.has(candidate)) { taken.add(candidate); return candidate; }
+      }
+      return safe + "-" + Math.random().toString(36).slice(2, 7); // last resort
+    });
+  }
+
   try {
     let count = 0;
     // Prefer Outlook item APIs for attachment bytes; this is the most reliable in add-ins.
-    const officeAtts = await getOfficeFileAttachments();
+    // Critical: pass `item` (the snapshot) — getOfficeFileAttachments would otherwise
+    // re-read the module-level emailItem and could pick up a different email's attachments.
+    const officeAtts = await getOfficeFileAttachments(item);
     if (officeAtts.length) {
       lastAttachmentUploadStats.attempted = officeAtts.length;
+      const uniqueNames = uniquifyNames(officeAtts.map(a => a.name));
       const { succeeded, failures } = await uploadInBatches(
         officeAtts,
-        att => uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, att.bytes)
+        async (att) => {
+          const finalName = uniqueNames[officeAtts.indexOf(att)];
+          // uploadAttachmentToSharePoint records verified metadata into
+          // lastAttachmentUploadStats.uploadedFiles itself (Phase 2). No extra
+          // push needed here.
+          return uploadAttachmentToSharePoint(driveId, token, targetPath, finalName, att.contentType, att.bytes);
+        }
       );
       count = succeeded;
       lastAttachmentUploadStats.failed.push(...failures);
@@ -2503,12 +2834,11 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
       return count;
     }
     // Fallback to Graph attachment APIs when Office APIs are unavailable.
-    // Download bytes in parallel too — for large emails with many attachments,
-    // this is where most of the time was being spent.
-    const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+    const restId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
     const fileAtts = (attData?.value || []).filter(att => att["@odata.type"] === "#microsoft.graph.fileAttachment");
     lastAttachmentUploadStats.attempted = fileAtts.length;
+    const uniqueGraphNames = uniquifyNames(fileAtts.map(a => a.name));
 
     const { succeeded, failures } = await uploadInBatches(fileAtts, async (att) => {
       let bytes = null;
@@ -2517,9 +2847,10 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
         bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       } else if (att.id) {
-        const rawRes = await fetch(
+        const rawRes = await fetchWithRetry(
           "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
-          { headers: { "Authorization": "Bearer " + token } }
+          { headers: { "Authorization": "Bearer " + token } },
+          { label: "graph attachment $value" }
         );
         if (!rawRes.ok) {
           throw new Error("download " + rawRes.status);
@@ -2527,7 +2858,15 @@ async function uploadEmailAndAttachments(driveId, token, targetPath) {
         bytes = new Uint8Array(await rawRes.arrayBuffer());
       }
       if (!bytes) return false;
-      return uploadAttachmentToSharePoint(driveId, token, targetPath, att.name, att.contentType, bytes);
+      // Size validation: if Graph gives us att.size, the decoded bytes MUST match.
+      // A mismatch indicates truncation (network cut short, partial base64, etc.) —
+      // refusing to upload is safer than silently writing a corrupt file.
+      if (typeof att.size === "number" && att.size > 0 && bytes.length !== att.size) {
+        throw new Error(`size mismatch: got ${bytes.length} bytes, expected ${att.size}`);
+      }
+      const safeName = uniqueGraphNames[fileAtts.indexOf(att)];
+      // uploadAttachmentToSharePoint records verified metadata itself (Phase 2).
+      return uploadAttachmentToSharePoint(driveId, token, targetPath, safeName, att.contentType, bytes);
     });
     count = succeeded;
     lastAttachmentUploadStats.failed.push(...failures);
@@ -2547,10 +2886,17 @@ function toBytesFromBase64(base64) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
-async function getOfficeFileAttachments() {
-  if (!emailItem?.getAttachmentsAsync || !emailItem?.getAttachmentContentAsync) return [];
+// `item` MUST be passed in by the caller (a snapshot captured before any
+// awaits). Reading the module-level emailItem inside this loop was a
+// real-world corruption risk: Office swaps mailbox.item silently when the
+// user clicks a different email, and a getAttachmentContentAsync call
+// against the new item with an attachment ID from the old item produces
+// either an error or — worse — bytes that *look* valid but are wrong.
+async function getOfficeFileAttachments(item) {
+  item = item || emailItem;
+  if (!item?.getAttachmentsAsync || !item?.getAttachmentContentAsync) return [];
   const atts = await new Promise((resolve, reject) => {
-    emailItem.getAttachmentsAsync((res) => {
+    item.getAttachmentsAsync((res) => {
       if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
       else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
     });
@@ -2559,7 +2905,8 @@ async function getOfficeFileAttachments() {
   const out = [];
   for (const att of fileAtts) {
     const content = await new Promise((resolve, reject) => {
-      emailItem.getAttachmentContentAsync(att.id, (res) => {
+      // CRITICAL: use the captured `item`, not the live module global.
+      item.getAttachmentContentAsync(att.id, (res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
         else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
       });
@@ -2568,26 +2915,387 @@ async function getOfficeFileAttachments() {
       return null;
     });
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
+    const bytes = toBytesFromBase64(content.content);
+    // Size validation when Office.js exposes att.size (in bytes). Office's
+    // getAttachmentContentAsync arrives in one shot rather than streaming, so
+    // truncation is essentially impossible — but if a future API change ever
+    // introduces chunking, this guard catches it before a corrupt file lands
+    // on SharePoint. Falls through silently when size isn't reported.
+    if (typeof att.size === "number" && att.size > 0 && Math.abs(bytes.length - att.size) > 8) {
+      // Allow tiny variance (Office sometimes reports size with mime/transfer
+      // overhead) — a >8-byte mismatch is the corruption signal.
+      console.warn(`[attachment] size mismatch for ${att.name}: got ${bytes.length}, expected ${att.size} — skipping to avoid corrupt upload`);
+      continue;
+    }
     out.push({
       name: att.name || "attachment",
       contentType: att.contentType || "application/octet-stream",
-      bytes: toBytesFromBase64(content.content),
+      bytes,
     });
   }
   return out;
 }
-async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
-  const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
-  const uploadRes = await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/content", {
-    method: "PUT",
-    headers: { "Authorization": "Bearer " + token, "Content-Type": contentType || "application/octet-stream" },
-    body: bytes,
-  });
-  if (!uploadRes.ok) {
-    console.warn("Attachment upload failed:", safeName, uploadRes.status);
+// Graph's simple PUT to /content is capped at 4 MiB. Above that, Graph
+// returns 413 (or in some corner cases, just hangs) and the file fails to
+// upload. We auto-dispatch to the upload-session API for anything > threshold.
+const SP_SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024;          // 4 MiB
+const SP_UPLOAD_CHUNK_SIZE = 5 * 320 * 1024;           // 1.6 MiB — multiple of 320 KiB (Graph requirement)
+
+// ─── INTEGRITY HASHING ───────────────────────────────────────────────────────
+// SHA-256 of the local bytes via Web Crypto. Used by the read-back verification
+// step to confirm that what SharePoint stored matches what we sent. Returns
+// lowercase hex string. Cost on a 5MB file: ~30ms in Chrome.
+async function sha256Hex(bytes) {
+  if (!bytes || bytes.length === 0) return "";
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const view = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < view.length; i++) hex += view[i].toString(16).padStart(2, "0");
+  return hex;
+}
+
+// Microsoft Graph's QuickXorHash — a custom XOR-with-rotation digest used by
+// OneDrive/SharePoint. We only need this when sha256Hash isn't present on the
+// DriveItem (SharePoint's `file.hashes` facet usually returns quickXorHash by
+// default, sometimes sha1Hash; sha256Hash requires explicit enablement).
+// Spec: https://learn.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash
+// Implementation translated from the reference C# / Python.
+async function quickXorHashBase64(bytes) {
+  if (!bytes || bytes.length === 0) return "";
+  const BITS_IN_LAST_CELL = 32;
+  const SHIFT = 11;
+  const WIDTH_BITS = 160;
+  const WIDTH_BYTES = 20;
+  // We maintain 160 bits as 5 × 32-bit lanes (little-endian inside each lane).
+  const lanes = new Uint32Array(5);
+  let shiftSoFar = 0;
+  let lengthSoFar = 0;
+
+  // Rotate-left of the lanes array by `bits`. Done by streaming each input byte
+  // into a moving 8-bit window. For performance + readability we operate on
+  // 8-bit groups and recompute the destination bit/lane each step.
+  for (let i = 0; i < bytes.length; i++) {
+    const currentShift = shiftSoFar;
+    const vectorArrayIndex = Math.floor(currentShift / 32) % 5;
+    const vectorOffset = currentShift % 32;
+    const nextVectorIndex = (vectorArrayIndex + 1) % 5;
+    const xoredByte = bytes[i];
+    // Lower bits of the byte XOR into the current lane shifted into position.
+    lanes[vectorArrayIndex] = (lanes[vectorArrayIndex] ^ (xoredByte << vectorOffset)) >>> 0;
+    // Bits that overflow the lane go into the next lane.
+    if (vectorOffset > 24) {
+      lanes[nextVectorIndex] = (lanes[nextVectorIndex] ^ (xoredByte >>> (32 - vectorOffset))) >>> 0;
+    }
+    shiftSoFar = (shiftSoFar + SHIFT) % WIDTH_BITS;
+    lengthSoFar++;
+  }
+
+  // Finalize by XORing the message length (8 bytes, little-endian) into the
+  // last 64 bits of the 160-bit state.
+  const out = new Uint8Array(WIDTH_BYTES);
+  for (let i = 0; i < 5; i++) {
+    out[i * 4 + 0] = (lanes[i] >>>  0) & 0xff;
+    out[i * 4 + 1] = (lanes[i] >>>  8) & 0xff;
+    out[i * 4 + 2] = (lanes[i] >>> 16) & 0xff;
+    out[i * 4 + 3] = (lanes[i] >>> 24) & 0xff;
+  }
+  // XOR the message length (in bytes, as 8-byte LE) into the last 8 bytes
+  let len = lengthSoFar;
+  for (let i = 0; i < 8; i++) {
+    out[WIDTH_BYTES - 8 + i] ^= (len & 0xff);
+    len = Math.floor(len / 256);
+  }
+  // base64 of the 20 bytes
+  let bin = "";
+  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i]);
+  return btoa(bin);
+}
+
+// SHA-1 (still occasionally surfaced by Graph). Web Crypto handles it.
+async function sha1Hex(bytes) {
+  if (!bytes || bytes.length === 0) return "";
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  const view = new Uint8Array(digest);
+  let hex = "";
+  for (let i = 0; i < view.length; i++) hex += view[i].toString(16).padStart(2, "0");
+  return hex.toUpperCase(); // Graph reports SHA-1 in uppercase hex
+}
+
+// Fetch metadata for a just-uploaded file. Returns { size, hashes } or null.
+async function fetchSpFileMetadata(driveId, token, targetPath, safeName) {
+  try {
+    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
+      "/root:/" + encodeDrivePath(targetPath + "/" + safeName) +
+      "?select=size,file";
+    const res = await fetchWithRetry(url, {
+      headers: { "Authorization": "Bearer " + token },
+    }, { label: "graph verify GET", maxAttempts: 3 });
+    if (!res.ok) return null;
+    const item = await res.json();
+    return {
+      size:   item?.size ?? null,
+      hashes: item?.file?.hashes || {},
+    };
+  } catch (e) {
+    console.warn("[verify] metadata GET failed:", safeName, e.message);
+    return null;
+  }
+}
+
+// Verify a just-uploaded file matches the local bytes we tried to send.
+// Returns:
+//   { ok: true,  algo, localHash, remoteHash } — verified clean
+//   { ok: false, reason } — mismatch or unable to verify
+async function verifyUploadedFile(driveId, token, targetPath, safeName, bytes) {
+  const meta = await fetchSpFileMetadata(driveId, token, targetPath, safeName);
+  if (!meta) return { ok: false, reason: "metadata GET failed" };
+
+  // Size check — fastest, most important. Any mismatch here is a hard fail
+  // regardless of which hash algorithm the server reports.
+  if (typeof meta.size === "number" && meta.size !== bytes.length) {
+    return {
+      ok: false,
+      reason: `size mismatch: local=${bytes.length} remote=${meta.size}`,
+    };
+  }
+
+  const hashes = meta.hashes || {};
+  // Prefer SHA-256 (only present if the tenant has it enabled), then SHA-1
+  // (deprecated but widely present), then quickXorHash (the SharePoint default).
+  if (hashes.sha256Hash) {
+    const local = (await sha256Hex(bytes)).toUpperCase();
+    const remote = String(hashes.sha256Hash).toUpperCase();
+    return local === remote
+      ? { ok: true,  algo: "sha256", localHash: local, remoteHash: remote }
+      : { ok: false, reason: `sha256 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
+  }
+  if (hashes.sha1Hash) {
+    const local = await sha1Hex(bytes);
+    const remote = String(hashes.sha1Hash).toUpperCase();
+    return local === remote
+      ? { ok: true,  algo: "sha1", localHash: local, remoteHash: remote }
+      : { ok: false, reason: `sha1 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
+  }
+  if (hashes.quickXorHash) {
+    const local = await quickXorHashBase64(bytes);
+    const remote = String(hashes.quickXorHash);
+    return local === remote
+      ? { ok: true,  algo: "quickXor", localHash: local, remoteHash: remote }
+      : { ok: false, reason: `quickXor mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
+  }
+  // Server returned no hashes — fall back to size-only (already checked above
+  // and matched). Better than nothing.
+  return { ok: true, algo: "size-only", localHash: String(bytes.length), remoteHash: String(meta.size) };
+}
+
+// Delete an item at a path. Used by the verify-then-retry path when the
+// first upload landed corrupt and we need to clear the bad file before re-PUT.
+async function deleteSpFile(driveId, token, targetPath, safeName) {
+  try {
+    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
+      "/root:/" + encodeDrivePath(targetPath + "/" + safeName);
+    const res = await fetchWithRetry(url, {
+      method: "DELETE",
+      headers: { "Authorization": "Bearer " + token },
+    }, { label: "graph delete bad file", maxAttempts: 2 });
+    return res.ok || res.status === 404;
+  } catch (e) {
+    console.warn("[verify] delete failed:", safeName, e.message);
     return false;
   }
-  return true;
+}
+
+// Upload + verify. Strategy:
+//   1. PUT bytes
+//   2. Read-back: GET file metadata, compare size + hash (sha256/sha1/quickXor)
+//   3. On mismatch: DELETE the bad file, re-PUT, re-verify
+//   4. If second verify still fails → hard error (caller surfaces to user)
+// The verify metadata (algo, localHash) is recorded into
+// lastAttachmentUploadStats.uploadedFiles so the audit log captures end-to-end
+// integrity proof for every successful save.
+async function uploadAttachmentToSharePoint(driveId, token, targetPath, name, contentType, bytes) {
+  const safeName = (name || "attachment").replace(/[\\/:*?"<>|]/g, "-").trim() || "attachment";
+  if (bytes && bytes.length > SP_SIMPLE_UPLOAD_MAX) {
+    return uploadLargeAttachmentToSharePoint(driveId, token, targetPath, safeName, contentType, bytes);
+  }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const uploadRes = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/content", {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": contentType || "application/octet-stream" },
+      body: bytes,
+    }, { label: "graph upload " + safeName });
+    if (!uploadRes.ok) {
+      console.warn("Attachment upload HTTP failed:", safeName, uploadRes.status);
+      return false;
+    }
+    const verify = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
+    if (verify.ok) {
+      _recordVerifiedFile(safeName, bytes, contentType, verify);
+      return true;
+    }
+    console.warn(`[verify] ${safeName} attempt ${attempt} failed: ${verify.reason}`);
+    if (attempt === 1) {
+      // Clear the bad file before re-uploading so we don't end up with two
+      // versions in SharePoint's version history that both look "OK" from above.
+      await deleteSpFile(driveId, token, targetPath, safeName);
+    } else {
+      // Second attempt also failed verification — surface a hard error rather
+      // than leaving a corrupt file as "success".
+      throw new Error(`Integrity verification failed for ${safeName}: ${verify.reason}`);
+    }
+  }
+  return false;
+}
+
+// Record the hash+verify outcome for the most recent uploaded file. Mutates
+// the last entry of lastAttachmentUploadStats.uploadedFiles (which was just
+// appended by the caller in uploadInBatches) if it matches by name; otherwise
+// pushes a fresh entry. The dual-shape covers both the Office and Graph paths.
+function _recordVerifiedFile(safeName, bytes, contentType, verify) {
+  if (!lastAttachmentUploadStats) return;
+  const arr = lastAttachmentUploadStats.uploadedFiles || (lastAttachmentUploadStats.uploadedFiles = []);
+  // Try to update the most recently-appended row with this name. The caller's
+  // append happens AFTER this function returns true, so on first call there
+  // won't be a row yet — push instead.
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (arr[i].name === safeName) {
+      arr[i].sha256 = verify.algo === "sha256" ? verify.localHash : (arr[i].sha256 || null);
+      arr[i].verifiedAlgo = verify.algo;
+      arr[i].verifiedHash = verify.localHash;
+      arr[i].verified = true;
+      return;
+    }
+  }
+  arr.push({
+    name: safeName,
+    size: bytes?.length || 0,
+    contentType: contentType || null,
+    sha256: verify.algo === "sha256" ? verify.localHash : null,
+    verifiedAlgo: verify.algo,
+    verifiedHash: verify.localHash,
+    verified: true,
+  });
+}
+
+// Resumable upload for files > 4 MiB. Creates an upload session and PUTs
+// fixed-size chunks with Content-Range headers. Retries each chunk on 5xx
+// (the upload-session URL is durable across transient failures). Returns
+// true on full success, false on any irrecoverable failure.
+async function uploadLargeAttachmentToSharePoint(driveId, token, targetPath, safeName, contentType, bytes) {
+  const sessionUrl = "https://graph.microsoft.com/v1.0/drives/" + driveId +
+    "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/createUploadSession";
+  let sessionRes;
+  try {
+    sessionRes = await fetchWithRetry(sessionUrl, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        item: {
+          "@microsoft.graph.conflictBehavior": "rename", // safety net on top of uniquifyNames
+          name: safeName,
+        },
+      }),
+    }, { label: "graph createUploadSession" });
+  } catch (e) {
+    console.warn("Large upload session creation failed:", safeName, e.message);
+    return false;
+  }
+  if (!sessionRes.ok) {
+    console.warn("Large upload session HTTP", sessionRes.status, "for", safeName);
+    return false;
+  }
+  const session = await sessionRes.json();
+  const uploadUrl = session.uploadUrl;
+  if (!uploadUrl) {
+    console.warn("Large upload session returned no uploadUrl for", safeName);
+    return false;
+  }
+
+  const total = bytes.length;
+  let offset = 0;
+  while (offset < total) {
+    const end = Math.min(offset + SP_UPLOAD_CHUNK_SIZE, total);
+    const chunk = bytes.subarray(offset, end);
+    const range = `bytes ${offset}-${end - 1}/${total}`;
+    // The upload URL is pre-authenticated by Graph — DO NOT add Authorization
+    // header (it returns 401 if you do). fetchWithRetry handles 503/504 here.
+    let res;
+    try {
+      res = await fetchWithRetry(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": String(chunk.length),
+          "Content-Range": range,
+        },
+        body: chunk,
+      }, { label: `large upload ${safeName} ${offset}-${end - 1}` });
+    } catch (e) {
+      console.warn("Chunked upload network error at", range, "for", safeName, "—", e.message);
+      // Best-effort cancel so we don't leave a half-built file on SharePoint
+      try { await fetch(uploadUrl, { method: "DELETE" }); } catch {}
+      return false;
+    }
+    if (res.status === 202) {
+      // Server accepted chunk; continue
+      offset = end;
+      continue;
+    }
+    if (res.status === 200 || res.status === 201) {
+      // Final chunk — upload complete. Verify integrity before returning success.
+      const verify = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
+      if (verify.ok) {
+        _recordVerifiedFile(safeName, bytes, contentType, verify);
+        return true;
+      }
+      console.warn(`[verify] large file ${safeName} failed: ${verify.reason} — retrying once`);
+      // Re-upload once. We delete the bad file, then recurse via the simple
+      // wrapper which will dispatch back into chunked upload for >4MiB inputs.
+      await deleteSpFile(driveId, token, targetPath, safeName);
+      // Avoid infinite recursion by inlining a single retry instead of recursing
+      const sessionUrl2 = "https://graph.microsoft.com/v1.0/drives/" + driveId +
+        "/root:/" + encodeDrivePath(targetPath + "/" + safeName) + ":/createUploadSession";
+      const sessionRes2 = await fetchWithRetry(sessionUrl2, {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+        body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename", name: safeName } }),
+      }, { label: "graph createUploadSession retry" });
+      if (!sessionRes2.ok) {
+        throw new Error(`Integrity verification failed for ${safeName} and re-upload session creation failed`);
+      }
+      const session2 = await sessionRes2.json();
+      const uploadUrl2 = session2.uploadUrl;
+      let offset2 = 0;
+      while (offset2 < total) {
+        const end2 = Math.min(offset2 + SP_UPLOAD_CHUNK_SIZE, total);
+        const chunk2 = bytes.subarray(offset2, end2);
+        const r2 = await fetchWithRetry(uploadUrl2, {
+          method: "PUT",
+          headers: { "Content-Length": String(chunk2.length), "Content-Range": `bytes ${offset2}-${end2 - 1}/${total}` },
+          body: chunk2,
+        }, { label: `large re-upload ${safeName}` });
+        if (r2.status === 202) { offset2 = end2; continue; }
+        if (r2.status === 200 || r2.status === 201) {
+          const verify2 = await verifyUploadedFile(driveId, token, targetPath, safeName, bytes);
+          if (verify2.ok) {
+            _recordVerifiedFile(safeName, bytes, contentType, verify2);
+            return true;
+          }
+          throw new Error(`Integrity verification failed for ${safeName} after re-upload: ${verify2.reason}`);
+        }
+        try { await fetch(uploadUrl2, { method: "DELETE" }); } catch {}
+        throw new Error(`Re-upload of ${safeName} failed at ${offset2}-${end2 - 1} with HTTP ${r2.status}`);
+      }
+      throw new Error(`Re-upload of ${safeName} ended without final 200/201`);
+    }
+    // Permanent failure
+    const errText = await res.text().catch(() => "");
+    console.warn("Chunked upload failed", res.status, "at", range, "for", safeName, errText.slice(0, 120));
+    try { await fetch(uploadUrl, { method: "DELETE" }); } catch {}
+    return false;
+  }
+  // If we exit the loop without 200/201, something went wrong — treat as failure.
+  console.warn("Chunked upload completed all chunks but never received 200/201 for", safeName);
+  return false;
 }
 // ─── CONCURRENT-SAVE GUARD ────────────────────────────────────────────────────
 // Wraps a save function so a second click during the first call's flight is
@@ -2627,6 +3335,28 @@ if (existingRecord) {
   refreshEmailSavedIndicator();
   return;
 }
+  // Snapshot all per-item data SYNCHRONOUSLY before any await. Without this,
+  // a fast item-switch (Office swaps mailbox.item silently on pinned panes)
+  // mid-save would read fields from the new email — saving the wrong subject,
+  // date, sender, or attachments into the current project's folder. The
+  // generation counter alone can't protect later sync reads of `emailItem.*`.
+  const snapItem = emailItem;
+  const snapSubject = snapItem?.subject || "";
+  const snapDate = snapItem?.dateTimeCreated;
+  const snapFromName = snapItem?.from?.displayName || "";
+  const snapFromAddr = snapItem?.from?.emailAddress || "";
+  const snapItemId = snapItem?.itemId || "";
+  const saveGen = itemContextGeneration; // capture for stale-write detection
+  // Crash-recovery queue: record the intent BEFORE any awaits. If the browser
+  // crashes during upload, the entry remains and is surfaced as a pending save
+  // on next taskpane open. Dequeued at the end of a clean save.
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        currentMsgId,
+    operation:     "email-sp",
+    email_subject: snapSubject,
+  });
   setStatus("actionStatus", "info", pickSavingMessage());
   try {
     const token = await getToken();
@@ -2640,30 +3370,36 @@ if (existingRecord) {
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-    const d = new Date(emailItem.dateTimeCreated);
+    const d = new Date(snapDate);
     // Folder name = YYYY_MM_DD + (custom name if user set one, else cleaned subject).
-    // The custom name is also sanitized to strip SharePoint-illegal chars in case
-    // the user typed any. Capped at 70 chars (same as the subject path) to keep
-    // path lengths well under SharePoint's 400-char URL limit.
     const customCleaned = _customSpFolderName
       ? _customSpFolderName.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70)
       : "";
-    const safeSubject = (emailItem.subject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
+    const safeSubject = (snapSubject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
     const folderTail = customCleaned || safeSubject;
     const emailFolderName = d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0") + "_" + String(d.getDate()).padStart(2, "0") + " " + folderTail;
     const emailsPath  = await ensureSpFolder(driveId, token, projFolderName, "Emails");
     const targetPath  = await ensureSpFolder(driveId, token, emailsPath, emailFolderName);
+    // Re-check generation right before destructive writes. If the user has
+    // switched to a different item during folder-resolution, abort cleanly
+    // rather than continuing with a mix of old-item folder + new-item body.
+    if (saveGen !== itemContextGeneration) {
+      setStatus("actionStatus", "info", "Save aborted — you switched emails. Click Save again on the email you want to file.");
+      return;
+    }
     await writeSpMetadataSidecar(driveId, token, targetPath, buildAddinMetadata(selectedProject, "correspondence"));
-    const attCount    = await uploadEmailAndAttachments(driveId, token, targetPath);
-    const from = emailItem.from;
+    // Pass snapItem so the attachment loop reads from the captured item, not
+    // the live module global — protects against item-switch corruption where
+    // bytes from a different email could otherwise be filed under this folder.
+    const attCount    = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
     const spFolderUrl = SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/Emails/" + encodeURIComponent(emailFolderName);
     const msgId = currentMsgId;
     const emailRecord = {
       id: uid(), msgId,
-      subject: emailItem.subject || "",
-      from: from?.displayName || "",
-      fromAddress: from?.emailAddress || "",
-      date: emailItem.dateTimeCreated,
+      subject: snapSubject,
+      from: snapFromName,
+      fromAddress: snapFromAddr,
+      date: snapDate,
       bodyText: "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
@@ -2709,13 +3445,43 @@ if (existingRecord) {
     } else {
       setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
     }
+    // Append to the filing-integrity audit log so PMS can reconcile this save.
+    // Status reflects whether the upload was clean or partial — verified flag
+    // gets set by Phase 2 read-back once that lands. Fire-and-forget.
+    const status =
+      (attempted > 0 && attCount === 0)            ? "failed" :
+      (attempted > 0 && attCount < attempted)      ? "partial" :
+      "success";
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        msgId,
+      operation:     "email-sp",
+      sp_folder_url: spFolderUrl,
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: snapSubject,
+      status,
+      error:         status === "success" ? null : (warnings.join(" ") || `${attCount}/${attempted} uploaded`),
+    });
     // One-shot custom name consumed — clear so the next email's save uses
     // subject-default unless explicitly renamed again.
     _customSpFolderName = "";
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
+    // Save completed without throwing — clear crash-recovery queue entry.
+    // (Partial successes still dequeue: the user has the status message and
+    // a "partial" audit log row; the queue is only for crash recovery.)
+    dequeueFilingIntent(queueId);
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        currentMsgId,
+      operation:     "email-sp",
+      email_subject: snapSubject,
+      status:        "failed",
+      error:         e.message,
+    });
+    // Leave the queue entry in place for crash-recovery surfacing on next open.
   }
 }
 async function doSaveToProjectRecordOnly() {
@@ -3113,11 +3879,17 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   const createdMeta = toAddinOneNoteCreatedLocal(dateStr) || toAddinOneNoteCreatedLocal(new Date().toISOString()) || new Date().toISOString();
   const pageHtml = `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${createdMeta}" /></head><body>${header}${bodyHtml}</body></html>`;
 
-  // POST page with retry on 429/503 — Graph throttles OneNote aggressively
-  // and the previous code would just fail on the first throttle response,
-  // which manifested as random "OneNote 429" errors during heavy save bursts.
+  // POST page with retry on 429/503 + idempotency dedup. Graph throttles
+  // OneNote aggressively, and a 5xx response can mask a successful server-
+  // side create — without dedup, the retry would post a duplicate page.
   const token = await getToken();
   const url = `https://graph.microsoft.com/v1.0/${baseUrl}/sections/${section.id}/pages`;
+  const key = _hashOneNoteReq(url, pageHtml);
+  const cached = _addinOneNoteCache.get(key);
+  if (cached && (Date.now() - cached.at) < ADDIN_ONENOTE_DEDUP_TTL_MS) {
+    console.log("[OneNote-addin] idempotency cache hit — skipping duplicate POST");
+    return cached.result;
+  }
   const maxAttempts = 3;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -3128,11 +3900,18 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
     });
     if (res.ok) {
       const page = await res.json();
-      return { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
+      const result = { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
+      _addinOneNoteCache.set(key, { result, at: Date.now() });
+      // Prune old entries opportunistically
+      if (_addinOneNoteCache.size > 100) {
+        const cutoff = Date.now() - 2 * ADDIN_ONENOTE_DEDUP_TTL_MS;
+        for (const [k, v] of _addinOneNoteCache) if (v.at < cutoff) _addinOneNoteCache.delete(k);
+      }
+      return result;
     }
     if (res.status === 429 || res.status === 503) {
       const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
-      const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(15000, 1000 * Math.pow(2, attempt));
+      const wait = retryAfter > 0 ? Math.min(15000, retryAfter * 1000) : Math.min(15000, 1000 * Math.pow(2, attempt));
       console.warn("[OneNote-addin] " + res.status + " — retrying in " + wait + "ms (attempt " + attempt + "/" + maxAttempts + ")");
       await new Promise(r => setTimeout(r, wait));
       lastErr = new Error("OneNote throttled (" + res.status + ")");
@@ -3154,6 +3933,15 @@ async function doSaveNote() {
   // Non-meeting categories use the email body as the OneNote content, so a
   // typed note becomes optional context above the email body.
   if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
+
+  // Snapshot per-item identity SYNCHRONOUSLY before any await. If the user
+  // switches items during the OneNote round-trip, these are the values that
+  // should land on the saved note — not whatever item is selected when the
+  // save completes.
+  const snapItemId = emailItem?.itemId || "";
+  const snapSharedMsgId = getCurrentSharedMessageId() || "";
+  const snapICalUId = currentItemICalUId || "";
+  const saveGen = itemContextGeneration;
 
   // Disable immediately so a slow OneNote round-trip can't trigger a double-save.
   const saveNoteBtn = document.getElementById("saveNoteBtn");
@@ -3212,9 +4000,9 @@ async function doSaveNote() {
       importedFromEmail: true, links: [],
       // sourceItemId — matches for the person who saved the note (mailbox-specific).
       // sourceCalendarUId — matches for ALL attendees of the same meeting (shared iCal standard ID).
-      ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
-      ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
-      ...(currentItemICalUId ? { sourceCalendarUId: currentItemICalUId } : {}),
+      ...(snapItemId ? { sourceItemId: snapItemId } : {}),
+      ...(snapSharedMsgId ? { sourceMessageId: snapSharedMsgId } : {}),
+      ...(snapICalUId ? { sourceCalendarUId: snapICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
@@ -3332,10 +4120,13 @@ async function doSaveActionItem() {
   }
 }
 // ─── SHARED: file email+attachments into a project subfolder ─────────────────
-async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null) {
+// `itemSnapshot` is the captured Office mailbox item — required to prevent
+// attachment-bytes corruption from item-switch races. Callers MUST capture
+// emailItem synchronously before any await and pass it in here.
+async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null, itemSnapshot = null) {
   const subPath    = await ensureSpFolder(driveId, token, projFolderName, subfolder);
   const recordPath = await ensureSpFolder(driveId, token, subPath, recordFolderName);
-  await uploadEmailAndAttachments(driveId, token, recordPath);
+  await uploadEmailAndAttachments(driveId, token, recordPath, itemSnapshot);
   if (metadata) await writeSpMetadataSidecar(driveId, token, recordPath, metadata);
   return SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
 }
@@ -3377,6 +4168,16 @@ async function doSaveRfi() {
   if (saveInFlight) { setStatus("rfiStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const title = document.getElementById("rfiTitle").value.trim();
   if (!title) { setStatus("rfiStatus", "error", "Title is required."); return; }
+  // Snapshot the mailbox item before any await — protects attachment bytes
+  // from item-switch race during the SharePoint write.
+  const snapItem = emailItem;
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        snapItem?.itemId || null,
+    operation:     "rfi-new",
+    email_subject: snapItem?.subject || "",
+  });
   saveInFlight = true;
   setStatus("rfiStatus", "info", "⏳ Saving…");
   try {
@@ -3407,7 +4208,7 @@ async function doSaveRfi() {
         const { driveId } = await resolveSpIds();
         const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"));
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"), snapItem);
       } catch (e) { console.warn("RFI SP upload failed:", e.message); }
     }
     const rfi = {
@@ -3426,10 +4227,29 @@ async function doSaveRfi() {
       rfis: [...(fresh.rfis || []), rfi],
     }));
     setStatus("rfiStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "rfi-new",
+      sp_folder_url: spFolderUrl || null,
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: snapItem?.subject || null,
+      status:        spFolderUrl ? "success" : "partial",
+      error:         spFolderUrl ? null : "RFI logged without SharePoint upload",
+    });
+    dequeueFilingIntent(queueId);
     document.getElementById("rfiTitle").value = "";
     document.getElementById("rfiNotes").value = "";
   } catch (e) {
     setStatus("rfiStatus", "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "rfi-new",
+      email_subject: snapItem?.subject || null,
+      status:        "failed",
+      error:         e.message,
+    });
   } finally {
     saveInFlight = false;
   }
@@ -3441,6 +4261,14 @@ async function doFileToExistingRfi() {
   if (saveInFlight) { setStatus("rfiExistingStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const rfi = (selectedProject.rfis || []).find(r => r.id === rfiId);
   if (!rfi) { setStatus("rfiExistingStatus", "error", "RFI not found."); return; }
+  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        snapItem?.itemId || null,
+    operation:     "rfi-existing",
+    email_subject: snapItem?.subject || "",
+  });
   saveInFlight = true;
   setStatus("rfiExistingStatus", "info", "⏳ Filing email…");
   try {
@@ -3455,19 +4283,44 @@ async function doFileToExistingRfi() {
       const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
       targetPath = await ensureSpFolder(driveId, token, rfisPath, safeName);
     }
-    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath);
+    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
     // If this RFI didn't have a spFolderUrl yet, store it now
+    let finalUrl = rfi.spFolderUrl;
     if (!rfi.spFolderUrl) {
-      const newUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+      finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
-        rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: newUrl } : r),
+        rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: finalUrl } : r),
       }));
     }
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     setStatus("rfiExistingStatus", "success", "✓ Filed to " + rfi.number + attMsg);
+    const attempted = lastAttachmentUploadStats?.attempted || 0;
+    const status =
+      (attempted > 0 && attCount === 0)       ? "failed" :
+      (attempted > 0 && attCount < attempted) ? "partial" :
+      "success";
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "rfi-existing",
+      sp_folder_url: finalUrl,
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: snapItem?.subject || null,
+      status,
+      error:         status === "success" ? null : `${attCount}/${attempted} uploaded`,
+    });
+    dequeueFilingIntent(queueId);
   } catch (e) {
     setStatus("rfiExistingStatus", "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "rfi-existing",
+      email_subject: snapItem?.subject || null,
+      status:        "failed",
+      error:         e.message,
+    });
   } finally {
     saveInFlight = false;
   }
@@ -3482,6 +4335,14 @@ async function doSaveSub() {
   if (saveInFlight) { setStatus("subStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const desc = document.getElementById("subDesc").value.trim();
   if (!desc) { setStatus("subStatus", "error", "Description is required."); return; }
+  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        snapItem?.itemId || null,
+    operation:     "sub-new",
+    email_subject: snapItem?.subject || "",
+  });
   saveInFlight = true;
   setStatus("subStatus", "info", "⏳ Saving…");
   try {
@@ -3509,7 +4370,7 @@ async function doSaveSub() {
         const { driveId } = await resolveSpIds();
         const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
         const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"));
+        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"), snapItem);
       } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
     }
     const sub = {
@@ -3530,11 +4391,30 @@ async function doSaveSub() {
       submittals: [...(fresh.submittals || []), sub],
     }));
     setStatus("subStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "sub-new",
+      sp_folder_url: spFolderUrl || null,
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: snapItem?.subject || null,
+      status:        spFolderUrl ? "success" : "partial",
+      error:         spFolderUrl ? null : "Submittal logged without SharePoint upload",
+    });
+    dequeueFilingIntent(queueId);
     document.getElementById("subDesc").value = "";
     document.getElementById("subSpec").value = "";
     document.getElementById("subNotes").value = "";
   } catch (e) {
     setStatus("subStatus", "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "sub-new",
+      email_subject: snapItem?.subject || null,
+      status:        "failed",
+      error:         e.message,
+    });
   } finally {
     saveInFlight = false;
   }
@@ -3546,6 +4426,14 @@ async function doFileToExistingSub() {
   if (!subId) { setStatus("subExistingStatus", "error", "Select a submittal."); return; }
   const sub = (selectedProject.submittals || []).find(s => s.id === subId);
   if (!sub) { setStatus("subExistingStatus", "error", "Submittal not found."); return; }
+  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        snapItem?.itemId || null,
+    operation:     "sub-existing",
+    email_subject: snapItem?.subject || "",
+  });
   saveInFlight = true;
   setStatus("subExistingStatus", "info", "⏳ Filing email…");
   try {
@@ -3559,18 +4447,43 @@ async function doFileToExistingSub() {
       const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
       targetPath = await ensureSpFolder(driveId, token, subsPath, safeName);
     }
-    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath);
+    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
+    let finalUrl = sub.spFolderUrl;
     if (!sub.spFolderUrl) {
-      const newUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+      finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
-        submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: newUrl } : s),
+        submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: finalUrl } : s),
       }));
     }
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     setStatus("subExistingStatus", "success", "✓ Filed to " + sub.number + attMsg);
+    const attempted = lastAttachmentUploadStats?.attempted || 0;
+    const status =
+      (attempted > 0 && attCount === 0)       ? "failed" :
+      (attempted > 0 && attCount < attempted) ? "partial" :
+      "success";
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "sub-existing",
+      sp_folder_url: finalUrl,
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: snapItem?.subject || null,
+      status,
+      error:         status === "success" ? null : `${attCount}/${attempted} uploaded`,
+    });
+    dequeueFilingIntent(queueId);
   } catch (e) {
     setStatus("subExistingStatus", "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation:     "sub-existing",
+      email_subject: snapItem?.subject || null,
+      status:        "failed",
+      error:         e.message,
+    });
   } finally {
     saveInFlight = false;
   }
