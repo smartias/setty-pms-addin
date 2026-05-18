@@ -647,6 +647,23 @@ function getLoggedRfiSubArtifacts(project) {
       if (e.id) matchingEmailRecordIds.add(e.id);
     }
   }
+  // TEMPORARY DIAGNOSTIC — logs state so we can see why linked-email
+  // detection isn't firing. Remove after the user confirms the linked-email
+  // chip is working.
+  if (typeof window !== "undefined" && window.__DEBUG_CHIPS) {
+    const allRfiLinks = (project.rfis || []).map(r => ({
+      number: r.number,
+      linkCount: (r.links || []).length,
+      links: (r.links || []).map(lk => ({ targetType: lk.targetType, targetId: lk.targetId })),
+    }));
+    console.log("[DBG-CHIP] state", {
+      currentItemId: sourceItemId?.slice(0, 30),
+      candidates: sourceMessageIds.map(c => c?.slice(0, 30)),
+      projectEmailsCount: (project.emails || []).length,
+      matchingEmailRecordIds: [...matchingEmailRecordIds],
+      rfisWithLinks: allRfiLinks,
+    });
+  }
   // Helper: does this artifact's links[] reference any matching email record?
   const hasLinkToCurrentEmail = (links) =>
     (links || []).some(lk =>
