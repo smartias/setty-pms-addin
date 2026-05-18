@@ -714,12 +714,12 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       const discPath = await ensureSpFolder(driveId, token, topPath, discCode);
       rootPath = await ensureSpFolder(driveId, token, discPath, safeNumber);
     }
-    const inPath = await ensureSpFolder(driveId, token, rootPath, "IN");
-    // Upload email + attachments into the artifact's /IN folder. This is a
-    // second pass through uploadEmailAndAttachments using the same item
-    // snapshot, so the bytes are guaranteed to be the same as what landed
-    // in the project's Emails folder.
-    await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+    // Per-email subfolder under /IN, so multiple emails linked to the same
+    // RFI/Sub coexist without colliding on "email.html". Same pattern as the
+    // project's main Emails folder.
+    const uploadResult = await uploadEmailToArtifactInFolder({
+      driveId, token, artifactRootPath: rootPath, snapItem,
+    });
 
     // Update the artifact's links[] array to point at the email record.
     // Schema matches the PMS link format (targetSystem/targetType/targetId).
@@ -743,12 +743,13 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
     });
 
     // Audit log: a separate row for the link operation so the reconcile sweep
-    // sees the secondary upload as its own filing event.
+    // sees the secondary upload as its own filing event. Points at the
+    // specific per-email subfolder where the files actually landed.
     void logFilingOp({
       project_id:    selectedProject.id,
       msg_id:        emailRecord.msgId || null,
       operation:     "email-linked-" + kind,
-      sp_folder_url: SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/"),
+      sp_folder_url: uploadResult.emailFolderUrl,
       files:         (lastAttachmentUploadStats?.uploadedFiles || []),
       email_subject: emailRecord.subject || "",
       status:        "success",
@@ -756,8 +757,11 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
 
     return { ok: true, label: ` · 📎 linked to ${target.number || (kind === "rfi" ? "RFI" : "Submittal")}` };
   } catch (e) {
-    console.warn("[link-to] secondary copy failed (non-fatal):", e.message);
-    return { ok: false, label: " · ⚠ link to RFI/Sub failed (primary save succeeded)" };
+    console.warn("[link-to] secondary copy failed:", e.message);
+    // Surface the actual error message so the user can act on it. The primary
+    // save already succeeded so this is non-fatal, but silent failure was
+    // exactly what masked the real upload bug — we want loud errors here.
+    return { ok: false, label: ` · ⚠ link to RFI/Sub failed: ${e.message.slice(0, 100)}` };
   }
 }
 
@@ -5164,33 +5168,35 @@ async function doSaveRfi() {
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
 
-      // Build the new folder structure: <projFolder>/RFIs/<discCode>/<RFI-NNN>/IN
-      // The IN folder gets the incoming email. The RFI root folder is what
-      // gets stored on the RFI record so users navigate to the RFI level
-      // (not the IN subfolder) when clicking SharePoint links in PMS.
-      let spFolderUrl = "";
-      let inFolderWebUrl = ""; // Specific URL of the /IN folder (for email body link)
+      // Build the new folder structure: <projFolder>/RFIs/<discCode>/<RFI-NNN>/IN/<date subject>
+      // The per-email subfolder under /IN means multiple emails to the same RFI
+      // coexist without colliding on "email.html". The RFI root URL is what
+      // gets stored on the record so PMS navigation lands at the RFI level.
+      let spFolderUrl = "";    // RFI root URL (stored on the record)
+      let inFolderWebUrl = ""; // /IN folder URL (for the assignment email body link)
+      let emailFolderUrl = ""; // specific per-email subfolder (for audit log)
+      let spUploadError = "";
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
           const { driveId } = await resolveSpIds();
           const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
-          // Sanitize RFI number for folder name (in case user enters "RFI/external#-001" etc.)
           const safeRfiNumber = rfiNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
           const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
           const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
           const rfiPath  = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
-          const inPath   = await ensureSpFolder(driveId, token, rfiPath, "IN");
-          // Sidecar at the RFI level so PMS-side reconcile knows what it represents
           await writeSpMetadataSidecar(driveId, token, rfiPath, buildAddinMetadata(freshProject, "rfi"));
-          await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
-          // Build web URLs. SP_BASE_URL + encoded path segments.
-          const rfiPathEncoded = rfiPath.split("/").map(encodeURIComponent).join("/");
-          const inPathEncoded  = inPath.split("/").map(encodeURIComponent).join("/");
-          spFolderUrl     = SP_BASE_URL + "/" + rfiPathEncoded;
-          inFolderWebUrl  = SP_BASE_URL + "/" + inPathEncoded;
+          // Upload via the shared helper — per-email subfolder, real error
+          // propagation. Throws on actual upload failure so we know.
+          const uploadResult = await uploadEmailToArtifactInFolder({
+            driveId, token, artifactRootPath: rfiPath, snapItem,
+          });
+          spFolderUrl    = SP_BASE_URL + "/" + rfiPath.split("/").map(encodeURIComponent).join("/");
+          inFolderWebUrl = uploadResult.inFolderUrl;
+          emailFolderUrl = uploadResult.emailFolderUrl;
         } catch (e) {
           console.warn("RFI SP upload failed:", e.message);
+          spUploadError = e.message;
         }
       }
 
@@ -5252,15 +5258,56 @@ async function doSaveRfi() {
 
       const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : ""));
+      const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
       return {
-        sp_folder_url:  spFolderUrl || null,
-        status:         spFolderUrl ? "success" : "partial",
-        error:          spFolderUrl ? null : "RFI logged without SharePoint upload",
-        successMessage: baseMsg + draftMsg,
+        // sp_folder_url points at the per-email subfolder so the reconcile
+        // sweep checks the right place. Falls back to the RFI root, then null,
+        // depending on which step succeeded.
+        sp_folder_url:  emailFolderUrl || spFolderUrl || null,
+        status:         emailFolderUrl ? "success" : (spFolderUrl ? "partial" : "partial"),
+        error:          emailFolderUrl ? null : (spUploadError || "RFI logged without SharePoint upload"),
+        successMessage: baseMsg + draftMsg + errMsg,
       };
     }
   );
 }
+// Upload an email + its attachments INTO an RFI/Submittal's /IN folder, using
+// a per-email subfolder so multiple emails coexist without colliding on
+// "email.html". Matches the structure the project's main Emails folder uses.
+//
+// Returns { emailPath, emailFolderUrl, inPath, inFolderUrl, attCount } so
+// callers can audit-log the precise upload location AND store the artifact
+// root URL on the record (for navigation).
+//
+// Throws on creation failure so callers can surface the real error instead
+// of silently filing a "logged without SharePoint upload" status.
+async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath, snapItem }) {
+  if (!artifactRootPath) throw new Error("artifactRootPath missing");
+  const inPath = await ensureSpFolder(driveId, token, artifactRootPath, "IN");
+  // Per-email subfolder. Format mirrors the project Emails folder:
+  // "YYYY-MM-DD <sanitized subject>". Capped at 60 chars to keep the path
+  // length comfortably under SharePoint's 400-char URL ceiling.
+  const dateObj = new Date(snapItem?.dateTimeCreated || Date.now());
+  const datePart = dateObj.getFullYear() + "-" +
+                   String(dateObj.getMonth() + 1).padStart(2, "0") + "-" +
+                   String(dateObj.getDate()).padStart(2, "0");
+  const subject = (snapItem?.subject || "Email")
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
+  const emailFolderName = (datePart + " " + subject).trim() || (datePart + " Email");
+  const emailPath = await ensureSpFolder(driveId, token, inPath, emailFolderName);
+  const attCount = await uploadEmailAndAttachments(driveId, token, emailPath, snapItem);
+  return {
+    emailPath,
+    emailFolderUrl: SP_BASE_URL + "/" + emailPath.split("/").map(encodeURIComponent).join("/"),
+    inPath,
+    inFolderUrl:    SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/"),
+    attCount,
+  };
+}
+
 // ─── LOG RFI RESPONSE ────────────────────────────────────────────────────────
 // Opens the response view for a specific RFI. Pre-fills today's date and the
 // current default status ("Responded"). The button that calls this is rendered
@@ -5456,10 +5503,9 @@ async function doFileToExistingRfi() {
     async ({ snapItem }) => {
       const token = await getToken();
       const { driveId } = await resolveSpIds();
-      // Resolve the RFI's root folder. If the RFI was logged before the new
-      // structure was introduced, rfi.spFolderUrl points at the old flat
-      // folder (e.g. <proj>/RFIs/RFI-001 Title). Creating "IN" inside it
-      // still works — the new layout coexists with the old.
+      // Resolve the RFI's root folder. If the RFI predates the new structure,
+      // rfi.spFolderUrl points at the old flat folder; creating IN + per-email
+      // subfolders inside still works.
       let rfiRootPath = spDrivePath(rfi.spFolderUrl);
       if (!rfiRootPath) {
         if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
@@ -5470,9 +5516,11 @@ async function doFileToExistingRfi() {
         const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
         rfiRootPath    = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
       }
-      // All incoming correspondence for an RFI lands in the IN subfolder.
-      const inPath  = await ensureSpFolder(driveId, token, rfiRootPath, "IN");
-      const attCount = await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+      // Per-email subfolder under /IN so multiple filed emails coexist.
+      const uploadResult = await uploadEmailToArtifactInFolder({
+        driveId, token, artifactRootPath: rfiRootPath, snapItem,
+      });
+      const attCount = uploadResult.attCount;
       let finalUrl = rfi.spFolderUrl;
       if (!rfi.spFolderUrl) {
         finalUrl = SP_BASE_URL + "/" + rfiRootPath.split("/").map(encodeURIComponent).join("/");
@@ -5488,7 +5536,9 @@ async function doFileToExistingRfi() {
         (attempted > 0 && attCount < attempted) ? "partial" :
         "success";
       return {
-        sp_folder_url:  finalUrl,
+        // sp_folder_url points at the per-email subfolder so reconcile finds
+        // the files in the right place.
+        sp_folder_url:  uploadResult.emailFolderUrl,
         status,
         error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
         successMessage: "✓ Filed to " + rfi.number + " · IN" + attMsg,
@@ -5591,9 +5641,11 @@ async function doSaveSub() {
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
 
-      // New folder structure: <projFolder>/Submittals/<discCode>/<SUB-NNN>/IN
+      // New folder structure: <projFolder>/Submittals/<discCode>/<SUB-NNN>/IN/<date subject>
       let spFolderUrl = "";
       let inFolderWebUrl = "";
+      let emailFolderUrl = "";
+      let spUploadError = "";
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
@@ -5603,15 +5655,16 @@ async function doSaveSub() {
           const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
           const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
           const subPath  = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
-          const inPath   = await ensureSpFolder(driveId, token, subPath, "IN");
           await writeSpMetadataSidecar(driveId, token, subPath, buildAddinMetadata(freshProject, "submittal"));
-          await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
-          const subPathEncoded = subPath.split("/").map(encodeURIComponent).join("/");
-          const inPathEncoded  = inPath.split("/").map(encodeURIComponent).join("/");
-          spFolderUrl    = SP_BASE_URL + "/" + subPathEncoded;
-          inFolderWebUrl = SP_BASE_URL + "/" + inPathEncoded;
+          const uploadResult = await uploadEmailToArtifactInFolder({
+            driveId, token, artifactRootPath: subPath, snapItem,
+          });
+          spFolderUrl    = SP_BASE_URL + "/" + subPath.split("/").map(encodeURIComponent).join("/");
+          inFolderWebUrl = uploadResult.inFolderUrl;
+          emailFolderUrl = uploadResult.emailFolderUrl;
         } catch (e) {
           console.warn("Submittal SP upload failed:", e.message);
+          spUploadError = e.message;
         }
       }
 
@@ -5669,11 +5722,12 @@ async function doSaveSub() {
 
       const baseMsg = "✓ " + subNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "");
+      const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
       return {
-        sp_folder_url:  spFolderUrl || null,
-        status:         spFolderUrl ? "success" : "partial",
-        error:          spFolderUrl ? null : "Submittal logged without SharePoint upload",
-        successMessage: baseMsg + draftMsg,
+        sp_folder_url:  emailFolderUrl || spFolderUrl || null,
+        status:         emailFolderUrl ? "success" : "partial",
+        error:          emailFolderUrl ? null : (spUploadError || "Submittal logged without SharePoint upload"),
+        successMessage: baseMsg + draftMsg + errMsg,
       };
     }
   );
@@ -5860,9 +5914,11 @@ async function doFileToExistingSub() {
         const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
         subRootPath    = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
       }
-      // Incoming correspondence for a submittal lands in the IN subfolder.
-      const inPath = await ensureSpFolder(driveId, token, subRootPath, "IN");
-      const attCount = await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+      // Per-email subfolder under /IN so multiple filed emails coexist.
+      const uploadResult = await uploadEmailToArtifactInFolder({
+        driveId, token, artifactRootPath: subRootPath, snapItem,
+      });
+      const attCount = uploadResult.attCount;
       let finalUrl = sub.spFolderUrl;
       if (!sub.spFolderUrl) {
         finalUrl = SP_BASE_URL + "/" + subRootPath.split("/").map(encodeURIComponent).join("/");
@@ -5878,7 +5934,8 @@ async function doFileToExistingSub() {
         (attempted > 0 && attCount < attempted) ? "partial" :
         "success";
       return {
-        sp_folder_url:  finalUrl,
+        // Audit log points at the per-email subfolder so reconcile finds files there.
+        sp_folder_url:  uploadResult.emailFolderUrl,
         status,
         error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
         successMessage: "✓ Filed to " + sub.number + " · IN" + attMsg,
