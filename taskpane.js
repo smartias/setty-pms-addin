@@ -874,7 +874,10 @@ function refreshLoggedArtifactChips() {
     const statusLabel = a.status && a.status !== "Open" && a.status !== "Received"
       ? ` · ${a.status}`
       : "";
-    const label = `${icon} Logged as ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}${statusLabel}`;
+    // "Logged as" for the email the RFI/Sub was originally created from;
+    // "Linked to" for emails added via the Link to dropdown after the fact.
+    const verb = a.relationship === "linked" ? "Linked to" : "Logged as";
+    const label = `${icon} ${verb} ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}${statusLabel}`;
     const safeLabel = label.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     let chipHtml;
     if (a.spFolderUrl) {
