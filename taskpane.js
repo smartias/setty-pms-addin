@@ -687,15 +687,20 @@ const SUB_OPEN_STATUSES = new Set(["Received", "In Review", "Pending Sub Respons
 // message. Failure is non-fatal — the primary save already succeeded; the
 // secondary link is a bonus we attempt best-effort.
 async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
-  if (!linkValue) return { ok: false, label: "" };
-  if (!selectedProject?.projectFolderUrl) return { ok: false, label: "" };
+  console.log("[DBG-LINK] linkEmailToArtifact called", { linkValue, hasEmailRecord: !!emailRecord, emailRecordId: emailRecord?.id, hasSnapItem: !!snapItem, hasProjectFolder: !!selectedProject?.projectFolderUrl });
+  if (!linkValue) { console.log("[DBG-LINK] early return: no linkValue"); return { ok: false, label: "" }; }
+  if (!selectedProject?.projectFolderUrl) { console.log("[DBG-LINK] early return: no projectFolderUrl"); return { ok: false, label: "" }; }
   const kind = linkValue.startsWith("rfi:") ? "rfi" :
                linkValue.startsWith("sub:") ? "sub" : null;
-  if (!kind) return { ok: false, label: "" };
+  if (!kind) { console.log("[DBG-LINK] early return: invalid kind from", linkValue); return { ok: false, label: "" }; }
   const targetId = linkValue.slice(kind === "rfi" ? "rfi:".length : "sub:".length);
   const arr = kind === "rfi" ? (selectedProject.rfis || []) : (selectedProject.submittals || []);
   const target = arr.find(x => x.id === targetId);
-  if (!target) return { ok: false, label: "" };
+  if (!target) {
+    console.log("[DBG-LINK] early return: target not found", { kind, targetId, arrLength: arr.length, sampleIds: arr.slice(0, 3).map(x => x.id) });
+    return { ok: false, label: "" };
+  }
+  console.log("[DBG-LINK] target found", { kind, number: target.number, spFolderUrl: target.spFolderUrl, discipline: target.discipline });
 
   try {
     const token = await getToken();
@@ -714,12 +719,14 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       const discPath = await ensureSpFolder(driveId, token, topPath, discCode);
       rootPath = await ensureSpFolder(driveId, token, discPath, safeNumber);
     }
+    console.log("[DBG-LINK] rootPath resolved", { rootPath });
     // Per-email subfolder under /IN, so multiple emails linked to the same
     // RFI/Sub coexist without colliding on "email.html". Same pattern as the
     // project's main Emails folder.
     const uploadResult = await uploadEmailToArtifactInFolder({
       driveId, token, artifactRootPath: rootPath, snapItem,
     });
+    console.log("[DBG-LINK] upload complete", { attCount: uploadResult.attCount, emailPath: uploadResult.emailPath, emailFolderUrl: uploadResult.emailFolderUrl });
 
     // Update the artifact's links[] array to point at the email record.
     // Schema matches the PMS link format (targetSystem/targetType/targetId).
@@ -755,12 +762,10 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       status:        "success",
     });
 
+    console.log("[DBG-LINK] success — returning ok");
     return { ok: true, label: ` · 📎 linked to ${target.number || (kind === "rfi" ? "RFI" : "Submittal")}` };
   } catch (e) {
-    console.warn("[link-to] secondary copy failed:", e.message);
-    // Surface the actual error message so the user can act on it. The primary
-    // save already succeeded so this is non-fatal, but silent failure was
-    // exactly what masked the real upload bug — we want loud errors here.
+    console.error("[DBG-LINK] CAUGHT ERROR in linkEmailToArtifact:", e.message, e.stack);
     return { ok: false, label: ` · ⚠ link to RFI/Sub failed: ${e.message.slice(0, 100)}` };
   }
 }
@@ -5282,8 +5287,10 @@ async function doSaveRfi() {
 // Throws on creation failure so callers can surface the real error instead
 // of silently filing a "logged without SharePoint upload" status.
 async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath, snapItem }) {
+  console.log("[DBG-UPL] uploadEmailToArtifactInFolder", { artifactRootPath, hasSnapItem: !!snapItem, snapItemId: snapItem?.itemId?.slice?.(0, 30) });
   if (!artifactRootPath) throw new Error("artifactRootPath missing");
   const inPath = await ensureSpFolder(driveId, token, artifactRootPath, "IN");
+  console.log("[DBG-UPL] inPath created", { inPath });
   // Per-email subfolder. Format mirrors the project Emails folder:
   // "YYYY-MM-DD <sanitized subject>". Capped at 60 chars to keep the path
   // length comfortably under SharePoint's 400-char URL ceiling.
@@ -5297,8 +5304,12 @@ async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath,
     .trim()
     .slice(0, 60);
   const emailFolderName = (datePart + " " + subject).trim() || (datePart + " Email");
+  console.log("[DBG-UPL] emailFolderName", { emailFolderName });
   const emailPath = await ensureSpFolder(driveId, token, inPath, emailFolderName);
+  console.log("[DBG-UPL] emailPath created", { emailPath });
+  console.log("[DBG-UPL] calling uploadEmailAndAttachments");
   const attCount = await uploadEmailAndAttachments(driveId, token, emailPath, snapItem);
+  console.log("[DBG-UPL] upload done", { attCount, stats: lastAttachmentUploadStats });
   return {
     emailPath,
     emailFolderUrl: SP_BASE_URL + "/" + emailPath.split("/").map(encodeURIComponent).join("/"),
