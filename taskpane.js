@@ -647,22 +647,46 @@ function getLoggedRfiSubArtifacts(project) {
       if (e.id) matchingEmailRecordIds.add(e.id);
     }
   }
-  // TEMPORARY DIAGNOSTIC — logs state so we can see why linked-email
-  // detection isn't firing. Remove after the user confirms the linked-email
-  // chip is working.
-  if (typeof window !== "undefined" && window.__DEBUG_CHIPS) {
+  // TEMPORARY DIAGNOSTIC — also writes the state into a visible div in the
+  // taskpane so we can see it without console access. Remove after the
+  // linked-email chip is confirmed working.
+  try {
     const allRfiLinks = (project.rfis || []).map(r => ({
       number: r.number,
       linkCount: (r.links || []).length,
-      links: (r.links || []).map(lk => ({ targetType: lk.targetType, targetId: lk.targetId })),
-    }));
-    console.log("[DBG-CHIP] state", {
-      currentItemId: sourceItemId?.slice(0, 30),
-      candidates: sourceMessageIds.map(c => c?.slice(0, 30)),
-      projectEmailsCount: (project.emails || []).length,
-      matchingEmailRecordIds: [...matchingEmailRecordIds],
+    })).filter(r => r.linkCount > 0);
+    const dbgInfo = {
+      itemId: (sourceItemId || "").slice(0, 20) + "…",
+      projectEmails: (project.emails || []).length,
+      matchedRecords: matchingEmailRecordIds.size,
+      rfisWithAnyLinks: allRfiLinks.length,
       rfisWithLinks: allRfiLinks,
-    });
+    };
+    console.log("[DBG-CHIP] state", dbgInfo);
+    // Also surface to a visible UI element so the user doesn't need console
+    let dbgBanner = document.getElementById("__chipDbg");
+    if (!dbgBanner) {
+      const mainView = document.getElementById("mainView");
+      if (mainView) {
+        dbgBanner = document.createElement("div");
+        dbgBanner.id = "__chipDbg";
+        dbgBanner.style.cssText = "background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:6px 10px;margin:6px 12px;border-radius:4px;font-size:10px;font-family:monospace;word-break:break-all;";
+        mainView.insertBefore(dbgBanner, mainView.firstChild);
+      }
+    }
+    if (dbgBanner) {
+      dbgBanner.innerHTML =
+        `<b>DBG-CHIP:</b><br>` +
+        `itemId: ${dbgInfo.itemId}<br>` +
+        `project.emails records: ${dbgInfo.projectEmails}<br>` +
+        `current item matches: ${dbgInfo.matchedRecords} email record(s)<br>` +
+        `RFIs with any links: ${dbgInfo.rfisWithAnyLinks}<br>` +
+        (allRfiLinks.length > 0
+          ? allRfiLinks.map(r => `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s)`).join("<br>")
+          : "&nbsp;&nbsp;(no RFI on this project has any links[] entries)");
+    }
+  } catch (e) {
+    console.warn("[DBG-CHIP] diagnostic failed:", e.message);
   }
   // Helper: does this artifact's links[] reference any matching email record?
   const hasLinkToCurrentEmail = (links) =>
