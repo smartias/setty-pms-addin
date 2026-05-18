@@ -751,6 +751,23 @@
        sourceItemId matches the current email. Empty by default. -->
   <div id="loggedAsArtifactChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;"></div>
 
+  <!-- Optional link target: when the selected project has open RFIs or
+       Submittals, this dropdown lets the user link the current email to one.
+       Picking a target + hitting Save SP/Save to Project files the email
+       normally AND copies it into the linked RFI/Sub's /IN folder, plus
+       updates the RFI/Sub's links[] to reference the email record.
+       Populated by refreshLinkToTargetDropdown(). Hidden when no open
+       RFIs/Subs exist on the selected project. -->
+  <div id="linkToRow" style="display:none;margin-bottom:8px;">
+    <label style="font-size:11px;color:#64748b;font-weight:600;display:block;margin-bottom:3px;">
+      📎 Also link this email to:
+      <span style="font-weight:400;font-size:10px;">(files a copy into the RFI/Sub's /IN folder)</span>
+    </label>
+    <select id="linkToTarget" style="width:100%;">
+      <option value="">— Standalone (no linking) —</option>
+    </select>
+  </div>
+
   <!-- Primary action zone — the 80/20 actions, always visible.
        Twin-save row: SharePoint (email + attachments) and Project Record (email body copy). -->
   <div class="save-row">

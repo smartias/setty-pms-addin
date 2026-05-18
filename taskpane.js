@@ -516,6 +516,7 @@ function loadItemContext() {
     void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
     try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
     maybeShowAecQuip();
   }
 }
@@ -667,6 +668,142 @@ function getLoggedRfiSubArtifacts(project) {
 const RFI_OPEN_STATUSES = new Set(["Open", "Pending Sub Response"]);
 // Same notion for submittals: while still under review (not yet returned).
 const SUB_OPEN_STATUSES = new Set(["Received", "In Review", "Pending Sub Response"]);
+
+// Populate the "Link to RFI/Submittal" dropdown on the main view. Lists only
+// OPEN artifacts (the user can't link to a closed RFI in a meaningful way).
+// Hides the row entirely when there are no open RFIs/Subs on the selected
+// project. Option value encodes the kind: "rfi:<id>" or "sub:<id>".
+// Secondary copy: after the primary Save SP completes, optionally copy the
+// email + attachments into a linked RFI or Submittal's /IN folder, and update
+// the artifact's links[] array to reference the email record.
+//
+// linkValue is the encoded dropdown value: "rfi:<id>" or "sub:<id>" or "".
+// emailRecord is the email object that was just persisted to project.emails
+// (we need its id for the bidirectional cross-link).
+// snapItem is the captured Office mailbox item (required by the attachment
+// upload path to avoid item-switch races).
+//
+// Returns { ok: bool, label: string } so the caller can append to the status
+// message. Failure is non-fatal — the primary save already succeeded; the
+// secondary link is a bonus we attempt best-effort.
+async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
+  if (!linkValue) return { ok: false, label: "" };
+  if (!selectedProject?.projectFolderUrl) return { ok: false, label: "" };
+  const kind = linkValue.startsWith("rfi:") ? "rfi" :
+               linkValue.startsWith("sub:") ? "sub" : null;
+  if (!kind) return { ok: false, label: "" };
+  const targetId = linkValue.slice(kind === "rfi" ? "rfi:".length : "sub:".length);
+  const arr = kind === "rfi" ? (selectedProject.rfis || []) : (selectedProject.submittals || []);
+  const target = arr.find(x => x.id === targetId);
+  if (!target) return { ok: false, label: "" };
+
+  try {
+    const token = await getToken();
+    const { driveId } = await resolveSpIds();
+    // Resolve the artifact's root path (new structure or legacy flat layout).
+    // Mirrors the resolution logic in doFileToExistingRfi / doFileToExistingSub
+    // so the link lands in the right place regardless of when the artifact
+    // was originally logged.
+    let rootPath = spDrivePath(target.spFolderUrl);
+    if (!rootPath) {
+      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const discCode = getDisciplineCode(target.discipline);
+      const safeNumber = (target.number || (kind === "rfi" ? "RFI-???" : "SUB-???"))
+        .replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+      const topPath = await ensureSpFolder(driveId, token, projFolderName, kind === "rfi" ? "RFIs" : "Submittals");
+      const discPath = await ensureSpFolder(driveId, token, topPath, discCode);
+      rootPath = await ensureSpFolder(driveId, token, discPath, safeNumber);
+    }
+    const inPath = await ensureSpFolder(driveId, token, rootPath, "IN");
+    // Upload email + attachments into the artifact's /IN folder. This is a
+    // second pass through uploadEmailAndAttachments using the same item
+    // snapshot, so the bytes are guaranteed to be the same as what landed
+    // in the project's Emails folder.
+    await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+
+    // Update the artifact's links[] array to point at the email record.
+    // Schema matches the PMS link format (targetSystem/targetType/targetId).
+    const linkEntry = {
+      id: uid(),
+      targetSystem: "pms",
+      targetType:   "email",
+      targetId:     emailRecord.id,
+      label:        "Related correspondence",
+      createdAt:    new Date().toISOString(),
+    };
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      const list = kind === "rfi" ? "rfis" : "submittals";
+      return {
+        ...fresh,
+        [list]: (fresh[list] || []).map(x => x.id === targetId ? {
+          ...x,
+          links: [...((x.links) || []), linkEntry],
+        } : x),
+      };
+    });
+
+    // Audit log: a separate row for the link operation so the reconcile sweep
+    // sees the secondary upload as its own filing event.
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        emailRecord.msgId || null,
+      operation:     "email-linked-" + kind,
+      sp_folder_url: SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/"),
+      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
+      email_subject: emailRecord.subject || "",
+      status:        "success",
+    });
+
+    return { ok: true, label: ` · 📎 linked to ${target.number || (kind === "rfi" ? "RFI" : "Submittal")}` };
+  } catch (e) {
+    console.warn("[link-to] secondary copy failed (non-fatal):", e.message);
+    return { ok: false, label: " · ⚠ link to RFI/Sub failed (primary save succeeded)" };
+  }
+}
+
+function refreshLinkToTargetDropdown() {
+  const row = document.getElementById("linkToRow");
+  const sel = document.getElementById("linkToTarget");
+  if (!row || !sel) return;
+  // Remember the user's previous selection so a UI refresh doesn't blow it
+  // away. We restore it at the end if the option still exists.
+  const prevValue = sel.value;
+  if (!selectedProject) {
+    row.style.display = "none";
+    sel.innerHTML = '<option value="">— Standalone (no linking) —</option>';
+    return;
+  }
+  const openRfis = (selectedProject.rfis || []).filter(r => RFI_OPEN_STATUSES.has(r?.status || "Open"));
+  const openSubs = (selectedProject.submittals || []).filter(s => SUB_OPEN_STATUSES.has(s?.status || "Received"));
+  if (openRfis.length === 0 && openSubs.length === 0) {
+    row.style.display = "none";
+    sel.innerHTML = '<option value="">— Standalone (no linking) —</option>';
+    return;
+  }
+  const opts = ['<option value="">— Standalone (no linking) —</option>'];
+  if (openRfis.length) {
+    opts.push('<optgroup label="Open RFIs">');
+    for (const r of openRfis) {
+      const label = `${r.number}${r.title ? " — " + r.title.slice(0, 50) : ""}`;
+      opts.push(`<option value="rfi:${r.id}">🔵 ${escHtml(label)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  if (openSubs.length) {
+    opts.push('<optgroup label="Open Submittals">');
+    for (const s of openSubs) {
+      const label = `${s.number}${s.description ? " — " + s.description.slice(0, 50) : ""}`;
+      opts.push(`<option value="sub:${s.id}">📋 ${escHtml(label)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  sel.innerHTML = opts.join("");
+  // Restore previous selection if still valid
+  if (prevValue && sel.querySelector(`option[value="${prevValue}"]`)) {
+    sel.value = prevValue;
+  }
+  row.style.display = "block";
+}
 
 // Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
 // to the SharePoint folder when one is stored. Open RFIs/Submittals also get
@@ -1979,6 +2116,8 @@ function setSelectedProject(project, persistForEmail = false) {
   // Re-render the "Logged as RFI/Sub" chip row — different project may have
   // different artifacts sourced from the same email.
   try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[chips] refresh failed:", e.message); }
+  // Re-populate the "Link to" dropdown — open RFIs/Subs differ per project.
+  try { refreshLinkToTargetDropdown(); } catch (e) { console.warn("[link-to] refresh failed:", e.message); }
   const badge = document.getElementById("selectedProjectBadge");
   const badgeText = document.getElementById("selectedProjectBadgeText");
   const clearBtn = document.getElementById("clearProjectTagBtn");
@@ -3704,6 +3843,9 @@ if (existingRecord) {
   const snapFromAddr = snapItem?.from?.emailAddress || "";
   const snapItemId = snapItem?.itemId || "";
   const saveGen = itemContextGeneration; // capture for stale-write detection
+  // Read the "Link to RFI/Sub" dropdown synchronously so it can't drift if
+  // the user switches projects mid-save.
+  const linkToValue = (document.getElementById("linkToTarget")?.value || "");
   // Crash-recovery queue: record the intent BEFORE any awaits. If the browser
   // crashes during upload, the entry remains and is surfaced as a pending save
   // on next taskpane open. Dequeued at the end of a clean save.
@@ -3776,6 +3918,10 @@ if (existingRecord) {
       console.warn("saveProjectEmailRow failed:", idxErr);
       indexSaveFailed = true;
     }
+    // Optional: if the user picked a "Link to RFI/Sub" target, copy the email
+    // into that artifact's /IN folder and add a links[] entry. Best-effort —
+    // primary save already succeeded so we never throw out of this branch.
+    const linkResult = await linkEmailToArtifact({ linkValue: linkToValue, emailRecord, snapItem });
     const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
     const attempted = lastAttachmentUploadStats?.attempted || 0;
 
@@ -3792,15 +3938,16 @@ if (existingRecord) {
     }
     if (indexSaveFailed) warnings.push("⚠ Email saved to project, but search-index write failed — it may not appear in PMS email searches until you resave or PMS is reloaded.");
 
+    const linkSuffix = linkResult.label || "";
     if (attempted > 0 && attCount === 0) {
       const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
-      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details.") + (warnings.length ? " " + warnings.join(" ") : ""));
+      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details.") + (warnings.length ? " " + warnings.join(" ") : "") + linkSuffix);
     } else if (warnings.length > 0) {
-      setStatus("actionStatus", "info", "✓ Saved to SharePoint" + attMsg + " and project record. " + warnings.join(" "));
+      setStatus("actionStatus", "info", "✓ Saved to SharePoint" + attMsg + " and project record. " + warnings.join(" ") + linkSuffix);
     } else if (attempted === 0) {
-      setStatus("actionStatus", "info", "Email saved to SharePoint, but no attachments were detected by Outlook/Graph for this message.");
+      setStatus("actionStatus", "info", "Email saved to SharePoint, but no attachments were detected by Outlook/Graph for this message." + linkSuffix);
     } else {
-      setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record.");
+      setStatus("actionStatus", "success", "✓ Saved to SharePoint" + attMsg + " and project record." + linkSuffix);
     }
     // Append to the filing-integrity audit log so PMS can reconcile this save.
     // Status reflects whether the upload was clean or partial — verified flag
@@ -3822,6 +3969,13 @@ if (existingRecord) {
     // One-shot custom name consumed — clear so the next email's save uses
     // subject-default unless explicitly renamed again.
     _customSpFolderName = "";
+    // Same one-shot semantics for the Link To target: don't carry over from
+    // one save to the next. Refresh chips so the new artifact-source-id
+    // chip + the just-linked RFI both show up.
+    const linkToEl = document.getElementById("linkToTarget");
+    if (linkToEl) linkToEl.value = "";
+    try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
     // Save completed without throwing — clear crash-recovery queue entry.
@@ -5061,6 +5215,7 @@ async function doSaveRfi() {
       // Refresh the "Logged as RFI" chip so the main view reflects the new state
       // when the user navigates back from the RFI form.
       try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
 
       const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : ""));
@@ -5203,6 +5358,7 @@ async function submitRfiResponse() {
     // Slight delay so the success message is visible before nav.
     setTimeout(() => {
       try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
     }, 1500);
   } catch (e) {
@@ -5476,6 +5632,7 @@ async function doSaveSub() {
       document.getElementById("subReceivedVia").value = "Email";
 
       try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
 
       const baseMsg = "✓ " + subNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "");
@@ -5597,6 +5754,7 @@ async function submitSubReview() {
 
     setTimeout(() => {
       try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
     }, 1500);
   } catch (e) {
