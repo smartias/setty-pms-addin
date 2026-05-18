@@ -13,6 +13,11 @@
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  <!-- docx: generates DOCX cover sheets for RFI Responses and Submittal Reviews
+       (matches the library transmittal.html uses, same version). The blob is
+       uploaded directly to SharePoint /OUT — we don't need file-saver since
+       we're not offering a local download. -->
+  <script src="https://unpkg.com/docx@8.2.3/build/index.umd.js"></script>
   <!-- canvas-confetti is loaded lazily on first celebration (see loadConfetti
        in taskpane.js) so it doesn't slow down pane open. ~5KB on first
        celebration, then browser-cached. -->
@@ -873,6 +878,13 @@
     </select>
     <label>From (GC / Prime)</label>
     <input type="text" id="rfiFrom" placeholder="Contractor name"/>
+    <label>Received Via</label>
+    <select id="rfiReceivedVia">
+      <option value="Email">Email</option>
+      <option value="Procore">Procore</option>
+      <option value="ACC">ACC</option>
+      <option value="Other">Other</option>
+    </select>
     <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiAssignHint"></span></label>
     <select id="rfiAssignedTo">
       <option value="">— Unassigned —</option>
@@ -926,6 +938,13 @@
     </select>
     <label>From (GC / Prime)</label>
     <input type="text" id="subFrom" placeholder="Contractor name"/>
+    <label>Received Via</label>
+    <select id="subReceivedVia">
+      <option value="Email">Email</option>
+      <option value="Procore">Procore</option>
+      <option value="ACC">ACC</option>
+      <option value="Other">Other</option>
+    </select>
     <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="subAssignHint"></span></label>
     <select id="subAssignedTo">
       <option value="">— Unassigned —</option>
@@ -948,6 +967,55 @@
     <div id="subExistingStatus" class="status-msg"></div>
     <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
   </div>
+</div>
+
+<!-- RFI Response View — opened from the "Log Response" button when an RFI is
+     still Open. Generates a DOCX cover sheet, uploads it to the RFI's /OUT
+     folder, opens a prefilled draft email back to the RFI sender, and flips
+     status to Responded. -->
+<div id="rfiResponseView" style="display:none;">
+  <button class="back-btn" id="rfiResponseBack">← Back</button>
+  <div class="section-title">Log RFI Response</div>
+  <div id="rfiResponseHeader" style="font-size:13px;color:#1e293b;background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <label>Response / Resolution</label>
+  <textarea id="rfiResponseText" rows="6" placeholder="The formal response that will go to the contractor…"></textarea>
+  <label>Date Responded</label>
+  <input type="date" id="rfiResponseDate"/>
+  <label>New Status</label>
+  <select id="rfiResponseStatus">
+    <option value="Responded">Responded</option>
+    <option value="Closed">Closed</option>
+    <option value="Pending Sub Response">Pending Sub Response</option>
+  </select>
+  <div id="rfiResponseStatusMsg" class="status-msg"></div>
+  <button class="btn btn-blue" id="submitRfiResponseBtn">📤 Log Response · Generate DOCX · Draft Email</button>
+</div>
+
+<!-- Submittal Review View — same pattern as RFI Response, but with stamp
+     (Approved / Approved as Noted / Revise and Resubmit / Rejected) and
+     review comments instead of a free-form response. -->
+<div id="subReviewView" style="display:none;">
+  <button class="back-btn" id="subReviewBack">← Back</button>
+  <div class="section-title">Log Submittal Review</div>
+  <div id="subReviewHeader" style="font-size:13px;color:#1e293b;background:#ede9fe;border:1px solid #c4b5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <label>Stamp</label>
+  <select id="subReviewStamp">
+    <option value="Approved">Approved</option>
+    <option value="Approved as Noted">Approved as Noted</option>
+    <option value="Revise and Resubmit">Revise and Resubmit</option>
+    <option value="Rejected">Rejected</option>
+  </select>
+  <label>Review Comments</label>
+  <textarea id="subReviewComments" rows="6" placeholder="Comments returning with the submittal…"></textarea>
+  <label>Date Returned</label>
+  <input type="date" id="subReviewDate"/>
+  <label>New Status</label>
+  <select id="subReviewStatus">
+    <option value="Returned">Returned</option>
+    <option value="Closed">Closed</option>
+  </select>
+  <div id="subReviewStatusMsg" class="status-msg"></div>
+  <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log Review · Generate DOCX · Draft Email</button>
 </div>
 
 <!-- Dates View -->

@@ -207,6 +207,15 @@ function setupEventListeners() {
   document.getElementById("actionItemBack").onclick = () => showView("mainView");
   document.getElementById("rfiBack").onclick     = () => showView("mainView");
   document.getElementById("subBack").onclick     = () => showView("mainView");
+  // Response/review views (RFI Log Response, Submittal Log Review)
+  const rfiRespBack = document.getElementById("rfiResponseBack");
+  if (rfiRespBack) rfiRespBack.onclick = () => showView("mainView");
+  const subRevBack = document.getElementById("subReviewBack");
+  if (subRevBack) subRevBack.onclick = () => showView("mainView");
+  const submitRfiResp = document.getElementById("submitRfiResponseBtn");
+  if (submitRfiResp) submitRfiResp.onclick = submitRfiResponse;
+  const submitSubRev = document.getElementById("submitSubReviewBtn");
+  if (submitSubRev) submitSubRev.onclick = submitSubReview;
   document.getElementById("peopleBack").onclick  = () => showView("mainView");
   // Contact form back returns to peopleView (the only entry point); peopleBack handles return-to-main
   document.getElementById("contactBack").onclick = () => showView("peopleView");
@@ -616,6 +625,9 @@ function getLoggedEmailArtifactLabels(project) {
 // Returns RFI/Submittal records whose sourceItemId or sourceMessageId matches
 // the currently-open mailbox item. Used by refreshLoggedArtifactChips to
 // surface "Logged as RFI-XXX on Date" chips on the main view.
+//
+// `status` is included so the chip renderer can decide whether to show a
+// "Log Response" / "Log Review" call-to-action (visible only while open).
 function getLoggedRfiSubArtifacts(project) {
   if (!project || !emailItem?.itemId) return [];
   const sourceItemId = emailItem.itemId;
@@ -630,6 +642,7 @@ function getLoggedRfiSubArtifacts(project) {
         title: r.title || "",
         date: r.createdAt || r.dateReceived || null,
         spFolderUrl: r.spFolderUrl || "",
+        status: r.status || "Open",
       });
     }
   }
@@ -642,14 +655,23 @@ function getLoggedRfiSubArtifacts(project) {
         title: s.description || "",
         date: s.createdAt || s.dateReceived || null,
         spFolderUrl: s.spFolderUrl || "",
+        status: s.status || "Received",
       });
     }
   }
   return matches;
 }
 
+// "Open"-ish RFI statuses where a response action is still meaningful. We
+// stop showing the Log Response button once the RFI is Responded/Closed/Void.
+const RFI_OPEN_STATUSES = new Set(["Open", "Pending Sub Response"]);
+// Same notion for submittals: while still under review (not yet returned).
+const SUB_OPEN_STATUSES = new Set(["Received", "In Review", "Pending Sub Response"]);
+
 // Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
-// to the SharePoint folder when one is stored. Hidden when nothing applies.
+// to the SharePoint folder when one is stored. Open RFIs/Submittals also get
+// a "Log Response" / "Log Review" button rendered below the chip so the user
+// can finish the workflow in one click. Hidden when nothing applies.
 function refreshLoggedArtifactChips() {
   const container = document.getElementById("loggedAsArtifactChips");
   if (!container) return;
@@ -664,8 +686,15 @@ function refreshLoggedArtifactChips() {
     container.style.display = "none";
     return;
   }
+  // Switch container to a column layout so each artifact's chip + (optional)
+  // action button stack vertically.
   container.style.display = "flex";
-  container.innerHTML = artifacts.map(a => {
+  container.style.flexDirection = "column";
+  container.style.gap = "6px";
+  // Build per-artifact rows. Each row is chip + optional action button.
+  // Action buttons are bound via event delegation below (one listener on the
+  // container handles all clicks via data-action attributes).
+  const rowsHtml = artifacts.map(a => {
     const dateStr = a.date
       ? new Date(a.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })
       : "earlier";
@@ -673,14 +702,42 @@ function refreshLoggedArtifactChips() {
     const bg = a.kind === "rfi" ? "#dbeafe" : "#ede9fe";
     const border = a.kind === "rfi" ? "#93c5fd" : "#c4b5fd";
     const color = a.kind === "rfi" ? "#1e3a8a" : "#5b21b6";
-    const label = `${icon} Logged as ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}`;
+    const statusLabel = a.status && a.status !== "Open" && a.status !== "Received"
+      ? ` · ${a.status}`
+      : "";
+    const label = `${icon} Logged as ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}${statusLabel}`;
     const safeLabel = label.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let chipHtml;
     if (a.spFolderUrl) {
       const safeUrl = a.spFolderUrl.replace(/"/g, "&quot;");
-      return `<a href="${safeUrl}" target="_blank" rel="noreferrer" style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap;">${safeLabel}</a>`;
+      chipHtml = `<a href="${safeUrl}" target="_blank" rel="noreferrer" style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap;">${safeLabel}</a>`;
+    } else {
+      chipHtml = `<span style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;white-space:nowrap;">${safeLabel}</span>`;
     }
-    return `<span style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;white-space:nowrap;">${safeLabel}</span>`;
-  }).join("");
+    // Action button — only for open artifacts.
+    let actionHtml = "";
+    const isOpen = a.kind === "rfi"
+      ? RFI_OPEN_STATUSES.has(a.status)
+      : SUB_OPEN_STATUSES.has(a.status);
+    if (isOpen) {
+      const action = a.kind === "rfi" ? "log-rfi-response" : "log-sub-review";
+      const label  = a.kind === "rfi" ? "📤 Log Response"  : "📤 Log Review";
+      const btnColor = a.kind === "rfi" ? "#1e40af" : "#6d28d9";
+      actionHtml = `<button data-action="${action}" data-id="${a.id.replace(/"/g, "&quot;")}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>`;
+    }
+    return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}</div>`;
+  });
+  container.innerHTML = rowsHtml.join("");
+  // Event delegation: one click listener handles all action buttons.
+  // Re-binding every refresh is fine since innerHTML wiped previous handlers.
+  container.onclick = (ev) => {
+    const btn = ev.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    const id = btn.getAttribute("data-id");
+    if (action === "log-rfi-response") openRfiResponseView(id);
+    else if (action === "log-sub-review") openSubReviewView(id);
+  };
 }
 function refreshEmailSavedIndicator(animate = false) {
   const btnSharePoint = document.getElementById("saveSpBtn");
@@ -4549,6 +4606,241 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
   `.trim();
 }
 
+// ─── DOCX GENERATORS (RFI Response / Submittal Review cover sheets) ─────────
+// Both use the same docx library transmittal.html loads. Style mirrors the
+// transmittal cover sheet so the documents look like a coherent family.
+
+const DOCX_COLORS = { NAVY: "1e3a8a", RED: "b91c1c", BLUE: "1e40af", GRAY: "475569", LIGHT: "cbd5e1" };
+
+// Returns a Blob of a DOCX cover sheet for an RFI response. Fields used:
+// rfi.number, .title, .description, .from, .discipline, .dateReceived, .dueDate.
+// project.projectNumber, .name, .prime, .clientName.
+async function buildRfiResponseDocx({ rfi, project, response, dateResponded, status }) {
+  if (typeof docx === "undefined" || !docx.Packer) {
+    throw new Error("DOCX library not loaded — refresh the taskpane and try again.");
+  }
+  const {
+    Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+    Header, BorderStyle, WidthType, ShadingType, VerticalAlign,
+  } = docx;
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const responder = msalAccount?.name || msalAccount?.username || "";
+
+  function infoRow(label, value) {
+    return new TableRow({
+      children: [
+        new TableCell({
+          width: { size: 2160, type: WidthType.DXA },
+          shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+          children: [new Paragraph({ children: [new TextRun({ text: label, font: "Calibri", size: 20, bold: true, color: DOCX_COLORS.NAVY })] })],
+        }),
+        new TableCell({
+          width: { size: 7200, type: WidthType.DXA },
+          children: [new Paragraph({ children: [new TextRun({ text: String(value || ""), font: "Calibri", size: 20 })] })],
+        }),
+      ],
+    });
+  }
+
+  // Paragraph factory for long-form text blocks that need to wrap.
+  function block(text, opts = {}) {
+    const lines = String(text || "").split(/\r?\n/);
+    return lines.map(line =>
+      new Paragraph({
+        spacing: { after: opts.dense ? 60 : 100 },
+        children: [new TextRun({ text: line, font: "Calibri", size: opts.size || 22 })],
+      })
+    );
+  }
+
+  const doc = new Document({
+    styles: { default: { document: { run: { font: "Calibri", size: 22 } } } },
+    sections: [{
+      properties: {
+        page: { size: { width: 12240, height: 15840 }, margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } },
+      },
+      headers: {
+        default: new Header({
+          children: [new Paragraph({
+            border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: DOCX_COLORS.RED, space: 1 } },
+            spacing: { after: 120 },
+            children: [
+              new TextRun({ text: "SETTY", font: "Calibri", size: 28, bold: true, color: DOCX_COLORS.RED }),
+              new TextRun({ text: "  & Associates    ", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+              new TextRun({ text: "RFI Response", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+            ],
+          })],
+        }),
+      },
+      children: [
+        new Paragraph({
+          spacing: { before: 0, after: 160 },
+          children: [new TextRun({ text: "RFI RESPONSE", font: "Calibri", size: 40, bold: true, color: DOCX_COLORS.NAVY })],
+        }),
+        new Paragraph({
+          border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.NAVY, space: 1 } },
+          spacing: { after: 200 },
+          children: [new TextRun({ text: (rfi.number || "RFI").toUpperCase(), font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.BLUE })],
+        }),
+
+        new Table({
+          width: { size: 9360, type: WidthType.DXA },
+          columnWidths: [2160, 7200],
+          rows: [
+            infoRow("Project:",       projLabel),
+            infoRow("RFI No.:",       rfi.number || ""),
+            infoRow("Title:",         rfi.title || ""),
+            infoRow("Discipline:",    rfi.discipline || ""),
+            infoRow("From:",          rfi.from || ""),
+            infoRow("Date Received:", rfi.dateReceived || ""),
+            infoRow("Due Date:",      rfi.dueDate || ""),
+            infoRow("Responded:",     dateResponded || ""),
+            infoRow("Status:",        status || "Responded"),
+            infoRow("Responder:",     responder),
+          ],
+        }),
+
+        new Paragraph({
+          spacing: { before: 280, after: 100 },
+          children: [new TextRun({ text: "ORIGINAL QUESTION", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+        }),
+        ...(block(rfi.description || rfi.title || "(no question text on record)", { size: 22 })),
+
+        new Paragraph({
+          spacing: { before: 280, after: 100 },
+          children: [new TextRun({ text: "RESPONSE", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+        }),
+        ...(block(response || "(no response text)", { size: 22 })),
+
+        new Paragraph({
+          spacing: { before: 400 },
+          border: { top: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.LIGHT, space: 1 } },
+          children: [
+            new TextRun({ text: `Generated: ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}     `, font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+            new TextRun({ text: "Setty & Associates", font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.NAVY }),
+          ],
+        }),
+      ],
+    }],
+  });
+
+  return await Packer.toBlob(doc);
+}
+
+// Same shape for Submittal review. Uses stamp + comments instead of free response.
+async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned, status }) {
+  if (typeof docx === "undefined" || !docx.Packer) {
+    throw new Error("DOCX library not loaded — refresh the taskpane and try again.");
+  }
+  const {
+    Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+    Header, BorderStyle, WidthType, ShadingType,
+  } = docx;
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const reviewer = msalAccount?.name || msalAccount?.username || "";
+
+  function infoRow(label, value) {
+    return new TableRow({
+      children: [
+        new TableCell({
+          width: { size: 2160, type: WidthType.DXA },
+          shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+          children: [new Paragraph({ children: [new TextRun({ text: label, font: "Calibri", size: 20, bold: true, color: DOCX_COLORS.NAVY })] })],
+        }),
+        new TableCell({
+          width: { size: 7200, type: WidthType.DXA },
+          children: [new Paragraph({ children: [new TextRun({ text: String(value || ""), font: "Calibri", size: 20 })] })],
+        }),
+      ],
+    });
+  }
+  function block(text, opts = {}) {
+    const lines = String(text || "").split(/\r?\n/);
+    return lines.map(line =>
+      new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text: line, font: "Calibri", size: opts.size || 22 })] })
+    );
+  }
+
+  // Stamp gets visual emphasis — it's the headline finding of the review.
+  const stampColor =
+    stamp === "Approved"            ? "059669" :
+    stamp === "Approved as Noted"   ? "0891b2" :
+    stamp === "Revise and Resubmit" ? "ea580c" :
+    stamp === "Rejected"            ? "b91c1c" : DOCX_COLORS.NAVY;
+
+  const doc = new Document({
+    styles: { default: { document: { run: { font: "Calibri", size: 22 } } } },
+    sections: [{
+      properties: { page: { size: { width: 12240, height: 15840 }, margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
+      headers: {
+        default: new Header({
+          children: [new Paragraph({
+            border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: DOCX_COLORS.RED, space: 1 } },
+            spacing: { after: 120 },
+            children: [
+              new TextRun({ text: "SETTY", font: "Calibri", size: 28, bold: true, color: DOCX_COLORS.RED }),
+              new TextRun({ text: "  & Associates    ", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+              new TextRun({ text: "Submittal Review", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+            ],
+          })],
+        }),
+      },
+      children: [
+        new Paragraph({
+          spacing: { before: 0, after: 160 },
+          children: [new TextRun({ text: "SUBMITTAL REVIEW", font: "Calibri", size: 40, bold: true, color: DOCX_COLORS.NAVY })],
+        }),
+        new Paragraph({
+          border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.NAVY, space: 1 } },
+          spacing: { after: 100 },
+          children: [new TextRun({ text: (sub.number || "SUB").toUpperCase(), font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.BLUE })],
+        }),
+        new Paragraph({
+          spacing: { after: 240 },
+          children: [
+            new TextRun({ text: "STAMP: ", font: "Calibri", size: 24, bold: true, color: DOCX_COLORS.NAVY }),
+            new TextRun({ text: (stamp || "—").toUpperCase(), font: "Calibri", size: 26, bold: true, color: stampColor }),
+          ],
+        }),
+
+        new Table({
+          width: { size: 9360, type: WidthType.DXA },
+          columnWidths: [2160, 7200],
+          rows: [
+            infoRow("Project:",        projLabel),
+            infoRow("Submittal No.:",  sub.number || ""),
+            infoRow("Spec Section:",   sub.specSection || ""),
+            infoRow("Description:",    sub.description || ""),
+            infoRow("Discipline:",     sub.discipline || ""),
+            infoRow("From:",           sub.from || ""),
+            infoRow("Date Received:",  sub.dateReceived || ""),
+            infoRow("Due Date:",       sub.dueDate || ""),
+            infoRow("Returned:",       dateReturned || ""),
+            infoRow("Status:",         status || "Returned"),
+            infoRow("Reviewer:",       reviewer),
+          ],
+        }),
+
+        new Paragraph({
+          spacing: { before: 280, after: 100 },
+          children: [new TextRun({ text: "REVIEW COMMENTS", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+        }),
+        ...(block(comments || "(no comments)", { size: 22 })),
+
+        new Paragraph({
+          spacing: { before: 400 },
+          border: { top: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.LIGHT, space: 1 } },
+          children: [
+            new TextRun({ text: `Generated: ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}     `, font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+            new TextRun({ text: "Setty & Associates", font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.NAVY }),
+          ],
+        }),
+      ],
+    }],
+  });
+  return await Packer.toBlob(doc);
+}
+
 // Open a new compose window with prefilled recipient, subject, and HTML body.
 // Uses the Office.js mailbox API (works in all Outlook clients, unlike mailto:).
 // Best-effort — if the API isn't available or fails, we log and return false
@@ -4634,6 +4926,10 @@ function prefillRfi() {
   document.getElementById("rfiDescription").value = "";
   document.getElementById("rfiNotes").value = "";
   document.getElementById("rfiAssignedTo").value = "";
+  // Reset to Email default — most add-in-filed RFIs come via email since the
+  // user is in Outlook. They can override per-RFI if the original source was
+  // Procore/ACC/etc.
+  document.getElementById("rfiReceivedVia").value = "Email";
   populateRfiAssigneeDropdown();
   setRfiMode("new");
   renderRfiPicker();
@@ -4648,6 +4944,7 @@ async function doSaveRfi() {
   const discipline = document.getElementById("rfiDiscipline").value;
   const fromField = document.getElementById("rfiFrom").value.trim();
   const notesField = document.getElementById("rfiNotes").value.trim();
+  const receivedVia = (document.getElementById("rfiReceivedVia")?.value || "Email");
   const assigneeRaw = (document.getElementById("rfiAssignedTo")?.value || "");
   let assignedToStaff = [];
   let subAssigned = "";
@@ -4715,6 +5012,7 @@ async function doSaveRfi() {
         description,
         discipline,
         from: fromField,
+        receivedVia,
         dateReceived: received.toISOString().slice(0, 10),
         dueDate: addBizDays(received, 5),
         status: "Open",
@@ -4758,6 +5056,7 @@ async function doSaveRfi() {
       document.getElementById("rfiDescription").value = "";
       document.getElementById("rfiNotes").value = "";
       document.getElementById("rfiAssignedTo").value = "";
+      document.getElementById("rfiReceivedVia").value = "Email";
 
       // Refresh the "Logged as RFI" chip so the main view reflects the new state
       // when the user navigates back from the RFI form.
@@ -4774,6 +5073,190 @@ async function doSaveRfi() {
     }
   );
 }
+// ─── LOG RFI RESPONSE ────────────────────────────────────────────────────────
+// Opens the response view for a specific RFI. Pre-fills today's date and the
+// current default status ("Responded"). The button that calls this is rendered
+// by refreshLoggedArtifactChips when an RFI matching the current email is open.
+let _activeResponseRfiId = "";
+function openRfiResponseView(rfiId) {
+  const rfi = (selectedProject?.rfis || []).find(r => r.id === rfiId);
+  if (!rfi) { setStatus("rfiResponseStatusMsg", "error", "RFI not found."); return; }
+  _activeResponseRfiId = rfiId;
+  // Pre-fill the header chip + form defaults
+  document.getElementById("rfiResponseHeader").textContent =
+    `${rfi.number}${rfi.title ? " — " + rfi.title : ""}`;
+  document.getElementById("rfiResponseText").value = rfi.response || "";
+  document.getElementById("rfiResponseDate").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("rfiResponseStatus").value = "Responded";
+  setStatus("rfiResponseStatusMsg", "", "");
+  showView("rfiResponseView");
+}
+
+// Submit the response: generate the DOCX, upload it to the RFI's /OUT folder,
+// update the project record, and open a prefilled email back to the RFI sender.
+// Status flips to whatever the user picked (default "Responded").
+async function submitRfiResponse() {
+  const rfiId = _activeResponseRfiId;
+  if (!rfiId) { setStatus("rfiResponseStatusMsg", "error", "No RFI selected."); return; }
+  const rfi = (selectedProject?.rfis || []).find(r => r.id === rfiId);
+  if (!rfi) { setStatus("rfiResponseStatusMsg", "error", "RFI no longer in cache. Refresh and try again."); return; }
+
+  // Synchronous DOM reads
+  const responseText = (document.getElementById("rfiResponseText")?.value || "").trim();
+  const dateResponded = (document.getElementById("rfiResponseDate")?.value || new Date().toISOString().slice(0, 10));
+  const newStatus = (document.getElementById("rfiResponseStatus")?.value || "Responded");
+  if (!responseText) {
+    setStatus("rfiResponseStatusMsg", "error", "Enter the response text first.");
+    return;
+  }
+
+  const submitBtn = document.getElementById("submitRfiResponseBtn");
+  if (submitBtn) submitBtn.disabled = true;
+  setStatus("rfiResponseStatusMsg", "info", "⏳ Generating response…");
+
+  try {
+    // 1. Build the DOCX cover sheet
+    const docxBlob = await buildRfiResponseDocx({
+      rfi, project: selectedProject, response: responseText, dateResponded, status: newStatus,
+    });
+
+    // 2. Resolve OUT folder path. If the RFI was filed with the new structure
+    // its spFolderUrl points at the RFI root; if it predates the new structure
+    // the folder will simply be flat — either way, OUT is created inside.
+    let outFolderWebUrl = "";
+    let inFolderWebUrl = "";
+    if (selectedProject?.projectFolderUrl) {
+      const token = await getToken();
+      const { driveId } = await resolveSpIds();
+      let rfiRootPath = spDrivePath(rfi.spFolderUrl);
+      if (!rfiRootPath) {
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const discCode = getDisciplineCode(rfi.discipline);
+        const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
+        const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
+        rfiRootPath    = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
+      }
+      const outPath = await ensureSpFolder(driveId, token, rfiRootPath, "OUT");
+      // The IN folder may or may not exist; we link to it best-effort. We don't
+      // create it here — if the user only filed via PMS and never via the
+      // add-in, there might never have been an /IN, and a stub folder would
+      // be misleading. The chip link can simply 404 in that case.
+      const inPath = rfiRootPath + "/IN";
+
+      // 3. Upload the DOCX to OUT. Uses the same verified upload path as
+      // attachments so it gets the same integrity guarantees.
+      const safeName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
+      const bytes = new Uint8Array(await docxBlob.arrayBuffer());
+      await uploadAttachmentToSharePoint(
+        driveId, token, outPath, safeName,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        bytes
+      );
+
+      outFolderWebUrl = SP_BASE_URL + "/" + outPath.split("/").map(encodeURIComponent).join("/");
+      inFolderWebUrl  = SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/");
+    }
+
+    // 4. Update the RFI record in Supabase
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? {
+        ...r,
+        response: responseText,
+        dateResponded,
+        status: newStatus,
+      } : r),
+    }));
+
+    // 5. Audit-log the response generation. Re-using the filing log so PMS
+    // reconcile sees the OUT folder activity and can verify the docx is there.
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        "milestone:rfi-response:" + rfi.id, // unique-ish key
+      operation:     "rfi-response",
+      sp_folder_url: outFolderWebUrl || null,
+      files:         [{ name: `${rfi.number}_Response.docx`, verified: true, distributionKind: "save-sp" }],
+      email_subject: `${rfi.number} Response`,
+      status:        outFolderWebUrl ? "success" : "partial",
+      error:         outFolderWebUrl ? null : "RFI response logged without SharePoint upload",
+    });
+
+    // 6. Open a prefilled draft to the RFI's original sender (rfi.from) — or
+    // fall back to the assignee if there's no usable sender email.
+    const recipientEmail = _guessEmailForRfi(rfi, selectedProject);
+    const subjectLine = `${rfi.number} Response · ${selectedProject.projectNumber || ""} · ${rfi.title || ""}`.trim();
+    const htmlBody = _buildRfiResponseEmailHtml({ rfi, project: selectedProject, response: responseText, dateResponded, outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl });
+    const draftOpened = openComposeDraft({
+      toEmail: recipientEmail?.email || "",
+      toName:  recipientEmail?.name  || "",
+      subject: subjectLine,
+      htmlBody,
+    });
+
+    setStatus("rfiResponseStatusMsg", "success",
+      `✓ ${rfi.number} response logged (status: ${newStatus})` +
+      (outFolderWebUrl ? " · DOCX in /OUT" : "") +
+      (draftOpened ? " · ✉️ Draft opened" : ""));
+
+    // Refresh the main view's chip so it reflects the new status (Responded).
+    // Slight delay so the success message is visible before nav.
+    setTimeout(() => {
+      try { refreshLoggedArtifactChips(); } catch {}
+      showView("mainView");
+    }, 1500);
+  } catch (e) {
+    setStatus("rfiResponseStatusMsg", "error", "✗ " + e.message);
+    console.error("[rfi-response]", e);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+// Best-effort recipient resolver for an RFI response. Prefers an explicit
+// from-address on the source email; falls back to the assignee. Returns
+// { email, name } or null.
+function _guessEmailForRfi(rfi, project) {
+  // If the original was logged from an email, we may have its from-address on
+  // the email record. The project.emails array has msgId → from/fromAddress.
+  if (rfi.sourceItemId || rfi.sourceMessageId) {
+    const emailRec = (project.emails || []).find(e =>
+      (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
+      (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
+    );
+    if (emailRec?.fromAddress) return { email: emailRec.fromAddress, name: emailRec.from || "" };
+  }
+  // Fall back to assignee (if a sub) — useful when we're sending the response
+  // through the sub who originally received it.
+  if (rfi.subAssigned) {
+    const sub = (project.subconsultants || []).find(s => s.id === rfi.subAssigned);
+    if (sub?.email) return { email: sub.email, name: sub.contact || sub.firm || "" };
+  }
+  // Internal staff don't usually receive RFI responses externally, so we skip
+  // them. The user can type the recipient themselves in the draft.
+  return null;
+}
+
+function _buildRfiResponseEmailHtml({ rfi, project, response, dateResponded, outFolderUrl, inFolderUrl }) {
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const responseEsc = esc(response).replace(/\n/g, "<br>");
+  const links = [];
+  if (outFolderUrl) links.push(`<a href="${esc(outFolderUrl)}">📁 Response folder (OUT) — formal DOCX</a>`);
+  if (inFolderUrl)  links.push(`<a href="${esc(inFolderUrl)}">📁 Original RFI folder (IN)</a>`);
+  return `
+    <p>Hi,</p>
+    <p>Please see our response to <strong>${esc(rfi.number)}</strong> below. The formal response cover sheet is in the SharePoint folder linked at the bottom.</p>
+    <p><strong>Project:</strong> ${esc(projLabel)}<br>
+       <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
+       <strong>Date Responded:</strong> ${esc(dateResponded)}</p>
+    <p><strong>Response:</strong></p>
+    <p style="margin-left:12px">${responseEsc}</p>
+    ${links.map(l => `<p>${l}</p>`).join("")}
+    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+  `.trim();
+}
+
 async function doFileToExistingRfi() {
   const rfiId = document.getElementById("rfiExistingSelect").value;
   if (!rfiId) { setStatus("rfiExistingStatus", "error", "Select an RFI."); return; }
@@ -4873,6 +5356,7 @@ function prefillSub() {
   document.getElementById("subFullDescription").value = "";
   document.getElementById("subNotes").value = "";
   document.getElementById("subAssignedTo").value = "";
+  document.getElementById("subReceivedVia").value = "Email";
   populateSubAssigneeDropdown();
   setSubMode("new");
   renderSubPicker();
@@ -4887,6 +5371,7 @@ async function doSaveSub() {
   const discipline = document.getElementById("subDiscipline").value;
   const fromField = document.getElementById("subFrom").value.trim();
   const notesField = document.getElementById("subNotes").value.trim();
+  const receivedVia = (document.getElementById("subReceivedVia")?.value || "Email");
   const assigneeRaw = (document.getElementById("subAssignedTo")?.value || "");
   let assignedToStaff = [];
   let subAssigned = "";
@@ -4948,6 +5433,7 @@ async function doSaveSub() {
         fullDescription, // longer free-form text (the new field)
         discipline,
         from: fromField,
+        receivedVia,
         dateReceived: received.toISOString().slice(0, 10),
         dueDate: addBizDays(received, 10),
         status: "Received",
@@ -4987,6 +5473,7 @@ async function doSaveSub() {
       document.getElementById("subFullDescription").value = "";
       document.getElementById("subNotes").value = "";
       document.getElementById("subAssignedTo").value = "";
+      document.getElementById("subReceivedVia").value = "Email";
 
       try { refreshLoggedArtifactChips(); } catch {}
 
@@ -5001,6 +5488,165 @@ async function doSaveSub() {
     }
   );
 }
+// ─── LOG SUBMITTAL REVIEW ────────────────────────────────────────────────────
+let _activeReviewSubId = "";
+function openSubReviewView(subId) {
+  const sub = (selectedProject?.submittals || []).find(s => s.id === subId);
+  if (!sub) { setStatus("subReviewStatusMsg", "error", "Submittal not found."); return; }
+  _activeReviewSubId = subId;
+  document.getElementById("subReviewHeader").textContent =
+    `${sub.number}${sub.description ? " — " + sub.description : ""}`;
+  document.getElementById("subReviewStamp").value = sub.stamp || "Approved";
+  document.getElementById("subReviewComments").value = sub.comments || "";
+  document.getElementById("subReviewDate").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("subReviewStatus").value = "Returned";
+  setStatus("subReviewStatusMsg", "", "");
+  showView("subReviewView");
+}
+
+async function submitSubReview() {
+  const subId = _activeReviewSubId;
+  if (!subId) { setStatus("subReviewStatusMsg", "error", "No submittal selected."); return; }
+  const sub = (selectedProject?.submittals || []).find(s => s.id === subId);
+  if (!sub) { setStatus("subReviewStatusMsg", "error", "Submittal no longer in cache."); return; }
+
+  const stamp = (document.getElementById("subReviewStamp")?.value || "—");
+  const comments = (document.getElementById("subReviewComments")?.value || "").trim();
+  const dateReturned = (document.getElementById("subReviewDate")?.value || new Date().toISOString().slice(0, 10));
+  const newStatus = (document.getElementById("subReviewStatus")?.value || "Returned");
+
+  const submitBtn = document.getElementById("submitSubReviewBtn");
+  if (submitBtn) submitBtn.disabled = true;
+  setStatus("subReviewStatusMsg", "info", "⏳ Generating review…");
+
+  try {
+    const docxBlob = await buildSubReviewDocx({
+      sub, project: selectedProject, comments, stamp, dateReturned, status: newStatus,
+    });
+
+    let outFolderWebUrl = "";
+    let inFolderWebUrl = "";
+    if (selectedProject?.projectFolderUrl) {
+      const token = await getToken();
+      const { driveId } = await resolveSpIds();
+      let subRootPath = spDrivePath(sub.spFolderUrl);
+      if (!subRootPath) {
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const discCode = getDisciplineCode(sub.discipline);
+        const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
+        const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
+        subRootPath    = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
+      }
+      const outPath = await ensureSpFolder(driveId, token, subRootPath, "OUT");
+      const inPath  = subRootPath + "/IN";
+
+      const safeName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
+      const bytes = new Uint8Array(await docxBlob.arrayBuffer());
+      await uploadAttachmentToSharePoint(
+        driveId, token, outPath, safeName,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        bytes
+      );
+
+      outFolderWebUrl = SP_BASE_URL + "/" + outPath.split("/").map(encodeURIComponent).join("/");
+      inFolderWebUrl  = SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/");
+    }
+
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      submittals: (fresh.submittals || []).map(s => s.id === sub.id ? {
+        ...s,
+        stamp,
+        comments,
+        dateReturned,
+        status: newStatus,
+      } : s),
+    }));
+
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        "milestone:sub-review:" + sub.id,
+      operation:     "sub-review",
+      sp_folder_url: outFolderWebUrl || null,
+      files:         [{ name: `${sub.number}_Review.docx`, verified: true, distributionKind: "save-sp" }],
+      email_subject: `${sub.number} Review`,
+      status:        outFolderWebUrl ? "success" : "partial",
+      error:         outFolderWebUrl ? null : "Submittal review logged without SharePoint upload",
+    });
+
+    // For submittals, the return recipient is most commonly the original sender
+    // (GC/Prime) who submitted it. Same email-record lookup as RFIs.
+    const recipientEmail = _guessEmailForSub(sub, selectedProject);
+    const subjectLine = `${sub.number} Review · ${selectedProject.projectNumber || ""} · ${sub.description || ""}`.trim();
+    const htmlBody = _buildSubReviewEmailHtml({
+      sub, project: selectedProject, stamp, comments, dateReturned,
+      outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl,
+    });
+    const draftOpened = openComposeDraft({
+      toEmail: recipientEmail?.email || "",
+      toName:  recipientEmail?.name || "",
+      subject: subjectLine,
+      htmlBody,
+    });
+
+    setStatus("subReviewStatusMsg", "success",
+      `✓ ${sub.number} review logged (stamp: ${stamp})` +
+      (outFolderWebUrl ? " · DOCX in /OUT" : "") +
+      (draftOpened ? " · ✉️ Draft opened" : ""));
+
+    setTimeout(() => {
+      try { refreshLoggedArtifactChips(); } catch {}
+      showView("mainView");
+    }, 1500);
+  } catch (e) {
+    setStatus("subReviewStatusMsg", "error", "✗ " + e.message);
+    console.error("[sub-review]", e);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+function _guessEmailForSub(sub, project) {
+  if (sub.sourceItemId || sub.sourceMessageId) {
+    const emailRec = (project.emails || []).find(e =>
+      (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
+      (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
+    );
+    if (emailRec?.fromAddress) return { email: emailRec.fromAddress, name: emailRec.from || "" };
+  }
+  if (sub.subAssigned) {
+    const s = (project.subconsultants || []).find(x => x.id === sub.subAssigned);
+    if (s?.email) return { email: s.email, name: s.contact || s.firm || "" };
+  }
+  return null;
+}
+
+function _buildSubReviewEmailHtml({ sub, project, stamp, comments, dateReturned, outFolderUrl, inFolderUrl }) {
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const stampColor =
+    stamp === "Approved"            ? "#059669" :
+    stamp === "Approved as Noted"   ? "#0891b2" :
+    stamp === "Revise and Resubmit" ? "#ea580c" :
+    stamp === "Rejected"            ? "#b91c1c" : "#1e3a8a";
+  const commentsEsc = esc(comments).replace(/\n/g, "<br>");
+  const links = [];
+  if (outFolderUrl) links.push(`<a href="${esc(outFolderUrl)}">📁 Review folder (OUT) — formal DOCX</a>`);
+  if (inFolderUrl)  links.push(`<a href="${esc(inFolderUrl)}">📁 Original submittal folder (IN)</a>`);
+  return `
+    <p>Hi,</p>
+    <p>We've completed our review of <strong>${esc(sub.number)}</strong>. The formal review cover sheet (with stamp + comments) is in the SharePoint folder linked below.</p>
+    <p><strong>Project:</strong> ${esc(projLabel)}<br>
+       <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
+       <strong>Stamp:</strong> <span style="color:${stampColor};font-weight:bold">${esc(stamp)}</span><br>
+       <strong>Date Returned:</strong> ${esc(dateReturned)}</p>
+    ${comments ? `<p><strong>Comments:</strong></p><p style="margin-left:12px">${commentsEsc}</p>` : ""}
+    ${links.map(l => `<p>${l}</p>`).join("")}
+    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+  `.trim();
+}
+
 async function doFileToExistingSub() {
   const subId = document.getElementById("subExistingSelect").value;
   if (!subId) { setStatus("subExistingStatus", "error", "Select a submittal."); return; }
