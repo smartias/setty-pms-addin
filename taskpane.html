@@ -741,6 +741,11 @@
     <a id="oneNoteLinkAnchor" href="#" target="_blank" style="font-size:13px;font-weight:600;color:var(--primary);text-decoration:none;">Open in OneNote →</a>
   </div>
 
+  <!-- "Already logged as RFI / Submittal" chip row. Populated by
+       refreshLoggedArtifactChips() based on RFI/Submittal records whose
+       sourceItemId matches the current email. Empty by default. -->
+  <div id="loggedAsArtifactChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;"></div>
+
   <!-- Primary action zone — the 80/20 actions, always visible.
        Twin-save row: SharePoint (email + attachments) and Project Record (email body copy). -->
   <div class="save-row">

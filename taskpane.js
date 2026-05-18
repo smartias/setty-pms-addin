@@ -506,6 +506,7 @@ function loadItemContext() {
     setSelectedProject(null, false);
     void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
+    try { refreshLoggedArtifactChips(); } catch {}
     maybeShowAecQuip();
   }
 }
@@ -597,7 +598,89 @@ function getLoggedEmailArtifactLabels(project) {
   if (hasNote) labels.push("note");
   if (hasActionItem) labels.push("action item");
   if (hasMilestone) labels.push("milestone");
+  // Surface RFIs/Submittals here too so they show up in the "also logged as"
+  // line of the saved-email indicator. The dedicated chip row above the save
+  // buttons (refreshLoggedArtifactChips) gives the prominent affordance the
+  // user expects for these specifically.
+  const rfiMatch = (project.rfis || []).some(r =>
+    r?.sourceItemId === sourceItemId || sourceMessageIds.includes(r?.sourceMessageId)
+  );
+  const subMatch = (project.submittals || []).some(s =>
+    s?.sourceItemId === sourceItemId || sourceMessageIds.includes(s?.sourceMessageId)
+  );
+  if (rfiMatch) labels.push("RFI");
+  if (subMatch) labels.push("Submittal");
   return labels;
+}
+
+// Returns RFI/Submittal records whose sourceItemId or sourceMessageId matches
+// the currently-open mailbox item. Used by refreshLoggedArtifactChips to
+// surface "Logged as RFI-XXX on Date" chips on the main view.
+function getLoggedRfiSubArtifacts(project) {
+  if (!project || !emailItem?.itemId) return [];
+  const sourceItemId = emailItem.itemId;
+  const sourceMessageIds = getCurrentMessageIdCandidates();
+  const matches = [];
+  for (const r of (project.rfis || [])) {
+    if (r?.sourceItemId === sourceItemId || (r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId))) {
+      matches.push({
+        kind: "rfi",
+        id: r.id,
+        number: r.number || "RFI",
+        title: r.title || "",
+        date: r.createdAt || r.dateReceived || null,
+        spFolderUrl: r.spFolderUrl || "",
+      });
+    }
+  }
+  for (const s of (project.submittals || [])) {
+    if (s?.sourceItemId === sourceItemId || (s?.sourceMessageId && sourceMessageIds.includes(s.sourceMessageId))) {
+      matches.push({
+        kind: "sub",
+        id: s.id,
+        number: s.number || "SUB",
+        title: s.description || "",
+        date: s.createdAt || s.dateReceived || null,
+        spFolderUrl: s.spFolderUrl || "",
+      });
+    }
+  }
+  return matches;
+}
+
+// Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
+// to the SharePoint folder when one is stored. Hidden when nothing applies.
+function refreshLoggedArtifactChips() {
+  const container = document.getElementById("loggedAsArtifactChips");
+  if (!container) return;
+  if (!selectedProject || !emailItem?.itemId) {
+    container.innerHTML = "";
+    container.style.display = "none";
+    return;
+  }
+  const artifacts = getLoggedRfiSubArtifacts(selectedProject);
+  if (artifacts.length === 0) {
+    container.innerHTML = "";
+    container.style.display = "none";
+    return;
+  }
+  container.style.display = "flex";
+  container.innerHTML = artifacts.map(a => {
+    const dateStr = a.date
+      ? new Date(a.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+      : "earlier";
+    const icon = a.kind === "rfi" ? "🔵" : "📋";
+    const bg = a.kind === "rfi" ? "#dbeafe" : "#ede9fe";
+    const border = a.kind === "rfi" ? "#93c5fd" : "#c4b5fd";
+    const color = a.kind === "rfi" ? "#1e3a8a" : "#5b21b6";
+    const label = `${icon} Logged as ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}`;
+    const safeLabel = label.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (a.spFolderUrl) {
+      const safeUrl = a.spFolderUrl.replace(/"/g, "&quot;");
+      return `<a href="${safeUrl}" target="_blank" rel="noreferrer" style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;text-decoration:none;white-space:nowrap;">${safeLabel}</a>`;
+    }
+    return `<span style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:${bg};border:1px solid ${border};color:${color};font-size:11px;font-weight:600;white-space:nowrap;">${safeLabel}</span>`;
+  }).join("");
 }
 function refreshEmailSavedIndicator(animate = false) {
   const btnSharePoint = document.getElementById("saveSpBtn");
@@ -1836,6 +1919,9 @@ function setSelectedProject(project, persistForEmail = false) {
   // the project isn't in CA. Runs every time the selection changes so a
   // status update in PMS naturally flows through on the next selection.
   applyConstructionAdminGuard();
+  // Re-render the "Logged as RFI/Sub" chip row — different project may have
+  // different artifacts sourced from the same email.
+  try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[chips] refresh failed:", e.message); }
   const badge = document.getElementById("selectedProjectBadge");
   const badgeText = document.getElementById("selectedProjectBadgeText");
   const clearBtn = document.getElementById("clearProjectTagBtn");
@@ -4673,6 +4759,10 @@ async function doSaveRfi() {
       document.getElementById("rfiNotes").value = "";
       document.getElementById("rfiAssignedTo").value = "";
 
+      // Refresh the "Logged as RFI" chip so the main view reflects the new state
+      // when the user navigates back from the RFI form.
+      try { refreshLoggedArtifactChips(); } catch {}
+
       const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : ""));
       return {
@@ -4735,13 +4825,76 @@ async function doFileToExistingRfi() {
   );
 }
 // ─── LOG SUBMITTAL ────────────────────────────────────────────────────────────
+// Populate the Submittal assignee dropdown — same logic as RFI: team always,
+// subs only when Setty is prime. Option values use the same "staff:<id>" /
+// "sub:<id>" encoding so resolveAssignee handles both.
+function populateSubAssigneeDropdown() {
+  const sel = document.getElementById("subAssignedTo");
+  const hint = document.getElementById("subAssignHint");
+  if (!sel) return;
+  const project = selectedProject;
+  const team = (project?.teamMembers || []).filter(m => m && (m.name || m.role));
+  const subs = (project?.subconsultants || []).filter(s => s && s.firm);
+  const isPrime = isSettyFirm(project?.prime || "");
+  const opts = ['<option value="">— Unassigned —</option>'];
+  if (team.length) {
+    opts.push('<optgroup label="Team (internal)">');
+    for (const m of team) {
+      const label = m.name || m.role || "Unnamed";
+      const role = m.role && m.name ? ` · ${m.role}` : "";
+      opts.push(`<option value="staff:${m.id}">${escHtml(label)}${escHtml(role)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  if (isPrime && subs.length) {
+    opts.push('<optgroup label="Subconsultants">');
+    for (const s of subs) {
+      const contact = s.contact ? ` · ${s.contact}` : "";
+      opts.push(`<option value="sub:${s.id}">${escHtml(s.firm)}${escHtml(contact)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  sel.innerHTML = opts.join("");
+  if (hint) {
+    hint.textContent = isPrime && subs.length
+      ? "(team or sub firm — we're prime on this project)"
+      : team.length ? "" : "(no team members on this project)";
+  }
+}
+
+function nextAutoSubNumber() {
+  const count = (selectedProject?.submittals || []).length + 1;
+  return "SUB-" + String(count).padStart(3, "0");
+}
+
 function prefillSub() {
+  document.getElementById("subDesc").value = emailItem?.subject || "";
+  document.getElementById("subNumber").value = nextAutoSubNumber();
+  document.getElementById("subFullDescription").value = "";
+  document.getElementById("subNotes").value = "";
+  document.getElementById("subAssignedTo").value = "";
+  populateSubAssigneeDropdown();
   setSubMode("new");
   renderSubPicker();
 }
 async function doSaveSub() {
   const desc = document.getElementById("subDesc").value.trim();
   if (!desc) { setStatus("subStatus", "error", "Description is required."); return; }
+  // Sync DOM reads before any await
+  const userEnteredNumber = (document.getElementById("subNumber")?.value || "").trim();
+  const fullDescription = (document.getElementById("subFullDescription")?.value || "").trim();
+  const specSection = document.getElementById("subSpec").value.trim();
+  const discipline = document.getElementById("subDiscipline").value;
+  const fromField = document.getElementById("subFrom").value.trim();
+  const notesField = document.getElementById("subNotes").value.trim();
+  const assigneeRaw = (document.getElementById("subAssignedTo")?.value || "");
+  let assignedToStaff = [];
+  let subAssigned = "";
+  if (assigneeRaw.startsWith("staff:")) {
+    assignedToStaff = [assigneeRaw.slice("staff:".length)];
+  } else if (assigneeRaw.startsWith("sub:")) {
+    subAssigned = assigneeRaw.slice("sub:".length);
+  }
   return withFilingScaffold(
     { operation: "sub-new", statusElement: "subStatus" },
     async ({ snapItem }) => {
@@ -4759,43 +4912,91 @@ async function doSaveSub() {
       } catch { /* fall back to cache */ }
 
       const existing = freshProject.submittals || [];
-      const nextNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
+      const autoNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
+      const subNumber = userEnteredNumber || autoNum;
+      const discCode = getDisciplineCode(discipline);
       const received = new Date();
+
+      // New folder structure: <projFolder>/Submittals/<discCode>/<SUB-NNN>/IN
       let spFolderUrl = "";
+      let inFolderWebUrl = "";
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
           const { driveId } = await resolveSpIds();
           const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
-          const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-          spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"), snapItem);
-        } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
+          const safeSubNumber = subNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+          const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
+          const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
+          const subPath  = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
+          const inPath   = await ensureSpFolder(driveId, token, subPath, "IN");
+          await writeSpMetadataSidecar(driveId, token, subPath, buildAddinMetadata(freshProject, "submittal"));
+          await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+          const subPathEncoded = subPath.split("/").map(encodeURIComponent).join("/");
+          const inPathEncoded  = inPath.split("/").map(encodeURIComponent).join("/");
+          spFolderUrl    = SP_BASE_URL + "/" + subPathEncoded;
+          inFolderWebUrl = SP_BASE_URL + "/" + inPathEncoded;
+        } catch (e) {
+          console.warn("Submittal SP upload failed:", e.message);
+        }
       }
+
       const sub = {
-        id: uid(), number: nextNum,
-        specSection: document.getElementById("subSpec").value.trim(),
+        id: uid(), number: subNumber,
+        specSection,
         description: desc,
-        discipline: document.getElementById("subDiscipline").value,
-        from: document.getElementById("subFrom").value.trim(),
+        fullDescription, // longer free-form text (the new field)
+        discipline,
+        from: fromField,
         dateReceived: received.toISOString().slice(0, 10),
         dueDate: addBizDays(received, 10),
         status: "Received",
-        notes: document.getElementById("subNotes").value.trim(),
-        assignedTo: [], spFolderUrl, links: [],
+        notes: notesField,
+        assignedTo: assignedToStaff,
+        subAssigned,
+        spFolderUrl, links: [],
+        sourceItemId:      snapItem?.itemId || "",
+        sourceMessageId:   getCurrentSharedMessageId() || "",
+        sourceCalendarUId: currentItemICalUId || "",
         createdAt: new Date().toISOString(),
       };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
         submittals: [...(fresh.submittals || []), sub],
       }));
+
+      // Open prefilled draft to the assignee
+      const assignee = resolveAssignee(assigneeRaw, freshProject);
+      let draftOpened = false;
+      if (assignee) {
+        const subjectLine = `${subNumber} · ${freshProject.projectNumber || ""} · ${desc}`.trim();
+        const htmlBody = buildSubAssignmentEmailHtml({
+          sub, project: freshProject, assignee, inFolderUrl: inFolderWebUrl || spFolderUrl,
+        });
+        draftOpened = openComposeDraft({
+          toEmail: assignee.email,
+          toName:  assignee.name,
+          subject: subjectLine,
+          htmlBody,
+        });
+      }
+
       document.getElementById("subDesc").value = "";
       document.getElementById("subSpec").value = "";
+      document.getElementById("subNumber").value = "";
+      document.getElementById("subFullDescription").value = "";
       document.getElementById("subNotes").value = "";
+      document.getElementById("subAssignedTo").value = "";
+
+      try { refreshLoggedArtifactChips(); } catch {}
+
+      const baseMsg = "✓ " + subNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
+      const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "");
       return {
         sp_folder_url:  spFolderUrl || null,
         status:         spFolderUrl ? "success" : "partial",
         error:          spFolderUrl ? null : "Submittal logged without SharePoint upload",
-        successMessage: "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""),
+        successMessage: baseMsg + draftMsg,
       };
     }
   );
@@ -4810,18 +5011,24 @@ async function doFileToExistingSub() {
     async ({ snapItem }) => {
       const token = await getToken();
       const { driveId } = await resolveSpIds();
-      let targetPath = spDrivePath(sub.spFolderUrl);
-      if (!targetPath) {
+      // Resolve the submittal's root folder; new structure or legacy flat layout
+      // both work — creating IN inside an existing folder is safe.
+      let subRootPath = spDrivePath(sub.spFolderUrl);
+      if (!subRootPath) {
         if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
         const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-        const safeName = (sub.number + " " + (sub.description || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const discCode = getDisciplineCode(sub.discipline);
+        const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
         const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-        targetPath = await ensureSpFolder(driveId, token, subsPath, safeName);
+        const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
+        subRootPath    = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
       }
-      const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
+      // Incoming correspondence for a submittal lands in the IN subfolder.
+      const inPath = await ensureSpFolder(driveId, token, subRootPath, "IN");
+      const attCount = await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
       let finalUrl = sub.spFolderUrl;
       if (!sub.spFolderUrl) {
-        finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        finalUrl = SP_BASE_URL + "/" + subRootPath.split("/").map(encodeURIComponent).join("/");
         await applyLocalChangeAndSave(selectedProject.id, fresh => ({
           ...fresh,
           submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: finalUrl } : s),
@@ -4837,7 +5044,7 @@ async function doFileToExistingSub() {
         sp_folder_url:  finalUrl,
         status,
         error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
-        successMessage: "✓ Filed to " + sub.number + attMsg,
+        successMessage: "✓ Filed to " + sub.number + " · IN" + attMsg,
       };
     }
   );
