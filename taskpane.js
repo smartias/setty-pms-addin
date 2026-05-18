@@ -952,22 +952,90 @@ const SB_HEADERS = {
   "Content-Type": "application/json",
   "Prefer": "return=minimal",
 };
-// Quick-Win #6: localStorage cache for the projects/clients list. Pane opens
-// instantly with last-known data; freshness fetch runs in the background and
-// re-renders if anything changed. Without this, the pane shows a blank state
-// while the V2 fetch round-trips Supabase (~300-800ms cold, longer on slow
-// VPN). With cache, perceived open time drops to ~50ms.
-const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV2";
+// localStorage cache for the projects/clients picker. Two changes vs prior
+// "v2" format:
+//   1. Strip projects + clients down to the fields the pane actually reads
+//      (picker, status banners, OneNote/Teams display). Nested arrays
+//      (rfis/submittals/changeOrders/milestones/emails/notes/links) are NOT
+//      cached — they're not used in the pane, and any save flow re-fetches
+//      the full project from Supabase via fetchFreshProjectV2 anyway.
+//   2. pako-compress before storing. Even after stripping, a busy firm with
+//      many clients/contacts can produce 100 KB+ of cache; compression
+//      drops it to ~15 KB and pushes the quota ceiling out of reach.
+// Cache key bumped to v3 so any stale uncompressed v2 entries are ignored
+// (and overwritten on first save).
+const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV3";
 const PROJECTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h hard limit; revalidate every open
+
+// Cache-strip strategy: keep all top-level fields (the pane reads project.emails,
+// .notes, .milestones, .rfis, .submittals for picker, banner, duplicate-check),
+// but drop the LARGE content fields within each nested record. The biggest
+// offenders are email bodies (bodyHtmlCompressed: ~5-30 KB per email) — those
+// alone account for most localStorage growth. Note bodies, RFI/submittal long
+// text, and link arrays are also stripped. None of these are needed by anything
+// the add-in reads from cache: bodies are re-fetched from Supabase on display.
+//
+// Result: a project with 20 saved emails goes from ~250 KB → ~5 KB in cache,
+// before compression. After pako, typically <1 KB per project.
+function _stripProjectForCache(p) {
+  if (!p) return p;
+  const out = { ...p };
+  if (Array.isArray(p.emails)) {
+    out.emails = p.emails.map(e => {
+      const { bodyHtmlCompressed, bodyHtml, bodyText, bodyHtmlSize, links, ...rest } = e || {};
+      return rest;
+    });
+  }
+  if (Array.isArray(p.notes)) {
+    out.notes = p.notes.map(n => {
+      const { body, bodyHtml, links, ...rest } = n || {};
+      return rest;
+    });
+  }
+  if (Array.isArray(p.rfis)) {
+    out.rfis = p.rfis.map(r => {
+      const { notes, links, ...rest } = r || {};
+      return rest;
+    });
+  }
+  if (Array.isArray(p.submittals)) {
+    out.submittals = p.submittals.map(s => {
+      const { notes, links, ...rest } = s || {};
+      return rest;
+    });
+  }
+  if (Array.isArray(p.changeOrders)) {
+    out.changeOrders = p.changeOrders.map(co => {
+      const { notes, links, ...rest } = co || {};
+      return rest;
+    });
+  }
+  return out;
+}
 
 function loadProjectsCache() {
   try {
     const raw = localStorage.getItem(PROJECTS_CACHE_KEY);
     if (!raw) return null;
-    const cached = JSON.parse(raw);
-    if (!cached || !Array.isArray(cached.projects)) return null;
-    if (!cached.savedAt || (Date.now() - cached.savedAt) > PROJECTS_CACHE_TTL_MS) return null;
-    return cached;
+    // New v3 format: base64-deflate of JSON. If pako isn't loaded yet, fall
+    // back gracefully (caller treats null as cache miss).
+    if (typeof pako === "undefined") return null;
+    let parsed;
+    try {
+      const binary = atob(raw);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const json = pako.inflate(bytes, { to: "string" });
+      parsed = JSON.parse(json);
+    } catch {
+      // Malformed entry (could be a stale uncompressed v2 blob that was
+      // overwritten under the same key by an older client). Toss it.
+      localStorage.removeItem(PROJECTS_CACHE_KEY);
+      return null;
+    }
+    if (!parsed || !Array.isArray(parsed.projects)) return null;
+    if (!parsed.savedAt || (Date.now() - parsed.savedAt) > PROJECTS_CACHE_TTL_MS) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -975,13 +1043,34 @@ function loadProjectsCache() {
 
 function saveProjectsCache(projects, clients, versionMap) {
   try {
-    const payload = {
-      projects,
-      clients: clients || [],
+    // Surgical strip: keep all top-level fields and nested arrays, drop only
+    // large content fields within each nested record. See _stripProjectForCache
+    // for details. Clients aren't stripped (already small).
+    const stripped = {
+      projects: (projects || []).map(_stripProjectForCache),
+      clients:  clients || [],
       versionMap: versionMap || {},
       savedAt: Date.now(),
     };
-    localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify(payload));
+    if (typeof pako === "undefined") {
+      // No compressor available — at least don't write the unstripped legacy
+      // shape. We could fall back to plain JSON.stringify(stripped) but if
+      // the user's localStorage is already near the cap, even that may fail.
+      // Better to skip caching this open and pick it up next open when pako
+      // (which loads via <script defer>) has arrived.
+      console.info("[cache] pako not yet loaded — skipping cache save this cycle");
+      return;
+    }
+    const json = JSON.stringify(stripped);
+    const deflated = pako.deflate(json, { level: 6 });
+    // Uint8Array → binary string → base64. Batch fromCharCode to avoid stack
+    // overflow on large inputs (same pattern used by compressHtmlAddin).
+    let binary = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < deflated.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, deflated.subarray(i, i + CHUNK));
+    }
+    localStorage.setItem(PROJECTS_CACHE_KEY, btoa(binary));
   } catch (e) {
     // QuotaExceeded is the most likely failure; silently drop. Cache is an
     // optimization, not a correctness requirement.
@@ -3340,6 +3429,87 @@ async function withSaveGuard(name, fn, buttonIds = []) {
   }
 }
 
+// ─── SHARED FILING SCAFFOLDING ───────────────────────────────────────────────
+// Every filing operation (Log RFI new/existing, Log Submittal new/existing,
+// plus eventually Save SP and others) goes through the same boilerplate:
+//   - check selectedProject + saveInFlight
+//   - snapshot the mailbox item before any await (item-switch race protection)
+//   - enqueue a crash-recovery intent in localStorage
+//   - set saveInFlight = true
+//   - try { runUpload } catch { log failed } finally { saveInFlight = false }
+//   - on success, log success + dequeue
+//
+// Before this helper, that ~30 lines of scaffolding lived in each save flow
+// (4× duplication, 5× counting Save SP). Adding the audit log this session
+// meant editing 5 places and the risk of missing one. Now there's one place.
+//
+// runUpload receives { snapItem, statusElement, project } and returns:
+//   {
+//     sp_folder_url?: string,   // for the audit log
+//     files?: array,            // for the audit log (defaults to lastAttachmentUploadStats.uploadedFiles)
+//     status?: "success" | "partial",  // audit log status; defaults to "success"
+//     error?: string,           // explanation if partial; for the audit log
+//     successMessage?: string,  // text shown in the status banner on success
+//   }
+//
+// Throwing from runUpload triggers the error path: status banner shows "✗ ..."
+// and a "failed" audit log row is written. The queue entry stays in place so
+// it surfaces on next taskpane open as a crash-recovery candidate.
+async function withFilingScaffold(opts, runUpload) {
+  const { operation, statusElement, startMessage = "⏳ Saving…" } = opts;
+  if (!selectedProject) {
+    setStatus(statusElement, "error", "No project selected.");
+    return;
+  }
+  if (saveInFlight) {
+    setStatus(statusElement, "info", "⏳ Another save is in progress; please wait.");
+    return;
+  }
+  // Snapshot BEFORE any await — protects against item-switch races.
+  const snapItem = emailItem;
+  const queueId = enqueueFilingIntent({
+    project_id:    selectedProject.id,
+    project_name:  selectedProject.name || "",
+    msg_id:        snapItem?.itemId || null,
+    operation,
+    email_subject: snapItem?.subject || "",
+  });
+  saveInFlight = true;
+  setStatus(statusElement, "info", startMessage);
+  try {
+    const result = await runUpload({ snapItem, statusElement, project: selectedProject });
+    if (result?.successMessage != null) {
+      setStatus(statusElement, "success", result.successMessage);
+    }
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation,
+      email_subject: snapItem?.subject || null,
+      sp_folder_url: result?.sp_folder_url || null,
+      files:         result?.files !== undefined ? result.files : (lastAttachmentUploadStats?.uploadedFiles || []),
+      status:        result?.status || "success",
+      error:         result?.error || null,
+    });
+    dequeueFilingIntent(queueId);
+    return result;
+  } catch (e) {
+    setStatus(statusElement, "error", "✗ " + e.message);
+    void logFilingOp({
+      project_id:    selectedProject.id,
+      msg_id:        snapItem?.itemId || null,
+      operation,
+      email_subject: snapItem?.subject || null,
+      status:        "failed",
+      error:         e.message,
+    });
+    // Queue entry intentionally NOT dequeued — surfaces on next open as
+    // a previous-save-did-not-complete banner.
+  } finally {
+    saveInFlight = false;
+  }
+}
+
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
 async function doSaveToSharePoint() {
   return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
@@ -4182,166 +4352,109 @@ function prefillRfi() {
   renderRfiPicker();
 }
 async function doSaveRfi() {
-  if (!selectedProject) { setStatus("rfiStatus", "error", "No project selected."); return; }
-  if (saveInFlight) { setStatus("rfiStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const title = document.getElementById("rfiTitle").value.trim();
   if (!title) { setStatus("rfiStatus", "error", "Title is required."); return; }
-  // Snapshot the mailbox item before any await — protects attachment bytes
-  // from item-switch race during the SharePoint write.
-  const snapItem = emailItem;
-  const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        snapItem?.itemId || null,
-    operation:     "rfi-new",
-    email_subject: snapItem?.subject || "",
-  });
-  saveInFlight = true;
-  setStatus("rfiStatus", "info", "⏳ Saving…");
-  try {
-    // Re-fetch fresh project data so the RFI number reflects what's actually in
-    // the cloud — not the add-in's possibly-stale cache. Prevents two users from
-    // independently picking the same RFI number when both edit at the same time.
-    // Reads from pms_projects (V2) — pms_data is frozen at migration time and
-    // doesn't include projects created post-migration.
-    let freshProject = selectedProject;
-    try {
-      const res = await fetch(
-        SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
-        { headers: SB_HEADERS }
-      );
-      if (res.ok) {
-        const rows = await res.json();
-        if (rows?.[0]?.project) freshProject = rows[0].project;
-      }
-    } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
-
-    const existingRfis = freshProject.rfis || [];
-    const nextNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
-    const received = new Date();
-    let spFolderUrl = "";
-    if (freshProject.projectFolderUrl) {
+  return withFilingScaffold(
+    { operation: "rfi-new", statusElement: "rfiStatus" },
+    async ({ snapItem }) => {
+      // Re-fetch fresh project data so the RFI number reflects what's actually
+      // in the cloud — not the add-in's possibly-stale cache. Prevents two
+      // users from independently picking the same RFI number.
+      let freshProject = selectedProject;
       try {
-        const token = await getToken();
-        const { driveId } = await resolveSpIds();
-        const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
-        const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"), snapItem);
-      } catch (e) { console.warn("RFI SP upload failed:", e.message); }
-    }
-    const rfi = {
-      id: uid(), number: nextNum, title,
-      discipline: document.getElementById("rfiDiscipline").value,
-      from: document.getElementById("rfiFrom").value.trim(),
-      dateReceived: received.toISOString().slice(0, 10),
-      dueDate: addBizDays(received, 5),
-      status: "Open",
-      notes: document.getElementById("rfiNotes").value.trim(),
-      assignedTo: [], spFolderUrl, links: [],
-      createdAt: new Date().toISOString(),
-    };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      rfis: [...(fresh.rfis || []), rfi],
-    }));
-    setStatus("rfiStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "rfi-new",
-      sp_folder_url: spFolderUrl || null,
-      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
-      email_subject: snapItem?.subject || null,
-      status:        spFolderUrl ? "success" : "partial",
-      error:         spFolderUrl ? null : "RFI logged without SharePoint upload",
-    });
-    dequeueFilingIntent(queueId);
-    document.getElementById("rfiTitle").value = "";
-    document.getElementById("rfiNotes").value = "";
-  } catch (e) {
-    setStatus("rfiStatus", "error", "✗ " + e.message);
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "rfi-new",
-      email_subject: snapItem?.subject || null,
-      status:        "failed",
-      error:         e.message,
-    });
-  } finally {
-    saveInFlight = false;
-  }
-}
-async function doFileToExistingRfi() {
-  if (!selectedProject) { setStatus("rfiExistingStatus", "error", "Select a project first."); return; }
-  const rfiId = document.getElementById("rfiExistingSelect").value;
-  if (!rfiId) { setStatus("rfiExistingStatus", "error", "Select an RFI."); return; }
-  if (saveInFlight) { setStatus("rfiExistingStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  const rfi = (selectedProject.rfis || []).find(r => r.id === rfiId);
-  if (!rfi) { setStatus("rfiExistingStatus", "error", "RFI not found."); return; }
-  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
-  const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        snapItem?.itemId || null,
-    operation:     "rfi-existing",
-    email_subject: snapItem?.subject || "",
-  });
-  saveInFlight = true;
-  setStatus("rfiExistingStatus", "info", "⏳ Filing email…");
-  try {
-    const token = await getToken();
-    const { driveId } = await resolveSpIds();
-    // Use the existing SP folder if set, otherwise create it under the project folder
-    let targetPath = spDrivePath(rfi.spFolderUrl);
-    if (!targetPath) {
-      if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
-      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-      const safeName = (rfi.number + " " + (rfi.title || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-      const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-      targetPath = await ensureSpFolder(driveId, token, rfisPath, safeName);
-    }
-    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
-    // If this RFI didn't have a spFolderUrl yet, store it now
-    let finalUrl = rfi.spFolderUrl;
-    if (!rfi.spFolderUrl) {
-      finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        const res = await fetch(
+          SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
+          { headers: SB_HEADERS }
+        );
+        if (res.ok) {
+          const rows = await res.json();
+          if (rows?.[0]?.project) freshProject = rows[0].project;
+        }
+      } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
+
+      const existingRfis = freshProject.rfis || [];
+      const nextNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
+      const received = new Date();
+      let spFolderUrl = "";
+      if (freshProject.projectFolderUrl) {
+        try {
+          const token = await getToken();
+          const { driveId } = await resolveSpIds();
+          const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
+          const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+          spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"), snapItem);
+        } catch (e) { console.warn("RFI SP upload failed:", e.message); }
+      }
+      const rfi = {
+        id: uid(), number: nextNum, title,
+        discipline: document.getElementById("rfiDiscipline").value,
+        from: document.getElementById("rfiFrom").value.trim(),
+        dateReceived: received.toISOString().slice(0, 10),
+        dueDate: addBizDays(received, 5),
+        status: "Open",
+        notes: document.getElementById("rfiNotes").value.trim(),
+        assignedTo: [], spFolderUrl, links: [],
+        createdAt: new Date().toISOString(),
+      };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
-        rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: finalUrl } : r),
+        rfis: [...(fresh.rfis || []), rfi],
       }));
+      document.getElementById("rfiTitle").value = "";
+      document.getElementById("rfiNotes").value = "";
+      return {
+        sp_folder_url:  spFolderUrl || null,
+        status:         spFolderUrl ? "success" : "partial",
+        error:          spFolderUrl ? null : "RFI logged without SharePoint upload",
+        successMessage: "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""),
+      };
     }
-    const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
-    setStatus("rfiExistingStatus", "success", "✓ Filed to " + rfi.number + attMsg);
-    const attempted = lastAttachmentUploadStats?.attempted || 0;
-    const status =
-      (attempted > 0 && attCount === 0)       ? "failed" :
-      (attempted > 0 && attCount < attempted) ? "partial" :
-      "success";
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "rfi-existing",
-      sp_folder_url: finalUrl,
-      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
-      email_subject: snapItem?.subject || null,
-      status,
-      error:         status === "success" ? null : `${attCount}/${attempted} uploaded`,
-    });
-    dequeueFilingIntent(queueId);
-  } catch (e) {
-    setStatus("rfiExistingStatus", "error", "✗ " + e.message);
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "rfi-existing",
-      email_subject: snapItem?.subject || null,
-      status:        "failed",
-      error:         e.message,
-    });
-  } finally {
-    saveInFlight = false;
-  }
+  );
+}
+async function doFileToExistingRfi() {
+  const rfiId = document.getElementById("rfiExistingSelect").value;
+  if (!rfiId) { setStatus("rfiExistingStatus", "error", "Select an RFI."); return; }
+  // selectedProject existence is re-checked inside the scaffold; we read .rfis
+  // here for the pre-flight which is fine since it's synchronous.
+  const rfi = (selectedProject?.rfis || []).find(r => r.id === rfiId);
+  if (!rfi) { setStatus("rfiExistingStatus", "error", "RFI not found."); return; }
+  return withFilingScaffold(
+    { operation: "rfi-existing", statusElement: "rfiExistingStatus", startMessage: "⏳ Filing email…" },
+    async ({ snapItem }) => {
+      const token = await getToken();
+      const { driveId } = await resolveSpIds();
+      // Use the existing SP folder if set, otherwise create it under the project folder
+      let targetPath = spDrivePath(rfi.spFolderUrl);
+      if (!targetPath) {
+        if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const safeName = (rfi.number + " " + (rfi.title || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
+        targetPath = await ensureSpFolder(driveId, token, rfisPath, safeName);
+      }
+      const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
+      let finalUrl = rfi.spFolderUrl;
+      if (!rfi.spFolderUrl) {
+        finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+          ...fresh,
+          rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: finalUrl } : r),
+        }));
+      }
+      const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
+      const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const status =
+        (attempted > 0 && attCount === 0)       ? "failed" :
+        (attempted > 0 && attCount < attempted) ? "partial" :
+        "success";
+      return {
+        sp_folder_url:  finalUrl,
+        status,
+        error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
+        successMessage: "✓ Filed to " + rfi.number + attMsg,
+      };
+    }
+  );
 }
 // ─── LOG SUBMITTAL ────────────────────────────────────────────────────────────
 function prefillSub() {
@@ -4349,162 +4462,107 @@ function prefillSub() {
   renderSubPicker();
 }
 async function doSaveSub() {
-  if (!selectedProject) { setStatus("subStatus", "error", "No project selected."); return; }
-  if (saveInFlight) { setStatus("subStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const desc = document.getElementById("subDesc").value.trim();
   if (!desc) { setStatus("subStatus", "error", "Description is required."); return; }
-  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
-  const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        snapItem?.itemId || null,
-    operation:     "sub-new",
-    email_subject: snapItem?.subject || "",
-  });
-  saveInFlight = true;
-  setStatus("subStatus", "info", "⏳ Saving…");
-  try {
-    // Re-fetch so submittal numbering reflects current cloud state.
-    // Reads from pms_projects (V2) — pms_data is frozen at migration time.
-    let freshProject = selectedProject;
-    try {
-      const res = await fetch(
-        SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
-        { headers: SB_HEADERS }
-      );
-      if (res.ok) {
-        const rows = await res.json();
-        if (rows?.[0]?.project) freshProject = rows[0].project;
-      }
-    } catch { /* fall back to cache */ }
-
-    const existing = freshProject.submittals || [];
-    const nextNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
-    const received = new Date();
-    let spFolderUrl = "";
-    if (freshProject.projectFolderUrl) {
+  return withFilingScaffold(
+    { operation: "sub-new", statusElement: "subStatus" },
+    async ({ snapItem }) => {
+      // Re-fetch so submittal numbering reflects current cloud state.
+      let freshProject = selectedProject;
       try {
-        const token = await getToken();
-        const { driveId } = await resolveSpIds();
-        const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
-        const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"), snapItem);
-      } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
-    }
-    const sub = {
-      id: uid(), number: nextNum,
-      specSection: document.getElementById("subSpec").value.trim(),
-      description: desc,
-      discipline: document.getElementById("subDiscipline").value,
-      from: document.getElementById("subFrom").value.trim(),
-      dateReceived: received.toISOString().slice(0, 10),
-      dueDate: addBizDays(received, 10),
-      status: "Received",
-      notes: document.getElementById("subNotes").value.trim(),
-      assignedTo: [], spFolderUrl, links: [],
-      createdAt: new Date().toISOString(),
-    };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      submittals: [...(fresh.submittals || []), sub],
-    }));
-    setStatus("subStatus", "success", "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""));
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "sub-new",
-      sp_folder_url: spFolderUrl || null,
-      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
-      email_subject: snapItem?.subject || null,
-      status:        spFolderUrl ? "success" : "partial",
-      error:         spFolderUrl ? null : "Submittal logged without SharePoint upload",
-    });
-    dequeueFilingIntent(queueId);
-    document.getElementById("subDesc").value = "";
-    document.getElementById("subSpec").value = "";
-    document.getElementById("subNotes").value = "";
-  } catch (e) {
-    setStatus("subStatus", "error", "✗ " + e.message);
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "sub-new",
-      email_subject: snapItem?.subject || null,
-      status:        "failed",
-      error:         e.message,
-    });
-  } finally {
-    saveInFlight = false;
-  }
-}
-async function doFileToExistingSub() {
-  if (!selectedProject) { setStatus("subExistingStatus", "error", "Select a project first."); return; }
-  if (saveInFlight) { setStatus("subExistingStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  const subId = document.getElementById("subExistingSelect").value;
-  if (!subId) { setStatus("subExistingStatus", "error", "Select a submittal."); return; }
-  const sub = (selectedProject.submittals || []).find(s => s.id === subId);
-  if (!sub) { setStatus("subExistingStatus", "error", "Submittal not found."); return; }
-  const snapItem = emailItem; // snapshot before awaits — prevents item-switch corruption
-  const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        snapItem?.itemId || null,
-    operation:     "sub-existing",
-    email_subject: snapItem?.subject || "",
-  });
-  saveInFlight = true;
-  setStatus("subExistingStatus", "info", "⏳ Filing email…");
-  try {
-    const token = await getToken();
-    const { driveId } = await resolveSpIds();
-    let targetPath = spDrivePath(sub.spFolderUrl);
-    if (!targetPath) {
-      if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
-      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-      const safeName = (sub.number + " " + (sub.description || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-      const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-      targetPath = await ensureSpFolder(driveId, token, subsPath, safeName);
-    }
-    const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
-    let finalUrl = sub.spFolderUrl;
-    if (!sub.spFolderUrl) {
-      finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        const res = await fetch(
+          SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
+          { headers: SB_HEADERS }
+        );
+        if (res.ok) {
+          const rows = await res.json();
+          if (rows?.[0]?.project) freshProject = rows[0].project;
+        }
+      } catch { /* fall back to cache */ }
+
+      const existing = freshProject.submittals || [];
+      const nextNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
+      const received = new Date();
+      let spFolderUrl = "";
+      if (freshProject.projectFolderUrl) {
+        try {
+          const token = await getToken();
+          const { driveId } = await resolveSpIds();
+          const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
+          const safeName = (nextNum + " " + desc).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+          spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "Submittals", safeName, buildAddinMetadata(freshProject, "submittal"), snapItem);
+        } catch (e) { console.warn("Submittal SP upload failed:", e.message); }
+      }
+      const sub = {
+        id: uid(), number: nextNum,
+        specSection: document.getElementById("subSpec").value.trim(),
+        description: desc,
+        discipline: document.getElementById("subDiscipline").value,
+        from: document.getElementById("subFrom").value.trim(),
+        dateReceived: received.toISOString().slice(0, 10),
+        dueDate: addBizDays(received, 10),
+        status: "Received",
+        notes: document.getElementById("subNotes").value.trim(),
+        assignedTo: [], spFolderUrl, links: [],
+        createdAt: new Date().toISOString(),
+      };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
-        submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: finalUrl } : s),
+        submittals: [...(fresh.submittals || []), sub],
       }));
+      document.getElementById("subDesc").value = "";
+      document.getElementById("subSpec").value = "";
+      document.getElementById("subNotes").value = "";
+      return {
+        sp_folder_url:  spFolderUrl || null,
+        status:         spFolderUrl ? "success" : "partial",
+        error:          spFolderUrl ? null : "Submittal logged without SharePoint upload",
+        successMessage: "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""),
+      };
     }
-    const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
-    setStatus("subExistingStatus", "success", "✓ Filed to " + sub.number + attMsg);
-    const attempted = lastAttachmentUploadStats?.attempted || 0;
-    const status =
-      (attempted > 0 && attCount === 0)       ? "failed" :
-      (attempted > 0 && attCount < attempted) ? "partial" :
-      "success";
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "sub-existing",
-      sp_folder_url: finalUrl,
-      files:         (lastAttachmentUploadStats?.uploadedFiles || []),
-      email_subject: snapItem?.subject || null,
-      status,
-      error:         status === "success" ? null : `${attCount}/${attempted} uploaded`,
-    });
-    dequeueFilingIntent(queueId);
-  } catch (e) {
-    setStatus("subExistingStatus", "error", "✗ " + e.message);
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
-      operation:     "sub-existing",
-      email_subject: snapItem?.subject || null,
-      status:        "failed",
-      error:         e.message,
-    });
-  } finally {
-    saveInFlight = false;
-  }
+  );
+}
+async function doFileToExistingSub() {
+  const subId = document.getElementById("subExistingSelect").value;
+  if (!subId) { setStatus("subExistingStatus", "error", "Select a submittal."); return; }
+  const sub = (selectedProject?.submittals || []).find(s => s.id === subId);
+  if (!sub) { setStatus("subExistingStatus", "error", "Submittal not found."); return; }
+  return withFilingScaffold(
+    { operation: "sub-existing", statusElement: "subExistingStatus", startMessage: "⏳ Filing email…" },
+    async ({ snapItem }) => {
+      const token = await getToken();
+      const { driveId } = await resolveSpIds();
+      let targetPath = spDrivePath(sub.spFolderUrl);
+      if (!targetPath) {
+        if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
+        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const safeName = (sub.number + " " + (sub.description || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
+        targetPath = await ensureSpFolder(driveId, token, subsPath, safeName);
+      }
+      const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
+      let finalUrl = sub.spFolderUrl;
+      if (!sub.spFolderUrl) {
+        finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+          ...fresh,
+          submittals: (fresh.submittals || []).map(s => s.id === sub.id ? { ...s, spFolderUrl: finalUrl } : s),
+        }));
+      }
+      const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
+      const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const status =
+        (attempted > 0 && attCount === 0)       ? "failed" :
+        (attempted > 0 && attCount < attempted) ? "partial" :
+        "success";
+      return {
+        sp_folder_url:  finalUrl,
+        status,
+        error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
+        successMessage: "✓ Filed to " + sub.number + attMsg,
+      };
+    }
+  );
 }
 // ─── CALENDAR HELPERS ─────────────────────────────────────────────────────────
 let _nycCalendarId = null;
