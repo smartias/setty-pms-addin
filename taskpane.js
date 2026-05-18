@@ -112,6 +112,28 @@ function isComposeMode() {
     return !!(item && item.to && typeof item.to.setAsync === "function");
   } catch { return false; }
 }
+// Hide the "Log as RFI" + "Log as Submittal" buttons on the main view when the
+// selected project's status is not "In Construction Administration" — RFIs and
+// submittals are only a CA-phase activity, so showing the entry points during
+// other phases (Proposal, In Progress, Completed, etc.) just clutters the UI
+// and invites mis-filing.
+//
+// Note: this only hides the buttons that LAUNCH those flows. The flows
+// themselves (rfiView, subView) remain in the DOM and continue to work if
+// reached — guarding the entry points is sufficient for the user-facing goal.
+function applyConstructionAdminGuard() {
+  const inCA = selectedProject?.status === "In Construction Administration";
+  // If no project is selected, show the buttons by default (so users see the
+  // moreActions row's full menu after picking a project). Without this, an
+  // empty selection would also hide them, which is more aggressive than asked.
+  const shouldHide = !!selectedProject && !inCA;
+  const ids = ["logRfiBtn", "logSubBtn"];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = shouldHide ? "none" : "";
+  }
+}
+
 function applyComposeModeUiGuard() {
   const compose = isComposeMode();
   document.body.classList.toggle("compose-mode", compose);
@@ -1810,6 +1832,10 @@ async function clearProjectTagForCurrentEmail() {
 
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
+  // Hide phase-inappropriate logging buttons (Log as RFI / Submittal) when
+  // the project isn't in CA. Runs every time the selection changes so a
+  // status update in PMS naturally flows through on the next selection.
+  applyConstructionAdminGuard();
   const badge = document.getElementById("selectedProjectBadge");
   const badgeText = document.getElementById("selectedProjectBadgeText");
   const clearBtn = document.getElementById("clearProjectTagBtn");
