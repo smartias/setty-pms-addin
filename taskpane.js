@@ -4372,20 +4372,210 @@ function renderSubPicker() {
     : '<option value="">No submittals on this project</option>';
 }
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
+// Mirrors the PMS helper of the same name (SettyPMS.html line 156). A project
+// is "Setty-prime" when the prime firm name contains "setty" (case-insensitive).
+// Used by the add-in to decide whether to offer sub firms as assignment targets.
+function isSettyFirm(name) {
+  return !!(name && name.toLowerCase().includes("setty"));
+}
+
+// Discipline → short folder code. Used by the RFIs/<code>/<RFI-NNN>/IN
+// folder structure on SharePoint. Codes follow the standard AEC convention
+// (single letter except FP). Unknown disciplines fall back to "GEN" so the
+// folder never breaks; the user can later move it manually if needed.
+const DISCIPLINE_TO_CODE = {
+  "Mechanical":      "M",
+  "Electrical":      "E",
+  "Plumbing":        "P",
+  "Fire Protection": "FP",
+  "General":         "GEN",
+  "Architectural":   "A",
+  "Structural":      "S",
+};
+function getDisciplineCode(disciplineName) {
+  if (!disciplineName) return "GEN";
+  return DISCIPLINE_TO_CODE[disciplineName] || "GEN";
+}
+
+// Resolve the assignee email + display name from an assignee-dropdown value.
+// dropdownValue is "staff:<id>" or "sub:<id>" or "".
+// Returns { email, name } or null if not resolvable.
+function resolveAssignee(dropdownValue, project) {
+  if (!dropdownValue || !project) return null;
+  if (dropdownValue.startsWith("staff:")) {
+    const staffId = dropdownValue.slice("staff:".length);
+    const m = (project.teamMembers || []).find(x => x.id === staffId);
+    if (!m) return null;
+    return { email: m.email || "", name: m.name || m.role || "Team member" };
+  }
+  if (dropdownValue.startsWith("sub:")) {
+    const subId = dropdownValue.slice("sub:".length);
+    const s = (project.subconsultants || []).find(x => x.id === subId);
+    if (!s) return null;
+    return { email: s.email || "", name: s.contact || s.firm || "Subconsultant" };
+  }
+  return null;
+}
+
+// Build the HTML body of an RFI assignment email. Keeps it short and
+// professional. The recipient is being asked to respond to an RFI; the email
+// gives them the context, the question, and the SharePoint link to the
+// incoming RFI folder (so they can grab the attachments / forwarded email).
+function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const dueLine = rfi.dueDate ? `<p><strong>Due:</strong> ${esc(rfi.dueDate)}</p>` : "";
+  const descLine = rfi.description ? `<p><strong>Question:</strong></p><p style="margin-left:12px">${esc(rfi.description).replace(/\n/g, "<br>")}</p>` : "";
+  const folderLine = inFolderUrl ? `<p><a href="${esc(inFolderUrl)}">📁 SharePoint folder (incoming)</a></p>` : "";
+  return `
+    <p>Hi ${esc(assignee?.name || "")},</p>
+    <p>Please review the attached RFI and respond by the due date.</p>
+    <p><strong>Project:</strong> ${esc(projLabel)}<br>
+       <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
+       <strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
+       <strong>From:</strong> ${esc(rfi.from || "—")}</p>
+    ${dueLine}
+    ${descLine}
+    ${folderLine}
+    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+  `.trim();
+}
+
+// Same shape for Submittals. The "review by" framing matches the typical
+// submittal workflow (assignee reviews, returns with stamp/comments).
+function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const dueLine = sub.dueDate ? `<p><strong>Review by:</strong> ${esc(sub.dueDate)}</p>` : "";
+  const descLine = sub.description ? `<p><strong>Description:</strong></p><p style="margin-left:12px">${esc(sub.description).replace(/\n/g, "<br>")}</p>` : "";
+  const folderLine = inFolderUrl ? `<p><a href="${esc(inFolderUrl)}">📁 SharePoint folder (incoming)</a></p>` : "";
+  return `
+    <p>Hi ${esc(assignee?.name || "")},</p>
+    <p>Please review the attached submittal and return with stamp/comments by the due date.</p>
+    <p><strong>Project:</strong> ${esc(projLabel)}<br>
+       <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
+       <strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
+       <strong>From:</strong> ${esc(sub.from || "—")}</p>
+    ${dueLine}
+    ${descLine}
+    ${folderLine}
+    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+  `.trim();
+}
+
+// Open a new compose window with prefilled recipient, subject, and HTML body.
+// Uses the Office.js mailbox API (works in all Outlook clients, unlike mailto:).
+// Best-effort — if the API isn't available or fails, we log and return false
+// so callers can surface "draft couldn't be opened — open Outlook and forward
+// manually" rather than silently failing.
+function openComposeDraft({ toEmail, toName, subject, htmlBody }) {
+  try {
+    if (!Office?.context?.mailbox?.displayNewMessageForm) return false;
+    const toRecipients = toEmail ? [{ displayName: toName || toEmail, emailAddress: toEmail }] : [];
+    Office.context.mailbox.displayNewMessageForm({
+      toRecipients,
+      subject: subject || "",
+      htmlBody: htmlBody || "",
+    });
+    return true;
+  } catch (e) {
+    console.warn("[draft] displayNewMessageForm failed:", e.message);
+    return false;
+  }
+}
+
+// Populate the Assigned-To dropdown for the currently-selected project.
+// Internal team always appears. Subconsultants appear only when Setty is the
+// prime, since otherwise the user wouldn't be the one assigning RFIs to subs.
+// Option value encodes the kind so doSaveRfi can route the write correctly:
+//   "staff:<id>"  → assignedTo = [staffId]
+//   "sub:<id>"    → subAssigned = subId
+function populateRfiAssigneeDropdown() {
+  const sel = document.getElementById("rfiAssignedTo");
+  const hint = document.getElementById("rfiAssignHint");
+  if (!sel) return;
+  const project = selectedProject;
+  const team = (project?.teamMembers || []).filter(m => m && (m.name || m.role));
+  const subs = (project?.subconsultants || []).filter(s => s && s.firm);
+  const isPrime = isSettyFirm(project?.prime || "");
+  const opts = ['<option value="">— Unassigned —</option>'];
+  if (team.length) {
+    opts.push('<optgroup label="Team (internal)">');
+    for (const m of team) {
+      const label = m.name || m.role || "Unnamed";
+      const role = m.role && m.name ? ` · ${m.role}` : "";
+      opts.push(`<option value="staff:${m.id}">${escHtml(label)}${escHtml(role)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  if (isPrime && subs.length) {
+    opts.push('<optgroup label="Subconsultants">');
+    for (const s of subs) {
+      const contact = s.contact ? ` · ${s.contact}` : "";
+      opts.push(`<option value="sub:${s.id}">${escHtml(s.firm)}${escHtml(contact)}</option>`);
+    }
+    opts.push('</optgroup>');
+  }
+  sel.innerHTML = opts.join("");
+  if (hint) {
+    hint.textContent = isPrime && subs.length
+      ? "(team or sub firm — we're prime on this project)"
+      : team.length
+      ? ""
+      : "(no team members on this project)";
+  }
+}
+
+// Tiny HTML-escape for the dropdown <option> labels. Subconsultant firm names
+// and contact names can technically contain & < > if someone enters them oddly;
+// escape defensively rather than trust the values.
+function escHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+}
+
+// Compute the next auto-RFI number for the selected project. Mirrors PMS:
+// "RFI-NNN" where NNN = (existingRfis.length + 1) zero-padded. We do this
+// against the cached project's rfis array; if a contractor-assigned number
+// is provided the user just overwrites the field.
+function nextAutoRfiNumber() {
+  const count = (selectedProject?.rfis || []).length + 1;
+  return "RFI-" + String(count).padStart(3, "0");
+}
+
 function prefillRfi() {
   document.getElementById("rfiTitle").value = emailItem?.subject || "";
+  document.getElementById("rfiNumber").value = nextAutoRfiNumber();
+  document.getElementById("rfiDescription").value = "";
+  document.getElementById("rfiNotes").value = "";
+  document.getElementById("rfiAssignedTo").value = "";
+  populateRfiAssigneeDropdown();
   setRfiMode("new");
   renderRfiPicker();
 }
 async function doSaveRfi() {
   const title = document.getElementById("rfiTitle").value.trim();
   if (!title) { setStatus("rfiStatus", "error", "Title is required."); return; }
+  // Read DOM fields synchronously (no awaits yet) so they're captured before
+  // any item-switch race or async drift.
+  const userEnteredNumber = (document.getElementById("rfiNumber")?.value || "").trim();
+  const description = (document.getElementById("rfiDescription")?.value || "").trim();
+  const discipline = document.getElementById("rfiDiscipline").value;
+  const fromField = document.getElementById("rfiFrom").value.trim();
+  const notesField = document.getElementById("rfiNotes").value.trim();
+  const assigneeRaw = (document.getElementById("rfiAssignedTo")?.value || "");
+  let assignedToStaff = [];
+  let subAssigned = "";
+  if (assigneeRaw.startsWith("staff:")) {
+    assignedToStaff = [assigneeRaw.slice("staff:".length)];
+  } else if (assigneeRaw.startsWith("sub:")) {
+    subAssigned = assigneeRaw.slice("sub:".length);
+  }
   return withFilingScaffold(
     { operation: "rfi-new", statusElement: "rfiStatus" },
     async ({ snapItem }) => {
-      // Re-fetch fresh project data so the RFI number reflects what's actually
-      // in the cloud — not the add-in's possibly-stale cache. Prevents two
-      // users from independently picking the same RFI number.
+      // Re-fetch fresh project data so the auto-number (if the user didn't
+      // override) reflects what's actually in the cloud — not the add-in's
+      // possibly-stale cache.
       let freshProject = selectedProject;
       try {
         const res = await fetch(
@@ -4399,40 +4589,97 @@ async function doSaveRfi() {
       } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
 
       const existingRfis = freshProject.rfis || [];
-      const nextNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
+      const autoNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
+      const rfiNumber = userEnteredNumber || autoNum;
+      const discCode = getDisciplineCode(discipline);
       const received = new Date();
+
+      // Build the new folder structure: <projFolder>/RFIs/<discCode>/<RFI-NNN>/IN
+      // The IN folder gets the incoming email. The RFI root folder is what
+      // gets stored on the RFI record so users navigate to the RFI level
+      // (not the IN subfolder) when clicking SharePoint links in PMS.
       let spFolderUrl = "";
+      let inFolderWebUrl = ""; // Specific URL of the /IN folder (for email body link)
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
           const { driveId } = await resolveSpIds();
           const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
-          const safeName = (nextNum + " " + title).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-          spFolderUrl = await uploadEmailUnderFolder(driveId, token, projFolderName, "RFIs", safeName, buildAddinMetadata(freshProject, "rfi"), snapItem);
-        } catch (e) { console.warn("RFI SP upload failed:", e.message); }
+          // Sanitize RFI number for folder name (in case user enters "RFI/external#-001" etc.)
+          const safeRfiNumber = rfiNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+          const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
+          const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
+          const rfiPath  = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
+          const inPath   = await ensureSpFolder(driveId, token, rfiPath, "IN");
+          // Sidecar at the RFI level so PMS-side reconcile knows what it represents
+          await writeSpMetadataSidecar(driveId, token, rfiPath, buildAddinMetadata(freshProject, "rfi"));
+          await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
+          // Build web URLs. SP_BASE_URL + encoded path segments.
+          const rfiPathEncoded = rfiPath.split("/").map(encodeURIComponent).join("/");
+          const inPathEncoded  = inPath.split("/").map(encodeURIComponent).join("/");
+          spFolderUrl     = SP_BASE_URL + "/" + rfiPathEncoded;
+          inFolderWebUrl  = SP_BASE_URL + "/" + inPathEncoded;
+        } catch (e) {
+          console.warn("RFI SP upload failed:", e.message);
+        }
       }
+
       const rfi = {
-        id: uid(), number: nextNum, title,
-        discipline: document.getElementById("rfiDiscipline").value,
-        from: document.getElementById("rfiFrom").value.trim(),
+        id: uid(), number: rfiNumber, title,
+        description,
+        discipline,
+        from: fromField,
         dateReceived: received.toISOString().slice(0, 10),
         dueDate: addBizDays(received, 5),
         status: "Open",
-        notes: document.getElementById("rfiNotes").value.trim(),
-        assignedTo: [], spFolderUrl, links: [],
+        notes: notesField,
+        assignedTo: assignedToStaff,
+        subAssigned,
+        spFolderUrl, links: [],
+        // Source linkage — lets the main view show a "Logged as RFI" chip when
+        // the user returns to this email. Mirrors the pattern used for notes.
+        sourceItemId:     snapItem?.itemId || "",
+        sourceMessageId:  getCurrentSharedMessageId() || "",
+        sourceCalendarUId: currentItemICalUId || "",
         createdAt: new Date().toISOString(),
       };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
         rfis: [...(fresh.rfis || []), rfi],
       }));
+
+      // Open a prefilled draft to the assignee. Mirrors the transmittal flow:
+      // user reviews the draft and hits Send. Failure is non-fatal — the RFI
+      // is logged regardless and the user can email manually.
+      const assignee = resolveAssignee(assigneeRaw, freshProject);
+      let draftOpened = false;
+      if (assignee) {
+        const subjectLine = `${rfiNumber} · ${freshProject.projectNumber || ""} · ${title}`.trim();
+        const htmlBody = buildRfiAssignmentEmailHtml({
+          rfi, project: freshProject, assignee, inFolderUrl: inFolderWebUrl || spFolderUrl,
+        });
+        draftOpened = openComposeDraft({
+          toEmail: assignee.email,
+          toName:  assignee.name,
+          subject: subjectLine,
+          htmlBody,
+        });
+      }
+
+      // Clear the form for the next entry
       document.getElementById("rfiTitle").value = "";
+      document.getElementById("rfiNumber").value = "";
+      document.getElementById("rfiDescription").value = "";
       document.getElementById("rfiNotes").value = "";
+      document.getElementById("rfiAssignedTo").value = "";
+
+      const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
+      const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : ""));
       return {
         sp_folder_url:  spFolderUrl || null,
         status:         spFolderUrl ? "success" : "partial",
         error:          spFolderUrl ? null : "RFI logged without SharePoint upload",
-        successMessage: "✓ " + nextNum + " logged" + (spFolderUrl ? " · filed to SharePoint" : ""),
+        successMessage: baseMsg + draftMsg,
       };
     }
   );
@@ -4440,8 +4687,6 @@ async function doSaveRfi() {
 async function doFileToExistingRfi() {
   const rfiId = document.getElementById("rfiExistingSelect").value;
   if (!rfiId) { setStatus("rfiExistingStatus", "error", "Select an RFI."); return; }
-  // selectedProject existence is re-checked inside the scaffold; we read .rfis
-  // here for the pre-flight which is fine since it's synchronous.
   const rfi = (selectedProject?.rfis || []).find(r => r.id === rfiId);
   if (!rfi) { setStatus("rfiExistingStatus", "error", "RFI not found."); return; }
   return withFilingScaffold(
@@ -4449,19 +4694,26 @@ async function doFileToExistingRfi() {
     async ({ snapItem }) => {
       const token = await getToken();
       const { driveId } = await resolveSpIds();
-      // Use the existing SP folder if set, otherwise create it under the project folder
-      let targetPath = spDrivePath(rfi.spFolderUrl);
-      if (!targetPath) {
+      // Resolve the RFI's root folder. If the RFI was logged before the new
+      // structure was introduced, rfi.spFolderUrl points at the old flat
+      // folder (e.g. <proj>/RFIs/RFI-001 Title). Creating "IN" inside it
+      // still works — the new layout coexists with the old.
+      let rfiRootPath = spDrivePath(rfi.spFolderUrl);
+      if (!rfiRootPath) {
         if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
         const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-        const safeName = (rfi.number + " " + (rfi.title || "")).replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+        const discCode = getDisciplineCode(rfi.discipline);
+        const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
         const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-        targetPath = await ensureSpFolder(driveId, token, rfisPath, safeName);
+        const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
+        rfiRootPath    = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
       }
-      const attCount = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
+      // All incoming correspondence for an RFI lands in the IN subfolder.
+      const inPath  = await ensureSpFolder(driveId, token, rfiRootPath, "IN");
+      const attCount = await uploadEmailAndAttachments(driveId, token, inPath, snapItem);
       let finalUrl = rfi.spFolderUrl;
       if (!rfi.spFolderUrl) {
-        finalUrl = SP_BASE_URL + "/" + targetPath.split("/").map(encodeURIComponent).join("/");
+        finalUrl = SP_BASE_URL + "/" + rfiRootPath.split("/").map(encodeURIComponent).join("/");
         await applyLocalChangeAndSave(selectedProject.id, fresh => ({
           ...fresh,
           rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? { ...r, spFolderUrl: finalUrl } : r),
@@ -4477,7 +4729,7 @@ async function doFileToExistingRfi() {
         sp_folder_url:  finalUrl,
         status,
         error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
-        successMessage: "✓ Filed to " + rfi.number + attMsg,
+        successMessage: "✓ Filed to " + rfi.number + " · IN" + attMsg,
       };
     }
   );
