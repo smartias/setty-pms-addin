@@ -3827,7 +3827,40 @@ async function _doSaveToSharePoint() {
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
 const currentMsgId = getCurrentMessageRecordId();
 const existingRecord = findSavedEmailRecord(selectedProject, currentMsgId);
+// Read the Link To target up front so we can branch on it BEFORE the
+// already-saved short-circuit below. Without this, the link operation
+// is silently skipped when the user is adding a link to an email that
+// was previously saved standalone.
+const earlyLinkValue = (document.getElementById("linkToTarget")?.value || "");
 if (existingRecord) {
+  // If a Link To target is picked, run JUST the link operation against the
+  // existing email record. This is the "I forgot to link the first time"
+  // recovery path — the most common reason a user re-clicks Save SP on an
+  // already-filed email is to add a link they couldn't pick before.
+  if (earlyLinkValue) {
+    setStatus("actionStatus", "info", "📎 Linking to RFI/Submittal…");
+    const linkSnapItem = emailItem;
+    try {
+      const linkResult = await linkEmailToArtifact({
+        linkValue: earlyLinkValue,
+        emailRecord: existingRecord,
+        snapItem: linkSnapItem,
+      });
+      if (linkResult.ok) {
+        setStatus("actionStatus", "success", "✓ Linked existing email" + linkResult.label);
+      } else {
+        setStatus("actionStatus", "error", "✗ Link failed" + (linkResult.label || ""));
+      }
+    } catch (e) {
+      setStatus("actionStatus", "error", "✗ Link failed: " + e.message);
+    }
+    // Reset link dropdown so subsequent saves don't re-link
+    const linkToEl = document.getElementById("linkToTarget");
+    if (linkToEl) linkToEl.value = "";
+    try { refreshLoggedArtifactChips(); } catch {}
+    try { refreshLinkToTargetDropdown(); } catch {}
+    return;
+  }
   refreshEmailSavedIndicator();
   return;
 }
