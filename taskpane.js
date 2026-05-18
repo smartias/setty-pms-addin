@@ -5914,24 +5914,26 @@ async function submitRfiResponse() {
     if (selectedProject?.projectFolderUrl) {
       const token = await getToken();
       const { driveId } = await resolveSpIds();
-      let rfiRootPath = spDrivePath(rfi.spFolderUrl);
-      if (!rfiRootPath) {
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-        const discCode = getDisciplineCode(rfi.discipline);
-        const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-        const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
-        rfiRootPath    = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
-      }
+      // ALWAYS construct the new-structure path for response OUT regardless of
+      // where the RFI was originally filed. Legacy RFIs (logged before the
+      // RFIs/<DiscCode>/RFI-NNN convention) keep their spFolderUrl pointing
+      // at the old flat folder, but the response transmittal should land in
+      // the canonical new path so the team can find it predictably. The new
+      // discipline-coded path is created if it doesn't exist.
+      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const discCode = getDisciplineCode(rfi.discipline);
+      const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+      const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
+      const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
+      const rfiRootPath = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
       const outPath = await ensureSpFolder(driveId, token, rfiRootPath, "OUT");
-      // The IN folder may or may not exist; we link to it best-effort. We don't
-      // create it here — if the user only filed via PMS and never via the
-      // add-in, there might never have been an /IN, and a stub folder would
-      // be misleading. The chip link can simply 404 in that case.
+      // /IN is referenced for the email link, not created here — if no IN
+      // folder exists yet (e.g. PMS-only filings), the chip link 404s, which
+      // is the honest signal.
       const inPath = rfiRootPath + "/IN";
 
-      // 3. Upload the DOCX to OUT. Uses the same verified upload path as
-      // attachments so it gets the same integrity guarantees.
+      // Upload the DOCX to OUT via the verified attachment path so it gets the
+      // same integrity guarantees as everything else.
       const safeName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
       const bytes = new Uint8Array(await docxBlob.arrayBuffer());
       await uploadAttachmentToSharePoint(
@@ -6391,15 +6393,15 @@ async function submitSubReview() {
     if (selectedProject?.projectFolderUrl) {
       const token = await getToken();
       const { driveId } = await resolveSpIds();
-      let subRootPath = spDrivePath(sub.spFolderUrl);
-      if (!subRootPath) {
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
-        const discCode = getDisciplineCode(sub.discipline);
-        const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-        const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
-        subRootPath    = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
-      }
+      // ALWAYS construct the new-structure path for review OUT regardless of
+      // where the submittal was originally filed. Matches the RFI Log Response
+      // behavior — review transmittal lands at Submittals/<DiscCode>/SUB-NNN/OUT/.
+      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const discCode = getDisciplineCode(sub.discipline);
+      const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
+      const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
+      const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
+      const subRootPath = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
       const outPath = await ensureSpFolder(driveId, token, subRootPath, "OUT");
       const inPath  = subRootPath + "/IN";
 
