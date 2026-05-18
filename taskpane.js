@@ -623,19 +623,45 @@ function getLoggedEmailArtifactLabels(project) {
   return labels;
 }
 
-// Returns RFI/Submittal records whose sourceItemId or sourceMessageId matches
-// the currently-open mailbox item. Used by refreshLoggedArtifactChips to
-// surface "Logged as RFI-XXX on Date" chips on the main view.
+// Returns RFI/Submittal records related to the currently-open mailbox item.
+// Two kinds of relationship are detected:
+//   1. SOURCE — the artifact was originally logged FROM this email
+//      (matches via sourceItemId / sourceMessageId)
+//   2. LINKED — the user later linked this email to the artifact via the
+//      "Link to RFI/Sub" dropdown (matches via artifact.links[].targetId
+//      pointing at an email record whose msgId matches this item)
 //
-// `status` is included so the chip renderer can decide whether to show a
-// "Log Response" / "Log Review" call-to-action (visible only while open).
+// Used by refreshLoggedArtifactChips to surface chips on the main view.
+// `status` drives whether the action button (Log Response / Log Review)
+// shows below the chip.
 function getLoggedRfiSubArtifacts(project) {
   if (!project || !emailItem?.itemId) return [];
   const sourceItemId = emailItem.itemId;
   const sourceMessageIds = getCurrentMessageIdCandidates();
+  // Build set of email-record IDs for emails on this project that match
+  // the currently-open item. Used to detect "linked" relationships below.
+  const matchingEmailRecordIds = new Set();
+  for (const e of (project.emails || [])) {
+    if (!e?.msgId) continue;
+    if (e.msgId === sourceItemId || sourceMessageIds.includes(e.msgId)) {
+      if (e.id) matchingEmailRecordIds.add(e.id);
+    }
+  }
+  // Helper: does this artifact's links[] reference any matching email record?
+  const hasLinkToCurrentEmail = (links) =>
+    (links || []).some(lk =>
+      lk?.targetSystem === "pms" &&
+      lk?.targetType === "email" &&
+      lk?.targetId &&
+      matchingEmailRecordIds.has(lk.targetId)
+    );
+
   const matches = [];
   for (const r of (project.rfis || [])) {
-    if (r?.sourceItemId === sourceItemId || (r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId))) {
+    const isSource = r?.sourceItemId === sourceItemId ||
+                     (r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId));
+    const isLinked = hasLinkToCurrentEmail(r?.links);
+    if (isSource || isLinked) {
       matches.push({
         kind: "rfi",
         id: r.id,
@@ -644,11 +670,15 @@ function getLoggedRfiSubArtifacts(project) {
         date: r.createdAt || r.dateReceived || null,
         spFolderUrl: r.spFolderUrl || "",
         status: r.status || "Open",
+        relationship: isSource ? "source" : "linked",
       });
     }
   }
   for (const s of (project.submittals || [])) {
-    if (s?.sourceItemId === sourceItemId || (s?.sourceMessageId && sourceMessageIds.includes(s.sourceMessageId))) {
+    const isSource = s?.sourceItemId === sourceItemId ||
+                     (s?.sourceMessageId && sourceMessageIds.includes(s.sourceMessageId));
+    const isLinked = hasLinkToCurrentEmail(s?.links);
+    if (isSource || isLinked) {
       matches.push({
         kind: "sub",
         id: s.id,
@@ -657,6 +687,7 @@ function getLoggedRfiSubArtifacts(project) {
         date: s.createdAt || s.dateReceived || null,
         spFolderUrl: s.spFolderUrl || "",
         status: s.status || "Received",
+        relationship: isSource ? "source" : "linked",
       });
     }
   }
@@ -687,20 +718,15 @@ const SUB_OPEN_STATUSES = new Set(["Received", "In Review", "Pending Sub Respons
 // message. Failure is non-fatal — the primary save already succeeded; the
 // secondary link is a bonus we attempt best-effort.
 async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
-  console.log("[DBG-LINK] linkEmailToArtifact called", { linkValue, hasEmailRecord: !!emailRecord, emailRecordId: emailRecord?.id, hasSnapItem: !!snapItem, hasProjectFolder: !!selectedProject?.projectFolderUrl });
-  if (!linkValue) { console.log("[DBG-LINK] early return: no linkValue"); return { ok: false, label: "" }; }
-  if (!selectedProject?.projectFolderUrl) { console.log("[DBG-LINK] early return: no projectFolderUrl"); return { ok: false, label: "" }; }
+  if (!linkValue) return { ok: false, label: "" };
+  if (!selectedProject?.projectFolderUrl) return { ok: false, label: "" };
   const kind = linkValue.startsWith("rfi:") ? "rfi" :
                linkValue.startsWith("sub:") ? "sub" : null;
-  if (!kind) { console.log("[DBG-LINK] early return: invalid kind from", linkValue); return { ok: false, label: "" }; }
+  if (!kind) return { ok: false, label: "" };
   const targetId = linkValue.slice(kind === "rfi" ? "rfi:".length : "sub:".length);
   const arr = kind === "rfi" ? (selectedProject.rfis || []) : (selectedProject.submittals || []);
   const target = arr.find(x => x.id === targetId);
-  if (!target) {
-    console.log("[DBG-LINK] early return: target not found", { kind, targetId, arrLength: arr.length, sampleIds: arr.slice(0, 3).map(x => x.id) });
-    return { ok: false, label: "" };
-  }
-  console.log("[DBG-LINK] target found", { kind, number: target.number, spFolderUrl: target.spFolderUrl, discipline: target.discipline });
+  if (!target) return { ok: false, label: "" };
 
   try {
     const token = await getToken();
@@ -719,14 +745,12 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       const discPath = await ensureSpFolder(driveId, token, topPath, discCode);
       rootPath = await ensureSpFolder(driveId, token, discPath, safeNumber);
     }
-    console.log("[DBG-LINK] rootPath resolved", { rootPath });
     // Per-email subfolder under /IN, so multiple emails linked to the same
     // RFI/Sub coexist without colliding on "email.html". Same pattern as the
     // project's main Emails folder.
     const uploadResult = await uploadEmailToArtifactInFolder({
       driveId, token, artifactRootPath: rootPath, snapItem,
     });
-    console.log("[DBG-LINK] upload complete", { attCount: uploadResult.attCount, emailPath: uploadResult.emailPath, emailFolderUrl: uploadResult.emailFolderUrl });
 
     // Update the artifact's links[] array to point at the email record.
     // Schema matches the PMS link format (targetSystem/targetType/targetId).
@@ -762,10 +786,9 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       status:        "success",
     });
 
-    console.log("[DBG-LINK] success — returning ok");
     return { ok: true, label: ` · 📎 linked to ${target.number || (kind === "rfi" ? "RFI" : "Submittal")}` };
   } catch (e) {
-    console.error("[DBG-LINK] CAUGHT ERROR in linkEmailToArtifact:", e.message, e.stack);
+    console.warn("[link-to] secondary copy failed:", e.message);
     return { ok: false, label: ` · ⚠ link to RFI/Sub failed: ${e.message.slice(0, 100)}` };
   }
 }
@@ -1272,56 +1295,123 @@ const SB_HEADERS = {
 //      drops it to ~15 KB and pushes the quota ceiling out of reach.
 // Cache key bumped to v3 so any stale uncompressed v2 entries are ignored
 // (and overwritten on first save).
-const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV3";
+const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV4";
 const PROJECTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h hard limit; revalidate every open
 
-// Cache-strip strategy: keep all top-level fields (the pane reads project.emails,
-// .notes, .milestones, .rfis, .submittals for picker, banner, duplicate-check),
-// but drop the LARGE content fields within each nested record. The biggest
-// offenders are email bodies (bodyHtmlCompressed: ~5-30 KB per email) — those
-// alone account for most localStorage growth. Note bodies, RFI/submittal long
-// text, and link arrays are also stripped. None of these are needed by anything
-// the add-in reads from cache: bodies are re-fetched from Supabase on display.
+// Cache-strip strategy v2 (aggressive): keep ONLY the fields the add-in reads
+// at pane-open time. Everything else is re-fetched from Supabase via the V2
+// fresh fetch (already happens in parallel with cache hydration, ~300-800ms).
 //
-// Result: a project with 20 saved emails goes from ~250 KB → ~5 KB in cache,
-// before compression. After pako, typically <1 KB per project.
+// Previous "soft strip" (remove just bodyHtmlCompressed) was still hitting
+// localStorage quota for users with hundreds of emails — the metadata fields
+// alone (msgId, subject, savedAt, etc.) add up at scale. Hard whitelist solves
+// this permanently: the cache becomes O(KB) regardless of email volume.
+//
+// Anything the cache DOESN'T have is fine — the freshly-loaded `allProjects`
+// from Supabase overwrites the cached version within 1s of pane open. The
+// cache exists only so the project picker renders instantly. Save flows
+// re-fetch the FULL project from Supabase via fetchFreshProjectV2 before
+// mutating, so they never depend on cache completeness.
 function _stripProjectForCache(p) {
   if (!p) return p;
-  const out = { ...p };
-  if (Array.isArray(p.emails)) {
-    out.emails = p.emails.map(e => {
-      const { bodyHtmlCompressed, bodyHtml, bodyText, bodyHtmlSize, links, ...rest } = e || {};
-      return rest;
-    });
-  }
-  if (Array.isArray(p.notes)) {
-    out.notes = p.notes.map(n => {
-      const { body, bodyHtml, links, ...rest } = n || {};
-      return rest;
-    });
-  }
-  if (Array.isArray(p.rfis)) {
-    out.rfis = p.rfis.map(r => {
-      const { notes, links, ...rest } = r || {};
-      return rest;
-    });
-  }
-  if (Array.isArray(p.submittals)) {
-    out.submittals = p.submittals.map(s => {
-      const { notes, links, ...rest } = s || {};
-      return rest;
-    });
-  }
-  if (Array.isArray(p.changeOrders)) {
-    out.changeOrders = p.changeOrders.map(co => {
-      const { notes, links, ...rest } = co || {};
-      return rest;
-    });
-  }
-  return out;
+  return {
+    // Top-level scalars needed everywhere
+    id: p.id,
+    projectNumber: p.projectNumber,
+    name: p.name,
+    client: p.client,
+    clientName: p.clientName,
+    prime: p.prime,
+    settyPm: p.settyPm,
+    status: p.status,
+    archived: p.archived,
+    projectFolderUrl: p.projectFolderUrl,
+    teamsChannelId: p.teamsChannelId,
+    teamsNotificationsEnabled: p.teamsNotificationsEnabled,
+    teamsOneNoteUrl: p.teamsOneNoteUrl,
+    teamsOneNoteNotebookId: p.teamsOneNoteNotebookId,
+    oneNoteNotebookId: p.oneNoteNotebookId,
+    // Small directory arrays — needed for assignee dropdowns
+    teamMembers: p.teamMembers || [],
+    subconsultants: p.subconsultants || [],
+    // Nested record arrays — slim each record to ONLY the fields the add-in
+    // reads from the cached project. findSavedEmailRecord needs msgId.
+    // refreshOneNoteLinkBanner needs note.{sourceItemId, sourceMessageId,
+    // oneNoteUrl}. getLoggedEmailArtifactLabels needs note + milestone +
+    // rfi + sub source-id matchers. Pickers need id/number/title/status/etc.
+    emails: (p.emails || []).map(e => ({
+      id: e.id,
+      msgId: e.msgId,
+      subject: e.subject,
+      from: e.from,
+      fromAddress: e.fromAddress,
+      date: e.date,
+      spFolderUrl: e.spFolderUrl,
+      savedAt: e.savedAt,
+    })),
+    notes: (p.notes || []).map(n => ({
+      id: n.id,
+      sourceItemId: n.sourceItemId,
+      sourceMessageId: n.sourceMessageId,
+      sourceCalendarUId: n.sourceCalendarUId,
+      oneNoteUrl: n.oneNoteUrl,
+      actionItem: n.actionItem,
+      category: n.category,
+    })),
+    milestones: (p.milestones || []).map(m => ({
+      id: m.id,
+      sourceItemId: m.sourceItemId,
+      sourceMessageId: m.sourceMessageId,
+      dueDate: m.dueDate,
+      name: m.name,
+    })),
+    rfis: (p.rfis || []).map(r => ({
+      id: r.id,
+      number: r.number,
+      title: r.title,
+      status: r.status,
+      discipline: r.discipline,
+      spFolderUrl: r.spFolderUrl,
+      sourceItemId: r.sourceItemId,
+      sourceMessageId: r.sourceMessageId,
+      // Keep links so the artifact-chip detector can spot emails linked to
+      // this RFI after the fact (not just the original source email).
+      // Links are small (just metadata) so this doesn't bloat the cache.
+      links: r.links || [],
+    })),
+    submittals: (p.submittals || []).map(s => ({
+      id: s.id,
+      number: s.number,
+      description: s.description,
+      status: s.status,
+      discipline: s.discipline,
+      spFolderUrl: s.spFolderUrl,
+      sourceItemId: s.sourceItemId,
+      sourceMessageId: s.sourceMessageId,
+      links: s.links || [],
+    })),
+    // Other arrays (changeOrders, attachments, contracts, etc.) — not used at
+    // pane-open time, drop entirely. Save flows re-fetch the full project
+    // before mutating, so freshness is guaranteed for writes.
+  };
+}
+
+// Evict prior versions of the projects cache. They occupy localStorage quota
+// that may prevent the new (smaller) cache from being writable. Runs on every
+// pane open; cheap.
+function _pruneStaleProjectsCaches() {
+  try {
+    const stale = ["settyPms:addinProjectsCache", "settyPms:addinProjectsCacheV2", "settyPms:addinProjectsCacheV3"];
+    for (const k of stale) {
+      if (k !== PROJECTS_CACHE_KEY && localStorage.getItem(k) != null) {
+        try { localStorage.removeItem(k); } catch {}
+      }
+    }
+  } catch {}
 }
 
 function loadProjectsCache() {
+  _pruneStaleProjectsCaches();
   try {
     const raw = localStorage.getItem(PROJECTS_CACHE_KEY);
     if (!raw) return null;
@@ -4803,118 +4893,412 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
 }
 
 // ─── DOCX GENERATORS (RFI Response / Submittal Review cover sheets) ─────────
-// Both use the same docx library transmittal.html loads. Style mirrors the
-// transmittal cover sheet so the documents look like a coherent family.
+// Layout mirrors the Newforma RFI Transmittal format (two-page structured doc:
+// metadata grid + boxed answer with boilerplate notations on page 1, FROM/TO/
+// contents tables on page 2). This is a deliberate format choice — the legal
+// "General Notations" boilerplate is risk management language that's standard
+// in the AEC industry, and the structured TO/FROM blocks make the email an
+// auditable artifact.
 
-const DOCX_COLORS = { NAVY: "1e3a8a", RED: "b91c1c", BLUE: "1e40af", GRAY: "475569", LIGHT: "cbd5e1" };
+const DOCX_COLORS = { NAVY: "1e3a8a", RED: "b91c1c", BLUE: "1e40af", GRAY: "475569", LIGHT: "cbd5e1", BOX_BORDER: "94a3b8" };
 
-// Returns a Blob of a DOCX cover sheet for an RFI response. Fields used:
-// rfi.number, .title, .description, .from, .discipline, .dateReceived, .dueDate.
-// project.projectNumber, .name, .prime, .clientName.
-async function buildRfiResponseDocx({ rfi, project, response, dateResponded, status }) {
+// Standard "General Notations" boilerplate for RFI responses. Tells the
+// contractor that the RFI response is not authorization to incur additional
+// cost — they must issue a PCO (Proposed Change Order) for that. This text
+// is unchanged across all Setty RFI responses; if it ever needs to evolve,
+// only this constant needs updating.
+const RFI_GENERAL_NOTATIONS = [
+  "This RFI, RFI response, and related correspondence, written, verbal, or other; is not an authorization to proceed with work which requires additional costs. If any RFI reply requires a change to the contract documents, the contractor shall issue for review, a Proposed Change Order (PCO). Additional costs are authorized only after a PCO has been reviewed, and formally issued as an Accepted Change Order (ACO).",
+  "If the contractor believes an RFI response has materially changed the contract documents, or would subsequently create conflicts in work, or conflicts in coordination with their own or an associated trade; the contractor must state such concerns formally and promptly, prior to acting upon the RFI response.",
+];
+
+// Submittal review boilerplate. Standard "review for general conformance"
+// language — Setty's review doesn't relieve the contractor of responsibility
+// for accuracy of fabrication, coordination with the work, etc.
+const SUB_GENERAL_NOTATIONS = [
+  "This review is for general conformance with the design intent of the contract documents only. Markings and comments do not relieve the contractor of responsibility for accuracy of fabrication, dimensions, quantities, coordination with other trades, performance of any equipment, or means and methods of construction.",
+  "The contractor is responsible for confirming all dimensions, field conditions, and coordination requirements prior to fabrication or installation. Any deviations from the contract documents must be brought to the Architect/Engineer's attention in writing prior to proceeding.",
+];
+
+// Format helper used by both DOCX generators for the metadata grid rows.
+// Returns a TableRow with a label cell (gray background, bold blue text)
+// and a value cell.
+function _docxInfoRow(docxLib, label, value, opts = {}) {
+  const { Paragraph, TextRun, TableRow, TableCell, WidthType, ShadingType } = docxLib;
+  const labelW = opts.labelW || 1600;
+  const valueW = opts.valueW || 3080;
+  return new TableRow({
+    children: [
+      new TableCell({
+        width: { size: labelW, type: WidthType.DXA },
+        shading: { type: ShadingType.SOLID, color: "f8fafc", fill: "f8fafc" },
+        children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: label, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+      }),
+      new TableCell({
+        width: { size: valueW, type: WidthType.DXA },
+        children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(value || ""), font: "Calibri", size: 20 })] })],
+      }),
+    ],
+  });
+}
+
+// Build the recipients list for the response. Defaults: original RFI sender
+// (from rfi.from + email lookup) + any assigned subconsultant POC + the
+// responder themselves on the COPIES line. Optional override via opts.
+function _resolveRfiResponseRecipients(rfi, project) {
+  const recipients = [];
+  // Original sender: look up in project.emails by sourceItemId/sourceMessageId
+  if (rfi.sourceItemId || rfi.sourceMessageId) {
+    const emailRec = (project.emails || []).find(e =>
+      (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
+      (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
+    );
+    if (emailRec?.fromAddress) {
+      recipients.push({ name: emailRec.from || "", company: "", email: emailRec.fromAddress, phone: "" });
+    }
+  }
+  // If no email lookup, fall back to rfi.from as a name-only entry
+  if (recipients.length === 0 && rfi.from) {
+    recipients.push({ name: rfi.from, company: "", email: "", phone: "" });
+  }
+  // Assigned subconsultant POC
+  if (rfi.subAssigned) {
+    const sub = (project.subconsultants || []).find(s => s.id === rfi.subAssigned);
+    if (sub) {
+      recipients.push({
+        name: sub.contact || sub.firm || "",
+        company: sub.firm || "",
+        email: sub.email || "",
+        phone: sub.phone || "",
+      });
+    }
+  }
+  return recipients;
+}
+
+// Returns a Blob of a DOCX cover sheet for an RFI response. Two-page layout
+// matching the Newforma RFI Transmittal format:
+//   Page 1: SETTY header, metadata grid (PROJECT / DATE SENT / SUBJECT / RFI ID /
+//     TYPE / TRANSMITTAL ID / PURPOSE / VIA), QUESTION section, ANSWER section
+//     in a bordered box with "Response (Answered) from", "General Notations"
+//     boilerplate, and the response body.
+//   Page 2: FROM table (name, company, email, phone), TO table, DESCRIPTION OF
+//     CONTENTS table, COPIES section.
+async function buildRfiResponseDocx({ rfi, project, response, dateResponded, status, recipients }) {
   if (typeof docx === "undefined" || !docx.Packer) {
     throw new Error("DOCX library not loaded — refresh the taskpane and try again.");
   }
+  const lib = docx;
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-    Header, BorderStyle, WidthType, ShadingType, VerticalAlign,
-  } = docx;
-  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
-  const responder = msalAccount?.name || msalAccount?.username || "";
+    Header, BorderStyle, WidthType, ShadingType, AlignmentType, PageBreak,
+  } = lib;
 
-  function infoRow(label, value) {
-    return new TableRow({
-      children: [
-        new TableCell({
-          width: { size: 2160, type: WidthType.DXA },
-          shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
-          children: [new Paragraph({ children: [new TextRun({ text: label, font: "Calibri", size: 20, bold: true, color: DOCX_COLORS.NAVY })] })],
-        }),
-        new TableCell({
-          width: { size: 7200, type: WidthType.DXA },
-          children: [new Paragraph({ children: [new TextRun({ text: String(value || ""), font: "Calibri", size: 20 })] })],
-        }),
+  const projLabel = project.name || "";
+  const projNumber = project.projectNumber || "";
+  const responder = msalAccount?.name || msalAccount?.username || "";
+  const responderEmail = msalAccount?.username || "";
+  const dateSent = dateResponded || new Date().toISOString().slice(0, 10);
+  const subject = rfi.title || "";
+  const rfiId = rfi.number || "";
+  const purpose = status === "Responded" ? "Answered" : (status || "Answered");
+  // Transmittal ID: a per-project counter would require schema work. For now,
+  // use the RFI number + date — auditable enough.
+  const transmittalId = `${rfiId}-${dateSent.replace(/-/g, "")}`;
+  const via = rfi.receivedVia || "Email";
+  const toList = recipients && recipients.length ? recipients : _resolveRfiResponseRecipients(rfi, project);
+
+  // Bullet-point detection: if the response uses "- " or "• " prefixes, treat
+  // each line as a bullet so the DOCX renders them as a list. Otherwise plain
+  // paragraphs.
+  function responseBodyParagraphs() {
+    const raw = String(response || "(no response text)").trim();
+    const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
+    const hasBullets = lines.some(l => /^[-•*]\s+/.test(l.trim()));
+    if (!hasBullets) {
+      return lines.map(line =>
+        new Paragraph({
+          spacing: { after: 120 },
+          children: [new TextRun({ text: line, font: "Calibri", size: 22 })],
+        })
+      );
+    }
+    return lines.map(line => {
+      const stripped = line.trim().replace(/^[-•*]\s+/, "");
+      return new Paragraph({
+        spacing: { after: 100 },
+        bullet: { level: 0 },
+        children: [new TextRun({ text: stripped, font: "Calibri", size: 22 })],
+      });
+    });
+  }
+
+  function sectionLabel(text) {
+    return new Paragraph({
+      spacing: { before: 200, after: 80 },
+      children: [new TextRun({ text, font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.GRAY })],
+    });
+  }
+
+  // The "ANSWER" boxed section. The Newforma version puts a bordered box
+  // around everything from "Response (Answered) from" through the response
+  // body. We approximate with a single-cell table that has visible borders.
+  function buildAnswerBox() {
+    const innerChildren = [
+      // "Response (Answered) from: <name>" with bottom border like the PDF
+      new Paragraph({
+        spacing: { before: 100, after: 100 },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.GRAY, space: 1 } },
+        children: [new TextRun({ text: `Response (${purpose}) from: ${responder}`, font: "Calibri", size: 22, bold: true })],
+      }),
+      new Paragraph({
+        spacing: { after: 60 },
+        children: [new TextRun({ text: "Remarks:", font: "Calibri", size: 18, italics: true, color: DOCX_COLORS.GRAY })],
+      }),
+      new Paragraph({
+        spacing: { before: 100, after: 80 },
+        children: [new TextRun({ text: "General Notations:", font: "Calibri", size: 22, bold: true })],
+      }),
+      ...RFI_GENERAL_NOTATIONS.map(p =>
+        new Paragraph({
+          spacing: { after: 140 },
+          children: [new TextRun({ text: p, font: "Calibri", size: 20 })],
+        })
+      ),
+      new Paragraph({
+        spacing: { before: 200, after: 80 },
+        children: [new TextRun({ text: "Response:", font: "Calibri", size: 22, bold: true })],
+      }),
+      ...responseBodyParagraphs(),
+      // Signature block — name / company / date
+      new Paragraph({
+        spacing: { before: 280, after: 0 },
+        children: [new TextRun({ text: responder, font: "Calibri", size: 20 })],
+      }),
+      new Paragraph({
+        spacing: { after: 0 },
+        children: [new TextRun({ text: "Setty & Associates", font: "Calibri", size: 20 })],
+      }),
+      new Paragraph({
+        spacing: { after: 100 },
+        children: [new TextRun({ text: dateSent, font: "Calibri", size: 20 })],
+      }),
+    ];
+    return new Table({
+      width: { size: 9360, type: WidthType.DXA },
+      columnWidths: [9360],
+      rows: [new TableRow({
+        children: [new TableCell({
+          width: { size: 9360, type: WidthType.DXA },
+          // Visible box border on all sides
+          borders: {
+            top:    { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            left:   { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            right:  { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+          },
+          children: innerChildren,
+        })],
+      })],
+    });
+  }
+
+  // FROM table (Setty responder) — page 2
+  function buildFromTable() {
+    const colHeader = (label, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: label, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+    });
+    const colData = (text, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+    });
+    return new Table({
+      width: { size: 9360, type: WidthType.DXA },
+      columnWidths: [2200, 2200, 3300, 1660],
+      rows: [
+        new TableRow({ tableHeader: true, children: [
+          colHeader("NAME", 2200), colHeader("COMPANY", 2200), colHeader("EMAIL", 3300), colHeader("PHONE", 1660),
+        ]}),
+        new TableRow({ children: [
+          colData(responder, 2200), colData("Setty & Associates", 2200), colData(responderEmail, 3300), colData("", 1660),
+        ]}),
       ],
     });
   }
 
-  // Paragraph factory for long-form text blocks that need to wrap.
-  function block(text, opts = {}) {
-    const lines = String(text || "").split(/\r?\n/);
-    return lines.map(line =>
-      new Paragraph({
-        spacing: { after: opts.dense ? 60 : 100 },
-        children: [new TextRun({ text: line, font: "Calibri", size: opts.size || 22 })],
-      })
-    );
+  function buildToTable() {
+    const colHeader = (label, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: label, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+    });
+    const colData = (text, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+    });
+    const rows = [
+      new TableRow({ tableHeader: true, children: [
+        colHeader("NAME", 2200), colHeader("COMPANY", 2200), colHeader("EMAIL", 3300), colHeader("PHONE", 1660),
+      ]}),
+    ];
+    if (toList.length === 0) {
+      rows.push(new TableRow({ children: [
+        colData("(no recipients on record)", 2200), colData("", 2200), colData("", 3300), colData("", 1660),
+      ]}));
+    } else {
+      for (const r of toList) {
+        rows.push(new TableRow({ children: [
+          colData(r.name, 2200), colData(r.company, 2200), colData(r.email, 3300), colData(r.phone, 1660),
+        ]}));
+      }
+    }
+    return new Table({
+      width: { size: 9360, type: WidthType.DXA },
+      columnWidths: [2200, 2200, 3300, 1660],
+      rows,
+    });
   }
+
+  function buildContentsTable() {
+    const colHeader = (label, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: label, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+    });
+    const colData = (text, w) => new TableCell({
+      width: { size: w, type: WidthType.DXA },
+      children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+    });
+    const docxFileName = `${rfiId} Response ${dateSent.replace(/-/g, "")}.pdf`;
+    return new Table({
+      width: { size: 9360, type: WidthType.DXA },
+      columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
+      rows: [
+        new TableRow({ tableHeader: true, children: [
+          colHeader("QTY", 800), colHeader("DATED", 1400), colHeader("TITLE", 3760), colHeader("NUMBER", 1100), colHeader("SCALE", 1100), colHeader("SIZE", 1200),
+        ]}),
+        new TableRow({ children: [
+          colData("1", 800), colData(dateSent, 1400), colData(docxFileName, 3760), colData("", 1100), colData("", 1100), colData("", 1200),
+        ]}),
+      ],
+    });
+  }
+
+  const headerBlock = new Header({
+    children: [new Paragraph({
+      border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: DOCX_COLORS.RED, space: 1 } },
+      spacing: { after: 120 },
+      children: [
+        new TextRun({ text: "SETTY", font: "Calibri", size: 36, bold: true, color: DOCX_COLORS.RED }),
+        new TextRun({ text: "                                                                ", font: "Calibri", size: 16 }),
+        new TextRun({ text: "RFI Transmittal", font: "Calibri", size: 24, bold: true, color: DOCX_COLORS.NAVY }),
+      ],
+    })],
+  });
 
   const doc = new Document({
     styles: { default: { document: { run: { font: "Calibri", size: 22 } } } },
     sections: [{
-      properties: {
-        page: { size: { width: 12240, height: 15840 }, margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } },
-      },
-      headers: {
-        default: new Header({
-          children: [new Paragraph({
-            border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: DOCX_COLORS.RED, space: 1 } },
-            spacing: { after: 120 },
-            children: [
-              new TextRun({ text: "SETTY", font: "Calibri", size: 28, bold: true, color: DOCX_COLORS.RED }),
-              new TextRun({ text: "  & Associates    ", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
-              new TextRun({ text: "RFI Response", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
-            ],
-          })],
-        }),
-      },
+      properties: { page: { size: { width: 12240, height: 15840 }, margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 } } },
+      headers: { default: headerBlock },
       children: [
+        // Discipline label (matches the "SME" label at the top of Newforma's page 1)
         new Paragraph({
-          spacing: { before: 0, after: 160 },
-          children: [new TextRun({ text: "RFI RESPONSE", font: "Calibri", size: 40, bold: true, color: DOCX_COLORS.NAVY })],
+          spacing: { before: 0, after: 200 },
+          children: [new TextRun({ text: (rfi.discipline || "").toUpperCase(), font: "Calibri", size: 18, color: DOCX_COLORS.GRAY })],
         }),
-        new Paragraph({
-          border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.NAVY, space: 1 } },
-          spacing: { after: 200 },
-          children: [new TextRun({ text: (rfi.number || "RFI").toUpperCase(), font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.BLUE })],
-        }),
+        // Metadata grid — 4 columns: LABEL | VALUE | LABEL | VALUE.
+        // We build cells directly here rather than via the _docxInfoRow helper
+        // because that helper returns a 2-cell row; the grid needs 4 cells per row.
+        (function() {
+          const labelCell = (text, w) => new TableCell({
+            width: { size: w, type: WidthType.DXA },
+            shading: { type: ShadingType.SOLID, color: "f8fafc", fill: "f8fafc" },
+            children: [new Paragraph({ spacing: { before: 40, after: 40 }, children: [new TextRun({ text, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+          });
+          const valueCell = (text, w) => new TableCell({
+            width: { size: w, type: WidthType.DXA },
+            children: [new Paragraph({ spacing: { before: 40, after: 40 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+          });
+          const W = [1600, 3080, 1600, 3080];
+          return new Table({
+            width: { size: 9360, type: WidthType.DXA },
+            columnWidths: W,
+            rows: [
+              new TableRow({ children: [
+                labelCell("PROJECT:", W[0]),
+                valueCell(`${projLabel}${projNumber ? "\n" + projNumber : ""}`, W[1]),
+                labelCell("DATE SENT:", W[2]),
+                valueCell(dateSent, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("SUBJECT:", W[0]),
+                valueCell(subject, W[1]),
+                labelCell("RFI ID:", W[2]),
+                valueCell(rfiId, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("TYPE:", W[0]),
+                valueCell("RFI", W[1]),
+                labelCell("TRANSMITTAL ID:", W[2]),
+                valueCell(transmittalId, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("PURPOSE:", W[0]),
+                valueCell(purpose, W[1]),
+                labelCell("VIA:", W[2]),
+                valueCell(via, W[3]),
+              ]}),
+            ],
+          });
+        })(),
 
-        new Table({
-          width: { size: 9360, type: WidthType.DXA },
-          columnWidths: [2160, 7200],
-          rows: [
-            infoRow("Project:",       projLabel),
-            infoRow("RFI No.:",       rfi.number || ""),
-            infoRow("Title:",         rfi.title || ""),
-            infoRow("Discipline:",    rfi.discipline || ""),
-            infoRow("From:",          rfi.from || ""),
-            infoRow("Date Received:", rfi.dateReceived || ""),
-            infoRow("Due Date:",      rfi.dueDate || ""),
-            infoRow("Responded:",     dateResponded || ""),
-            infoRow("Status:",        status || "Responded"),
-            infoRow("Responder:",     responder),
-          ],
+        sectionLabel("QUESTION:"),
+        ...(String(rfi.description || rfi.title || "").trim() ? [
+          new Paragraph({
+            spacing: { after: 200 },
+            indent: { left: 1600 },
+            children: [new TextRun({ text: rfi.description || rfi.title || "", font: "Calibri", size: 22 })],
+          })
+        ] : [
+          new Paragraph({ spacing: { after: 200 }, children: [new TextRun({ text: " ", font: "Calibri", size: 22 })] }),
+        ]),
+
+        sectionLabel("SUGGESTION:"),
+        new Paragraph({ spacing: { after: 200 }, children: [new TextRun({ text: " ", font: "Calibri", size: 22 })] }),
+
+        sectionLabel("ANSWER:"),
+        buildAnswerBox(),
+
+        // Page break before the FROM/TO/CONTENTS tables (page 2)
+        new Paragraph({
+          children: [new TextRun({ text: "FROM", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })],
+          spacing: { before: 240, after: 60 },
+          pageBreakBefore: true,
         }),
+        buildFromTable(),
 
         new Paragraph({
-          spacing: { before: 280, after: 100 },
-          children: [new TextRun({ text: "ORIGINAL QUESTION", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+          children: [new TextRun({ text: "TO", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })],
+          spacing: { before: 240, after: 60 },
         }),
-        ...(block(rfi.description || rfi.title || "(no question text on record)", { size: 22 })),
+        buildToTable(),
 
         new Paragraph({
-          spacing: { before: 280, after: 100 },
-          children: [new TextRun({ text: "RESPONSE", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+          children: [new TextRun({ text: "DESCRIPTION OF CONTENTS", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })],
+          spacing: { before: 240, after: 60 },
         }),
-        ...(block(response || "(no response text)", { size: 22 })),
+        buildContentsTable(),
 
         new Paragraph({
-          spacing: { before: 400 },
-          border: { top: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.LIGHT, space: 1 } },
-          children: [
-            new TextRun({ text: `Generated: ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}     `, font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
-            new TextRun({ text: "Setty & Associates", font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.NAVY }),
-          ],
+          children: [new TextRun({ text: "COPIES:", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })],
+          spacing: { before: 240, after: 60 },
+        }),
+        new Paragraph({
+          spacing: { after: 0 },
+          children: [new TextRun({ text: responder, font: "Calibri", size: 20 })],
         }),
       ],
     }],
@@ -4923,46 +5307,185 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
   return await Packer.toBlob(doc);
 }
 
-// Same shape for Submittal review. Uses stamp + comments instead of free response.
-async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned, status }) {
+function _resolveSubReviewRecipients(sub, project) {
+  const recipients = [];
+  if (sub.sourceItemId || sub.sourceMessageId) {
+    const emailRec = (project.emails || []).find(e =>
+      (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
+      (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
+    );
+    if (emailRec?.fromAddress) {
+      recipients.push({ name: emailRec.from || "", company: "", email: emailRec.fromAddress, phone: "" });
+    }
+  }
+  if (recipients.length === 0 && sub.from) {
+    recipients.push({ name: sub.from, company: "", email: "", phone: "" });
+  }
+  if (sub.subAssigned) {
+    const s = (project.subconsultants || []).find(x => x.id === sub.subAssigned);
+    if (s) {
+      recipients.push({
+        name: s.contact || s.firm || "",
+        company: s.firm || "",
+        email: s.email || "",
+        phone: s.phone || "",
+      });
+    }
+  }
+  return recipients;
+}
+
+// Submittal Review DOCX — same two-page Newforma-style layout as the RFI
+// version, with stamp + comments substituted for the answer/response, and
+// submittal-appropriate boilerplate.
+async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned, status, recipients }) {
   if (typeof docx === "undefined" || !docx.Packer) {
     throw new Error("DOCX library not loaded — refresh the taskpane and try again.");
   }
+  const lib = docx;
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
     Header, BorderStyle, WidthType, ShadingType,
-  } = docx;
-  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  } = lib;
+  const projLabel = project.name || "";
+  const projNumber = project.projectNumber || "";
   const reviewer = msalAccount?.name || msalAccount?.username || "";
+  const reviewerEmail = msalAccount?.username || "";
+  const dateSent = dateReturned || new Date().toISOString().slice(0, 10);
+  const subject = sub.description || "";
+  const subId = sub.number || "";
+  const purpose = stamp || "Reviewed";
+  const transmittalId = `${subId}-${dateSent.replace(/-/g, "")}`;
+  const via = sub.receivedVia || "Email";
+  const toList = recipients && recipients.length ? recipients : _resolveSubReviewRecipients(sub, project);
 
-  function infoRow(label, value) {
-    return new TableRow({
-      children: [
-        new TableCell({
-          width: { size: 2160, type: WidthType.DXA },
-          shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
-          children: [new Paragraph({ children: [new TextRun({ text: label, font: "Calibri", size: 20, bold: true, color: DOCX_COLORS.NAVY })] })],
-        }),
-        new TableCell({
-          width: { size: 7200, type: WidthType.DXA },
-          children: [new Paragraph({ children: [new TextRun({ text: String(value || ""), font: "Calibri", size: 20 })] })],
-        }),
-      ],
-    });
-  }
-  function block(text, opts = {}) {
-    const lines = String(text || "").split(/\r?\n/);
-    return lines.map(line =>
-      new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text: line, font: "Calibri", size: opts.size || 22 })] })
-    );
-  }
-
-  // Stamp gets visual emphasis — it's the headline finding of the review.
   const stampColor =
     stamp === "Approved"            ? "059669" :
     stamp === "Approved as Noted"   ? "0891b2" :
     stamp === "Revise and Resubmit" ? "ea580c" :
     stamp === "Rejected"            ? "b91c1c" : DOCX_COLORS.NAVY;
+
+  function commentsBodyParagraphs() {
+    const raw = String(comments || "(no comments)").trim();
+    const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
+    const hasBullets = lines.some(l => /^[-•*]\s+/.test(l.trim()));
+    if (!hasBullets) {
+      return lines.map(line =>
+        new Paragraph({ spacing: { after: 120 }, children: [new TextRun({ text: line, font: "Calibri", size: 22 })] })
+      );
+    }
+    return lines.map(line => {
+      const stripped = line.trim().replace(/^[-•*]\s+/, "");
+      return new Paragraph({
+        spacing: { after: 100 }, bullet: { level: 0 },
+        children: [new TextRun({ text: stripped, font: "Calibri", size: 22 })],
+      });
+    });
+  }
+
+  function sectionLabel(text) {
+    return new Paragraph({
+      spacing: { before: 200, after: 80 },
+      children: [new TextRun({ text, font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.GRAY })],
+    });
+  }
+
+  function buildReviewBox() {
+    const innerChildren = [
+      new Paragraph({
+        spacing: { before: 100, after: 100 },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.GRAY, space: 1 } },
+        children: [new TextRun({ text: `Review (${purpose}) by: ${reviewer}`, font: "Calibri", size: 22, bold: true })],
+      }),
+      new Paragraph({
+        spacing: { after: 100 },
+        children: [
+          new TextRun({ text: "Stamp: ", font: "Calibri", size: 22, bold: true }),
+          new TextRun({ text: (stamp || "—").toUpperCase(), font: "Calibri", size: 22, bold: true, color: stampColor }),
+        ],
+      }),
+      new Paragraph({
+        spacing: { after: 60 },
+        children: [new TextRun({ text: "Remarks:", font: "Calibri", size: 18, italics: true, color: DOCX_COLORS.GRAY })],
+      }),
+      new Paragraph({
+        spacing: { before: 100, after: 80 },
+        children: [new TextRun({ text: "General Notations:", font: "Calibri", size: 22, bold: true })],
+      }),
+      ...SUB_GENERAL_NOTATIONS.map(p =>
+        new Paragraph({ spacing: { after: 140 }, children: [new TextRun({ text: p, font: "Calibri", size: 20 })] })
+      ),
+      new Paragraph({
+        spacing: { before: 200, after: 80 },
+        children: [new TextRun({ text: "Comments:", font: "Calibri", size: 22, bold: true })],
+      }),
+      ...commentsBodyParagraphs(),
+      new Paragraph({
+        spacing: { before: 280, after: 0 },
+        children: [new TextRun({ text: reviewer, font: "Calibri", size: 20 })],
+      }),
+      new Paragraph({ spacing: { after: 0 }, children: [new TextRun({ text: "Setty & Associates", font: "Calibri", size: 20 })] }),
+      new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text: dateSent, font: "Calibri", size: 20 })] }),
+    ];
+    return new Table({
+      width: { size: 9360, type: WidthType.DXA },
+      columnWidths: [9360],
+      rows: [new TableRow({
+        children: [new TableCell({
+          width: { size: 9360, type: WidthType.DXA },
+          borders: {
+            top:    { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            left:   { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+            right:  { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.BOX_BORDER },
+          },
+          children: innerChildren,
+        })],
+      })],
+    });
+  }
+
+  // FROM/TO/CONTENTS table builders — same shape as RFI version
+  const colHeader = (label, w) => new TableCell({
+    width: { size: w, type: WidthType.DXA },
+    shading: { type: ShadingType.SOLID, color: "f1f5f9", fill: "f1f5f9" },
+    children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: label, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+  });
+  const colData = (text, w) => new TableCell({
+    width: { size: w, type: WidthType.DXA },
+    children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+  });
+
+  const fromTable = new Table({
+    width: { size: 9360, type: WidthType.DXA },
+    columnWidths: [2200, 2200, 3300, 1660],
+    rows: [
+      new TableRow({ tableHeader: true, children: [colHeader("NAME", 2200), colHeader("COMPANY", 2200), colHeader("EMAIL", 3300), colHeader("PHONE", 1660)] }),
+      new TableRow({ children: [colData(reviewer, 2200), colData("Setty & Associates", 2200), colData(reviewerEmail, 3300), colData("", 1660)] }),
+    ],
+  });
+
+  const toRows = [
+    new TableRow({ tableHeader: true, children: [colHeader("NAME", 2200), colHeader("COMPANY", 2200), colHeader("EMAIL", 3300), colHeader("PHONE", 1660)] }),
+  ];
+  if (toList.length === 0) {
+    toRows.push(new TableRow({ children: [colData("(no recipients on record)", 2200), colData("", 2200), colData("", 3300), colData("", 1660)] }));
+  } else {
+    for (const r of toList) {
+      toRows.push(new TableRow({ children: [colData(r.name, 2200), colData(r.company, 2200), colData(r.email, 3300), colData(r.phone, 1660)] }));
+    }
+  }
+  const toTable = new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [2200, 2200, 3300, 1660], rows: toRows });
+
+  const docxFileName = `${subId} Review ${dateSent.replace(/-/g, "")}.pdf`;
+  const contentsTable = new Table({
+    width: { size: 9360, type: WidthType.DXA },
+    columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
+    rows: [
+      new TableRow({ tableHeader: true, children: [colHeader("QTY", 800), colHeader("DATED", 1400), colHeader("TITLE", 3760), colHeader("NUMBER", 1100), colHeader("SCALE", 1100), colHeader("SIZE", 1200)] }),
+      new TableRow({ children: [colData("1", 800), colData(dateSent, 1400), colData(docxFileName, 3760), colData("", 1100), colData("", 1100), colData("", 1200)] }),
+    ],
+  });
 
   const doc = new Document({
     styles: { default: { document: { run: { font: "Calibri", size: 22 } } } },
@@ -4974,63 +5497,83 @@ async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned,
             border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: DOCX_COLORS.RED, space: 1 } },
             spacing: { after: 120 },
             children: [
-              new TextRun({ text: "SETTY", font: "Calibri", size: 28, bold: true, color: DOCX_COLORS.RED }),
-              new TextRun({ text: "  & Associates    ", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
-              new TextRun({ text: "Submittal Review", font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
+              new TextRun({ text: "SETTY", font: "Calibri", size: 36, bold: true, color: DOCX_COLORS.RED }),
+              new TextRun({ text: "                                                                ", font: "Calibri", size: 16 }),
+              new TextRun({ text: "Submittal Transmittal", font: "Calibri", size: 24, bold: true, color: DOCX_COLORS.NAVY }),
             ],
           })],
         }),
       },
       children: [
         new Paragraph({
-          spacing: { before: 0, after: 160 },
-          children: [new TextRun({ text: "SUBMITTAL REVIEW", font: "Calibri", size: 40, bold: true, color: DOCX_COLORS.NAVY })],
+          spacing: { before: 0, after: 200 },
+          children: [new TextRun({ text: (sub.discipline || "").toUpperCase(), font: "Calibri", size: 18, color: DOCX_COLORS.GRAY })],
         }),
+        // Metadata grid
+        (function() {
+          const labelCell = (text, w) => new TableCell({
+            width: { size: w, type: WidthType.DXA },
+            shading: { type: ShadingType.SOLID, color: "f8fafc", fill: "f8fafc" },
+            children: [new Paragraph({ spacing: { before: 40, after: 40 }, children: [new TextRun({ text, font: "Calibri", size: 16, bold: true, color: DOCX_COLORS.GRAY })] })],
+          });
+          const valueCell = (text, w) => new TableCell({
+            width: { size: w, type: WidthType.DXA },
+            children: [new Paragraph({ spacing: { before: 40, after: 40 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
+          });
+          const W = [1600, 3080, 1600, 3080];
+          return new Table({
+            width: { size: 9360, type: WidthType.DXA },
+            columnWidths: W,
+            rows: [
+              new TableRow({ children: [
+                labelCell("PROJECT:", W[0]), valueCell(`${projLabel}${projNumber ? "\n" + projNumber : ""}`, W[1]),
+                labelCell("DATE SENT:", W[2]), valueCell(dateSent, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("SUBJECT:", W[0]), valueCell(subject, W[1]),
+                labelCell("SUBMITTAL ID:", W[2]), valueCell(subId, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("SPEC SECTION:", W[0]), valueCell(sub.specSection || "", W[1]),
+                labelCell("TRANSMITTAL ID:", W[2]), valueCell(transmittalId, W[3]),
+              ]}),
+              new TableRow({ children: [
+                labelCell("STAMP:", W[0]),
+                new TableCell({
+                  width: { size: W[1], type: WidthType.DXA },
+                  children: [new Paragraph({
+                    spacing: { before: 40, after: 40 },
+                    children: [new TextRun({ text: (stamp || "—").toUpperCase(), font: "Calibri", size: 22, bold: true, color: stampColor })],
+                  })],
+                }),
+                labelCell("VIA:", W[2]), valueCell(via, W[3]),
+              ]}),
+            ],
+          });
+        })(),
+
+        sectionLabel("DESCRIPTION:"),
         new Paragraph({
-          border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.NAVY, space: 1 } },
-          spacing: { after: 100 },
-          children: [new TextRun({ text: (sub.number || "SUB").toUpperCase(), font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.BLUE })],
-        }),
-        new Paragraph({
-          spacing: { after: 240 },
-          children: [
-            new TextRun({ text: "STAMP: ", font: "Calibri", size: 24, bold: true, color: DOCX_COLORS.NAVY }),
-            new TextRun({ text: (stamp || "—").toUpperCase(), font: "Calibri", size: 26, bold: true, color: stampColor }),
-          ],
+          spacing: { after: 200 },
+          indent: { left: 1600 },
+          children: [new TextRun({ text: sub.fullDescription || sub.description || "", font: "Calibri", size: 22 })],
         }),
 
-        new Table({
-          width: { size: 9360, type: WidthType.DXA },
-          columnWidths: [2160, 7200],
-          rows: [
-            infoRow("Project:",        projLabel),
-            infoRow("Submittal No.:",  sub.number || ""),
-            infoRow("Spec Section:",   sub.specSection || ""),
-            infoRow("Description:",    sub.description || ""),
-            infoRow("Discipline:",     sub.discipline || ""),
-            infoRow("From:",           sub.from || ""),
-            infoRow("Date Received:",  sub.dateReceived || ""),
-            infoRow("Due Date:",       sub.dueDate || ""),
-            infoRow("Returned:",       dateReturned || ""),
-            infoRow("Status:",         status || "Returned"),
-            infoRow("Reviewer:",       reviewer),
-          ],
-        }),
+        sectionLabel("REVIEW:"),
+        buildReviewBox(),
 
         new Paragraph({
-          spacing: { before: 280, after: 100 },
-          children: [new TextRun({ text: "REVIEW COMMENTS", font: "Calibri", size: 22, bold: true, color: DOCX_COLORS.NAVY })],
+          spacing: { before: 240, after: 60 },
+          pageBreakBefore: true,
+          children: [new TextRun({ text: "FROM", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })],
         }),
-        ...(block(comments || "(no comments)", { size: 22 })),
-
-        new Paragraph({
-          spacing: { before: 400 },
-          border: { top: { style: BorderStyle.SINGLE, size: 4, color: DOCX_COLORS.LIGHT, space: 1 } },
-          children: [
-            new TextRun({ text: `Generated: ${new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}     `, font: "Calibri", size: 18, color: DOCX_COLORS.GRAY }),
-            new TextRun({ text: "Setty & Associates", font: "Calibri", size: 18, bold: true, color: DOCX_COLORS.NAVY }),
-          ],
-        }),
+        fromTable,
+        new Paragraph({ spacing: { before: 240, after: 60 }, children: [new TextRun({ text: "TO", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })] }),
+        toTable,
+        new Paragraph({ spacing: { before: 240, after: 60 }, children: [new TextRun({ text: "DESCRIPTION OF CONTENTS", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })] }),
+        contentsTable,
+        new Paragraph({ spacing: { before: 240, after: 60 }, children: [new TextRun({ text: "COPIES:", font: "Calibri", size: 16, color: DOCX_COLORS.GRAY })] }),
+        new Paragraph({ children: [new TextRun({ text: reviewer, font: "Calibri", size: 20 })] }),
       ],
     }],
   });
@@ -5287,10 +5830,8 @@ async function doSaveRfi() {
 // Throws on creation failure so callers can surface the real error instead
 // of silently filing a "logged without SharePoint upload" status.
 async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath, snapItem }) {
-  console.log("[DBG-UPL] uploadEmailToArtifactInFolder", { artifactRootPath, hasSnapItem: !!snapItem, snapItemId: snapItem?.itemId?.slice?.(0, 30) });
   if (!artifactRootPath) throw new Error("artifactRootPath missing");
   const inPath = await ensureSpFolder(driveId, token, artifactRootPath, "IN");
-  console.log("[DBG-UPL] inPath created", { inPath });
   // Per-email subfolder. Format mirrors the project Emails folder:
   // "YYYY-MM-DD <sanitized subject>". Capped at 60 chars to keep the path
   // length comfortably under SharePoint's 400-char URL ceiling.
@@ -5304,12 +5845,8 @@ async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath,
     .trim()
     .slice(0, 60);
   const emailFolderName = (datePart + " " + subject).trim() || (datePart + " Email");
-  console.log("[DBG-UPL] emailFolderName", { emailFolderName });
   const emailPath = await ensureSpFolder(driveId, token, inPath, emailFolderName);
-  console.log("[DBG-UPL] emailPath created", { emailPath });
-  console.log("[DBG-UPL] calling uploadEmailAndAttachments");
   const attCount = await uploadEmailAndAttachments(driveId, token, emailPath, snapItem);
-  console.log("[DBG-UPL] upload done", { attCount, stats: lastAttachmentUploadStats });
   return {
     emailPath,
     emailFolderUrl: SP_BASE_URL + "/" + emailPath.split("/").map(encodeURIComponent).join("/"),
@@ -5432,7 +5969,7 @@ async function submitRfiResponse() {
     // fall back to the assignee if there's no usable sender email.
     const recipientEmail = _guessEmailForRfi(rfi, selectedProject);
     const subjectLine = `${rfi.number} Response · ${selectedProject.projectNumber || ""} · ${rfi.title || ""}`.trim();
-    const htmlBody = _buildRfiResponseEmailHtml({ rfi, project: selectedProject, response: responseText, dateResponded, outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl });
+    const htmlBody = _buildRfiResponseEmailHtml({ rfi, project: selectedProject, response: responseText, dateResponded, outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl, status: newStatus });
     const draftOpened = openComposeDraft({
       toEmail: recipientEmail?.email || "",
       toName:  recipientEmail?.name  || "",
@@ -5484,23 +6021,90 @@ function _guessEmailForRfi(rfi, project) {
   return null;
 }
 
-function _buildRfiResponseEmailHtml({ rfi, project, response, dateResponded, outFolderUrl, inFolderUrl }) {
+function _buildRfiResponseEmailHtml({ rfi, project, response, dateResponded, outFolderUrl, inFolderUrl, status }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
-  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
-  const responseEsc = esc(response).replace(/\n/g, "<br>");
-  const links = [];
-  if (outFolderUrl) links.push(`<a href="${esc(outFolderUrl)}">📁 Response folder (OUT) — formal DOCX</a>`);
-  if (inFolderUrl)  links.push(`<a href="${esc(inFolderUrl)}">📁 Original RFI folder (IN)</a>`);
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" ");
+  const responderName = msalAccount?.name || msalAccount?.username || "";
+  const dateDisplay = dateResponded || new Date().toISOString().slice(0, 10);
+  const purpose = status === "Responded" ? "Answered" : (status || "Answered");
+  const senderId = rfi.number || "";
+
+  // Format response as bullet list if the user used "- " / "• " / "* " line
+  // prefixes; otherwise render line breaks as <br>.
+  function formatResponse(text) {
+    const raw = String(text || "").trim();
+    const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
+    const hasBullets = lines.some(l => /^[-•*]\s+/.test(l.trim()));
+    if (!hasBullets) {
+      return lines.map(l => esc(l)).join("<br>");
+    }
+    return "<ul style='margin:6px 0 6px 18px;padding:0'>" +
+      lines.map(l => {
+        const stripped = l.trim().replace(/^[-•*]\s+/, "");
+        return `<li style='margin-bottom:4px'>${esc(stripped)}</li>`;
+      }).join("") +
+      "</ul>";
+  }
+
+  const responseHtml = formatResponse(response);
+  const generalNotationsHtml = RFI_GENERAL_NOTATIONS.map(p => `<p style="margin:8px 0">${esc(p)}</p>`).join("");
+
+  // Recipients block — best-effort from rfi.from + assignee/sub
+  const recipients = _resolveRfiResponseRecipients(rfi, project);
+  const toBlock = recipients.length
+    ? recipients.map(r => {
+        const company = r.company ? ` (${esc(r.company)})` : "";
+        return esc(r.name) + company;
+      }).join("; ")
+    : esc(rfi.from || "(no recipient on record)");
+
+  const senderName = recipients[0]?.name || rfi.from || "";
+  const senderCompany = recipients[0]?.company || "";
+
   return `
-    <p>Hi,</p>
-    <p>Please see our response to <strong>${esc(rfi.number)}</strong> below. The formal response cover sheet is in the SharePoint folder linked at the bottom.</p>
-    <p><strong>Project:</strong> ${esc(projLabel)}<br>
-       <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
-       <strong>Date Responded:</strong> ${esc(dateResponded)}</p>
-    <p><strong>Response:</strong></p>
-    <p style="margin-left:12px">${responseEsc}</p>
-    ${links.map(l => `<p>${l}</p>`).join("")}
-    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+<div style="font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #1f2937;">
+
+  <p style="margin:6px 0"><strong>Project:</strong> ${esc(projLabel)}</p>
+
+  <p style="margin:14px 0 8px 0; font-weight:bold;">Notification about RFI ${esc(rfi.title || "")}</p>
+
+  <p style="margin:6px 0">This email contains the response for an RFI.</p>
+
+  <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+
+  <p style="margin:6px 0; font-weight:bold; font-size:16px;">Answer</p>
+
+  <p style="margin:10px 0"><strong>Response (${esc(purpose)}) from:</strong> ${esc(responderName)}</p>
+
+  <p style="margin:10px 0 4px 0"><strong>Remarks:</strong></p>
+
+  <p style="margin:10px 0; font-weight:bold;">General Notations:</p>
+  ${generalNotationsHtml}
+
+  <p style="margin:14px 0 4px 0; font-weight:bold;">Response:</p>
+  <div style="margin-left:6px">${responseHtml}</div>
+
+  <p style="margin:20px 0 4px 0">${esc(responderName)}<br>
+  Setty &amp; Associates<br>
+  ${esc(dateDisplay)}</p>
+
+  <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+
+  <p style="margin:6px 0; font-weight:bold;">RFI Info</p>
+  <p style="margin:4px 0"><strong>To:</strong> ${toBlock}</p>
+  <p style="margin:4px 0"><strong>From:</strong> ${esc(senderName)}${senderCompany ? " (" + esc(senderCompany) + ")" : ""}</p>
+  <p style="margin:4px 0"><strong>Purpose:</strong> ${esc(purpose)}</p>
+  <p style="margin:4px 0"><strong>Sender ID:</strong> ${esc(senderId)}</p>
+  <p style="margin:4px 0"><strong>Expiration Date:</strong> None</p>
+
+  ${outFolderUrl || inFolderUrl ? `
+    <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+    <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
+    ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 RFI Response folder (OUT) — cover sheet DOCX</a></p>` : ""}
+    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original RFI folder (IN)</a></p>` : ""}
+  ` : ""}
+
+</div>
   `.trim();
 }
 
@@ -5837,6 +6441,7 @@ async function submitSubReview() {
     const htmlBody = _buildSubReviewEmailHtml({
       sub, project: selectedProject, stamp, comments, dateReturned,
       outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl,
+      status: newStatus,
     });
     const draftOpened = openComposeDraft({
       toEmail: recipientEmail?.email || "",
@@ -5878,28 +6483,88 @@ function _guessEmailForSub(sub, project) {
   return null;
 }
 
-function _buildSubReviewEmailHtml({ sub, project, stamp, comments, dateReturned, outFolderUrl, inFolderUrl }) {
+function _buildSubReviewEmailHtml({ sub, project, stamp, comments, dateReturned, outFolderUrl, inFolderUrl, status }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
-  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
+  const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" ");
+  const reviewerName = msalAccount?.name || msalAccount?.username || "";
+  const dateDisplay = dateReturned || new Date().toISOString().slice(0, 10);
+  const purpose = stamp || "Reviewed";
+  const subId = sub.number || "";
   const stampColor =
     stamp === "Approved"            ? "#059669" :
     stamp === "Approved as Noted"   ? "#0891b2" :
     stamp === "Revise and Resubmit" ? "#ea580c" :
     stamp === "Rejected"            ? "#b91c1c" : "#1e3a8a";
-  const commentsEsc = esc(comments).replace(/\n/g, "<br>");
-  const links = [];
-  if (outFolderUrl) links.push(`<a href="${esc(outFolderUrl)}">📁 Review folder (OUT) — formal DOCX</a>`);
-  if (inFolderUrl)  links.push(`<a href="${esc(inFolderUrl)}">📁 Original submittal folder (IN)</a>`);
+
+  function formatBody(text) {
+    const raw = String(text || "").trim();
+    const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
+    const hasBullets = lines.some(l => /^[-•*]\s+/.test(l.trim()));
+    if (!hasBullets) return lines.map(l => esc(l)).join("<br>");
+    return "<ul style='margin:6px 0 6px 18px;padding:0'>" +
+      lines.map(l => {
+        const stripped = l.trim().replace(/^[-•*]\s+/, "");
+        return `<li style='margin-bottom:4px'>${esc(stripped)}</li>`;
+      }).join("") + "</ul>";
+  }
+  const commentsHtml = formatBody(comments);
+  const generalNotationsHtml = SUB_GENERAL_NOTATIONS.map(p => `<p style="margin:8px 0">${esc(p)}</p>`).join("");
+
+  const recipients = _resolveSubReviewRecipients(sub, project);
+  const toBlock = recipients.length
+    ? recipients.map(r => esc(r.name) + (r.company ? ` (${esc(r.company)})` : "")).join("; ")
+    : esc(sub.from || "(no recipient on record)");
+  const senderName = recipients[0]?.name || sub.from || "";
+  const senderCompany = recipients[0]?.company || "";
+
   return `
-    <p>Hi,</p>
-    <p>We've completed our review of <strong>${esc(sub.number)}</strong>. The formal review cover sheet (with stamp + comments) is in the SharePoint folder linked below.</p>
-    <p><strong>Project:</strong> ${esc(projLabel)}<br>
-       <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
-       <strong>Stamp:</strong> <span style="color:${stampColor};font-weight:bold">${esc(stamp)}</span><br>
-       <strong>Date Returned:</strong> ${esc(dateReturned)}</p>
-    ${comments ? `<p><strong>Comments:</strong></p><p style="margin-left:12px">${commentsEsc}</p>` : ""}
-    ${links.map(l => `<p>${l}</p>`).join("")}
-    <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
+<div style="font-family: Calibri, Arial, sans-serif; font-size: 14px; color: #1f2937;">
+
+  <p style="margin:6px 0"><strong>Project:</strong> ${esc(projLabel)}</p>
+
+  <p style="margin:14px 0 8px 0; font-weight:bold;">Notification about Submittal ${esc(sub.description || "")}</p>
+
+  <p style="margin:6px 0">This email contains the review for a submittal.</p>
+
+  <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+
+  <p style="margin:6px 0; font-weight:bold; font-size:16px;">Review</p>
+
+  <p style="margin:10px 0"><strong>Review (${esc(purpose)}) by:</strong> ${esc(reviewerName)}</p>
+
+  <p style="margin:10px 0"><strong>Stamp:</strong> <span style="color:${stampColor};font-weight:bold;text-transform:uppercase">${esc(stamp || "—")}</span></p>
+
+  <p style="margin:10px 0 4px 0"><strong>Remarks:</strong></p>
+
+  <p style="margin:10px 0; font-weight:bold;">General Notations:</p>
+  ${generalNotationsHtml}
+
+  ${comments ? `
+    <p style="margin:14px 0 4px 0; font-weight:bold;">Comments:</p>
+    <div style="margin-left:6px">${commentsHtml}</div>
+  ` : ""}
+
+  <p style="margin:20px 0 4px 0">${esc(reviewerName)}<br>
+  Setty &amp; Associates<br>
+  ${esc(dateDisplay)}</p>
+
+  <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+
+  <p style="margin:6px 0; font-weight:bold;">Submittal Info</p>
+  <p style="margin:4px 0"><strong>To:</strong> ${toBlock}</p>
+  <p style="margin:4px 0"><strong>From:</strong> ${esc(senderName)}${senderCompany ? " (" + esc(senderCompany) + ")" : ""}</p>
+  <p style="margin:4px 0"><strong>Purpose:</strong> ${esc(purpose)}</p>
+  <p style="margin:4px 0"><strong>Sender ID:</strong> ${esc(subId)}</p>
+  ${sub.specSection ? `<p style="margin:4px 0"><strong>Spec Section:</strong> ${esc(sub.specSection)}</p>` : ""}
+
+  ${outFolderUrl || inFolderUrl ? `
+    <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
+    <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
+    ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 Submittal Review folder (OUT) — cover sheet DOCX</a></p>` : ""}
+    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original submittal folder (IN)</a></p>` : ""}
+  ` : ""}
+
+</div>
   `.trim();
 }
 
