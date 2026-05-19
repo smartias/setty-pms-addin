@@ -651,19 +651,53 @@ function getLoggedRfiSubArtifacts(project) {
   // taskpane so we can see it without console access. Remove after the
   // linked-email chip is confirmed working.
   try {
-    const allRfiLinks = (project.rfis || []).map(r => ({
-      number: r.number,
-      linkCount: (r.links || []).length,
-    })).filter(r => r.linkCount > 0);
+    const internetMsgId = emailItem?.internetMessageId || "";
+    const restId = getCurrentMessageRestId() || "";
+
+    // SOURCE-path check: which RFIs have source IDs, and do any match?
+    const rfiSourceInfo = (project.rfis || []).map(r => {
+      const srcItemMatch  = r?.sourceItemId  && r.sourceItemId  === sourceItemId;
+      const srcMsgMatch   = r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId);
+      return {
+        number:        r.number || "?",
+        hasSourceItem: !!r?.sourceItemId,
+        hasSourceMsg:  !!r?.sourceMessageId,
+        srcItemMatch,
+        srcMsgMatch,
+        sourceItemId:  (r?.sourceItemId  || "").slice(0, 20),
+        sourceMessageId: (r?.sourceMessageId || "").slice(0, 30),
+      };
+    });
+    const sourceMatches = rfiSourceInfo.filter(r => r.srcItemMatch || r.srcMsgMatch);
+
+    const allRfiLinks = (project.rfis || []).map(r => {
+      const links = r.links || [];
+      const matchingLinks = links.filter(lk =>
+        lk?.targetSystem === "pms" && lk?.targetType === "email" &&
+        lk?.targetId && matchingEmailRecordIds.has(lk.targetId)
+      );
+      return {
+        number: r.number,
+        linkCount: links.length,
+        linkedTargetIds: links.map(lk => (lk?.targetId || "").slice(0, 16)),
+        matchingEmailIds: [...matchingEmailRecordIds].map(id => id.slice(0, 16)),
+        linkedMatchCount: matchingLinks.length,
+      };
+    }).filter(r => r.linkCount > 0);
+
     const dbgInfo = {
-      itemId: (sourceItemId || "").slice(0, 20) + "…",
-      projectEmails: (project.emails || []).length,
+      ewsId:          (sourceItemId  || "").slice(0, 20) + "…",
+      internetMsgId:  internetMsgId  ? internetMsgId.slice(0, 40)  + "…" : "(none)",
+      restId:         restId         ? restId.slice(0, 20)          + "…" : "(none)",
+      projectEmails:  (project.emails || []).length,
       matchedRecords: matchingEmailRecordIds.size,
+      rfisTotal:      (project.rfis || []).length,
+      rfisWithSourceIds: rfiSourceInfo.filter(r => r.hasSourceItem || r.hasSourceMsg).length,
+      sourcePathMatches: sourceMatches.length,
       rfisWithAnyLinks: allRfiLinks.length,
-      rfisWithLinks: allRfiLinks,
     };
-    console.log("[DBG-CHIP] state", dbgInfo);
-    // Also surface to a visible UI element so the user doesn't need console
+    console.log("[DBG-CHIP] state", dbgInfo, { rfiSourceInfo, allRfiLinks });
+
     let dbgBanner = document.getElementById("__chipDbg");
     if (!dbgBanner) {
       const mainView = document.getElementById("mainView");
@@ -675,14 +709,28 @@ function getLoggedRfiSubArtifacts(project) {
       }
     }
     if (dbgBanner) {
+      const srcLines = rfiSourceInfo.length > 0
+        ? rfiSourceInfo.map(r =>
+            `&nbsp;&nbsp;${r.number}: srcItem=${r.hasSourceItem ? r.sourceItemId + (r.srcItemMatch ? "✓" : "✗") : "none"} ` +
+            `srcMsg=${r.hasSourceMsg ? r.sourceMessageId.slice(0, 20) + (r.srcMsgMatch ? "✓" : "✗") : "none"}`
+          ).join("<br>")
+        : "&nbsp;&nbsp;(no RFIs have any source IDs — were they logged from email?)";
       dbgBanner.innerHTML =
         `<b>DBG-CHIP:</b><br>` +
-        `itemId: ${dbgInfo.itemId}<br>` +
+        `ewsId: ${dbgInfo.ewsId}<br>` +
+        `internetMsgId: ${dbgInfo.internetMsgId}<br>` +
+        `restId: ${dbgInfo.restId}<br>` +
         `project.emails records: ${dbgInfo.projectEmails}<br>` +
         `current item matches: ${dbgInfo.matchedRecords} email record(s)<br>` +
-        `RFIs with any links: ${dbgInfo.rfisWithAnyLinks}<br>` +
+        `RFIs total: ${dbgInfo.rfisTotal} | with source IDs: ${dbgInfo.rfisWithSourceIds} | SOURCE path matches: ${dbgInfo.sourcePathMatches}<br>` +
+        srcLines + `<br>` +
+        `RFIs with any links[]: ${dbgInfo.rfisWithAnyLinks}<br>` +
         (allRfiLinks.length > 0
-          ? allRfiLinks.map(r => `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s)`).join("<br>")
+          ? allRfiLinks.map(r =>
+              `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s), ${r.linkedMatchCount} match current email<br>` +
+              `&nbsp;&nbsp;&nbsp;link targetIds: [${r.linkedTargetIds.join(", ")}]<br>` +
+              `&nbsp;&nbsp;&nbsp;email rec ids:  [${r.matchingEmailIds.join(", ")}]`
+            ).join("<br>")
           : "&nbsp;&nbsp;(no RFI on this project has any links[] entries)");
     }
   } catch (e) {
