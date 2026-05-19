@@ -647,6 +647,27 @@ function getLoggedRfiSubArtifacts(project) {
       if (e.id) matchingEmailRecordIds.add(e.id);
     }
   }
+  // Supplemental fuzzy match: same email may have multiple records with
+  // different EWS IDs (e.g. email moved between folders). Links and source
+  // references may point at an older record whose msgId no longer matches
+  // the current EWS ID. Match by subject + sender + date (day) instead.
+  {
+    const curSubject = typeof emailItem.subject === "string" ? emailItem.subject.trim() : "";
+    const curFrom = (emailFromAddress || "").toLowerCase().trim();
+    const curDateRaw = emailItem.dateTimeCreated;
+    const curDate = curDateRaw instanceof Date
+      ? curDateRaw.toISOString().slice(0, 10)
+      : typeof curDateRaw === "string" ? curDateRaw.slice(0, 10) : "";
+    if (curSubject && curFrom) {
+      for (const e of (project.emails || [])) {
+        if (matchingEmailRecordIds.has(e.id)) continue;
+        if ((e.subject || "").trim() !== curSubject) continue;
+        if ((e.fromAddress || "").toLowerCase().trim() !== curFrom) continue;
+        if (curDate && e.date && String(e.date).slice(0, 10) !== curDate) continue;
+        if (e.id) matchingEmailRecordIds.add(e.id);
+      }
+    }
+  }
   // TEMPORARY DIAGNOSTIC — also writes the state into a visible div in the
   // taskpane so we can see it without console access. Remove after the
   // linked-email chip is confirmed working.
@@ -745,10 +766,21 @@ function getLoggedRfiSubArtifacts(project) {
       matchingEmailRecordIds.has(lk.targetId)
     );
 
+  // Helper: does the artifact's sourceItemId belong to an email record that
+  // the fuzzy matcher recognized as the current email? Handles the case where
+  // the email was moved (EWS ID changed) and sourceMessageId was never stored.
+  const isSourceViaFuzzy = (srcItemId) => {
+    if (!srcItemId) return false;
+    return (project.emails || []).some(
+      e => e.msgId === srcItemId && matchingEmailRecordIds.has(e.id)
+    );
+  };
+
   const matches = [];
   for (const r of (project.rfis || [])) {
     const isSource = r?.sourceItemId === sourceItemId ||
-                     (r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId));
+                     (r?.sourceMessageId && sourceMessageIds.includes(r.sourceMessageId)) ||
+                     isSourceViaFuzzy(r?.sourceItemId);
     const isLinked = hasLinkToCurrentEmail(r?.links);
     if (isSource || isLinked) {
       matches.push({
@@ -765,7 +797,8 @@ function getLoggedRfiSubArtifacts(project) {
   }
   for (const s of (project.submittals || [])) {
     const isSource = s?.sourceItemId === sourceItemId ||
-                     (s?.sourceMessageId && sourceMessageIds.includes(s.sourceMessageId));
+                     (s?.sourceMessageId && sourceMessageIds.includes(s.sourceMessageId)) ||
+                     isSourceViaFuzzy(s?.sourceItemId);
     const isLinked = hasLinkToCurrentEmail(s?.links);
     if (isSource || isLinked) {
       matches.push({
