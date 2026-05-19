@@ -674,6 +674,13 @@ function getLoggedRfiSubArtifacts(project) {
   try {
     const internetMsgId = emailItem?.internetMessageId || "";
     const restId = getCurrentMessageRestId() || "";
+    // Capture fuzzy-match inputs so the banner can show why a record did/didn't match.
+    const _fuzzyCurSubject = typeof emailItem.subject === "string" ? emailItem.subject.trim() : "";
+    const _fuzzyCurFrom = (emailFromAddress || "").toLowerCase().trim();
+    const _fuzzyCurDateRaw = emailItem.dateTimeCreated;
+    const _fuzzyCurDate = _fuzzyCurDateRaw instanceof Date
+      ? _fuzzyCurDateRaw.toISOString().slice(0, 10)
+      : typeof _fuzzyCurDateRaw === "string" ? _fuzzyCurDateRaw.slice(0, 10) : "";
 
     // SOURCE-path check: which RFIs have source IDs, and do any match?
     const rfiSourceInfo = (project.rfis || []).map(r => {
@@ -697,12 +704,34 @@ function getLoggedRfiSubArtifacts(project) {
         lk?.targetSystem === "pms" && lk?.targetType === "email" &&
         lk?.targetId && matchingEmailRecordIds.has(lk.targetId)
       );
+      // For each link target, look up the email record and capture fuzzy fields
+      // so we can see WHY it did or didn't fuzzy-match.
+      const linkTargetDetails = links.map(lk => {
+        const rec = (project.emails || []).find(e => e.id === lk?.targetId);
+        if (!rec) return { id: (lk?.targetId || "").slice(0, 16), found: false };
+        return {
+          id:          rec.id.slice(0, 16),
+          found:       true,
+          inMatchSet:  matchingEmailRecordIds.has(rec.id),
+          subject:     (rec.subject || "").slice(0, 40),
+          fromAddress: (rec.fromAddress || "").toLowerCase(),
+          date:        String(rec.date || "").slice(0, 10),
+          curSubject:  _fuzzyCurSubject.slice(0, 40),
+          curFrom:     _fuzzyCurFrom,
+          curDate:     _fuzzyCurDate,
+          subjectMatch: (rec.subject || "").trim() === _fuzzyCurSubject,
+          fromMatch:    (rec.fromAddress || "").toLowerCase().trim() === _fuzzyCurFrom,
+          dateMatch:    !_fuzzyCurDate || !rec.date ||
+                        String(rec.date).slice(0, 10) === _fuzzyCurDate,
+        };
+      });
       return {
         number: r.number,
         linkCount: links.length,
         linkedTargetIds: links.map(lk => (lk?.targetId || "").slice(0, 16)),
         matchingEmailIds: [...matchingEmailRecordIds].map(id => id.slice(0, 16)),
         linkedMatchCount: matchingLinks.length,
+        linkTargetDetails,
       };
     }).filter(r => r.linkCount > 0);
 
@@ -747,11 +776,19 @@ function getLoggedRfiSubArtifacts(project) {
         srcLines + `<br>` +
         `RFIs with any links[]: ${dbgInfo.rfisWithAnyLinks}<br>` +
         (allRfiLinks.length > 0
-          ? allRfiLinks.map(r =>
-              `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s), ${r.linkedMatchCount} match current email<br>` +
-              `&nbsp;&nbsp;&nbsp;link targetIds: [${r.linkedTargetIds.join(", ")}]<br>` +
-              `&nbsp;&nbsp;&nbsp;email rec ids:  [${r.matchingEmailIds.join(", ")}]`
-            ).join("<br>")
+          ? allRfiLinks.map(r => {
+              const targetDetail = (r.linkTargetDetails || []).map(d => {
+                if (!d.found) return `&nbsp;&nbsp;&nbsp;&nbsp;${d.id}: NOT FOUND in project.emails`;
+                const why = d.inMatchSet ? "✓ in matchSet" :
+                  `✗ sub:${d.subjectMatch?"✓":"✗"} from:${d.fromMatch?"✓":"✗"} date:${d.dateMatch?"✓":"✗"}`;
+                return `&nbsp;&nbsp;&nbsp;&nbsp;${d.id}: ${why}<br>` +
+                  `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;stored: sub="${d.subject}" from=${d.fromAddress} date=${d.date}<br>` +
+                  `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;current: sub="${d.curSubject}" from=${d.curFrom} date=${d.curDate}`;
+              }).join("<br>");
+              return `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s), ${r.linkedMatchCount} match current email<br>` +
+                `&nbsp;&nbsp;&nbsp;matchSet ids: [${r.matchingEmailIds.join(", ")}]<br>` +
+                targetDetail;
+            }).join("<br>")
           : "&nbsp;&nbsp;(no RFI on this project has any links[] entries)");
     }
   } catch (e) {
