@@ -519,8 +519,8 @@ function loadItemContext() {
     // once it lands, so RFIs whose sourceMessageId was captured (or whose
     // source/linked email records have that ID stored) become matchable.
     try { fetchInternetMessageIdFromHeaders(); } catch {}
-    try { refreshLoggedArtifactChips(); } catch {}
     try { refreshLinkToTargetDropdown(); } catch {}
+    try { refreshLoggedArtifactChips(); } catch {}
     maybeShowAecQuip();
   }
 }
@@ -913,20 +913,41 @@ function refreshLinkToTargetDropdown() {
 // to the SharePoint folder when one is stored. Open RFIs/Submittals also get
 // a "Log Response" / "Log Review" button rendered below the chip so the user
 // can finish the workflow in one click. Hidden when nothing applies.
+// When an RFI/Submittal chip is showing for the current email, the link-to
+// dropdown, save buttons, and Log as RFI/Sub buttons become redundant — the
+// email is already filed and linked. Hide them. Restoration is automatic:
+// the underlying managers (refreshEmailSavedIndicator, refreshLinkToTargetDropdown)
+// always run before this on the next item change, setting their own visibility
+// before this function gets a chance to override.
+function _applyChipPresenceUiToggles(hasChips) {
+  if (!hasChips) return; // no-op — let the upstream managers own the visible state
+  const ids = ["linkToRow", "logRfiBtn", "logSubBtn"];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = "none";
+  }
+  for (const sel of [".save-row", ".save-row-caption"]) {
+    const el = document.querySelector(sel);
+    if (el) el.style.display = "none";
+  }
+}
 function refreshLoggedArtifactChips() {
   const container = document.getElementById("loggedAsArtifactChips");
   if (!container) return;
   if (!selectedProject || !emailItem?.itemId) {
     container.innerHTML = "";
     container.style.display = "none";
+    _applyChipPresenceUiToggles(false);
     return;
   }
   const artifacts = getLoggedRfiSubArtifacts(selectedProject);
   if (artifacts.length === 0) {
     container.innerHTML = "";
     container.style.display = "none";
+    _applyChipPresenceUiToggles(false);
     return;
   }
+  _applyChipPresenceUiToggles(true);
   // Switch container to a column layout so each artifact's chip + (optional)
   // action button stack vertically.
   container.style.display = "flex";
@@ -1005,11 +1026,13 @@ function refreshEmailSavedIndicator(animate = false) {
 
   if (!selectedProject || !emailItem?.itemId) {
     applyEmailFlowEmphasis();
+    try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
   const existing = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
   if (!existing) {
     applyEmailFlowEmphasis();
+    try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
 
@@ -1079,6 +1102,9 @@ function refreshEmailSavedIndicator(animate = false) {
   // saved-state message, so showing both would be redundant.
   setStatus("actionStatus", "", "");
   applyPipelineUiRules();
+  // Re-apply chip-aware hides last — if an RFI/Sub chip is showing for this
+  // email, the save row stays hidden regardless of save state.
+  try { refreshLoggedArtifactChips(); } catch {}
 }
 
 // Single source of truth for "does this email have file attachments?".
