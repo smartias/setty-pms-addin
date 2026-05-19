@@ -515,6 +515,10 @@ function loadItemContext() {
     setSelectedProject(null, false);
     void restoreProjectSelectionForCurrentEmail();
     refreshEmailSavedIndicator();
+    // Kick off async Message-ID header fetch — it'll re-trigger chip detection
+    // once it lands, so RFIs whose sourceMessageId was captured (or whose
+    // source/linked email records have that ID stored) become matchable.
+    try { fetchInternetMessageIdFromHeaders(); } catch {}
     try { refreshLoggedArtifactChips(); } catch {}
     try { refreshLinkToTargetDropdown(); } catch {}
     maybeShowAecQuip();
@@ -524,20 +528,55 @@ function getCurrentMessageRestId() {
   if (!emailItem?.itemId) return "";
   return Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
 }
+// Fetched-from-headers Message-ID, keyed by itemContextGeneration so it
+// invalidates when the user opens a different item. Set asynchronously by
+// fetchInternetMessageIdFromHeaders() — `emailItem.internetMessageId` is
+// unreliable across Outlook clients (returns "" in new Outlook for Windows),
+// so we read the raw RFC-822 Message-ID header as a fallback.
+let cachedInternetMessageId = "";
+let cachedInternetMessageIdGen = -1;
+function fetchInternetMessageIdFromHeaders() {
+  const myGen = itemContextGeneration;
+  if (!emailItem?.itemId) return;
+  // Already have a synchronous value? No need to fetch.
+  if (emailItem?.internetMessageId) {
+    cachedInternetMessageId = emailItem.internetMessageId;
+    cachedInternetMessageIdGen = myGen;
+    return;
+  }
+  if (!emailItem.getAllInternetHeadersAsync) return; // requires Mailbox 1.8+
+  emailItem.getAllInternetHeadersAsync(result => {
+    if (myGen !== itemContextGeneration) return; // user moved on
+    if (result.status !== Office.AsyncResultStatus.Succeeded) return;
+    const m = String(result.value || "").match(/^Message-ID:\s*(.+)$/im);
+    const id = m ? m[1].trim() : "";
+    if (!id) return;
+    cachedInternetMessageId = id;
+    cachedInternetMessageIdGen = myGen;
+    // Now that we have the stable ID, re-run chip detection — earlier calls
+    // may have returned nothing because matching depended on this value.
+    try { refreshLoggedArtifactChips(); } catch {}
+  });
+}
+function getEffectiveInternetMessageId() {
+  if (emailItem?.internetMessageId) return emailItem.internetMessageId;
+  if (cachedInternetMessageIdGen === itemContextGeneration) return cachedInternetMessageId;
+  return "";
+}
 function getCurrentMessageRecordId() {
   // Prefer internetMessageId (shared across recipients) for cross-mailbox matching.
   // Keep REST/item IDs as fallbacks so existing records created before this change still resolve.
-  return emailItem?.internetMessageId || getCurrentMessageRestId() || emailItem?.itemId || "";
+  return getEffectiveInternetMessageId() || getCurrentMessageRestId() || emailItem?.itemId || "";
 }
 function getCurrentMessageIdCandidates() {
   return [...new Set([
-    emailItem?.internetMessageId || "",
+    getEffectiveInternetMessageId(),
     getCurrentMessageRestId(),
     emailItem?.itemId || "",
   ].filter(Boolean))];
 }
 function getCurrentSharedMessageId() {
-  return emailItem?.internetMessageId || "";
+  return getEffectiveInternetMessageId();
 }
 async function getCurrentConversationId() {
   if (currentConversationId) return currentConversationId;
@@ -759,37 +798,45 @@ function getLoggedRfiSubArtifacts(project) {
       }
     }
     if (dbgBanner) {
-      const srcLines = rfiSourceInfo.length > 0
-        ? rfiSourceInfo.map(r =>
-            `&nbsp;&nbsp;${r.number}: srcItem=${r.hasSourceItem ? r.sourceItemId + (r.srcItemMatch ? "✓" : "✗") : "none"} ` +
-            `srcMsg=${r.hasSourceMsg ? r.sourceMessageId.slice(0, 20) + (r.srcMsgMatch ? "✓" : "✗") : "none"}`
-          ).join("<br>")
-        : "&nbsp;&nbsp;(no RFIs have any source IDs — were they logged from email?)";
+      // Build a "which email opens each chip" guide for every RFI.
+      const rfiGuideLines = (project.rfis || []).map(r => {
+        const num = r.number || "RFI-?";
+        const lines = [];
+
+        // SOURCE: look up the email record whose msgId = sourceItemId
+        if (r.sourceItemId) {
+          const srcRec = (project.emails || []).find(e => e.msgId === r.sourceItemId);
+          if (srcRec) {
+            const isCurrent = matchingEmailRecordIds.has(srcRec.id);
+            lines.push(`&nbsp;&nbsp;<b>${num}</b> SOURCE ${isCurrent ? "✓ THIS EMAIL" : "→ open:"}<br>` +
+              `&nbsp;&nbsp;&nbsp;sub: "${(srcRec.subject || "").slice(0, 50)}"<br>` +
+              `&nbsp;&nbsp;&nbsp;from: ${srcRec.fromAddress || "?"} | date: ${String(srcRec.date || "").slice(0, 10)}`);
+          } else {
+            lines.push(`&nbsp;&nbsp;<b>${num}</b> SOURCE → no email record found (msgId not in project.emails)`);
+          }
+        }
+
+        // LINKED: for each link, look up the email record
+        (r.links || []).filter(lk => lk?.targetSystem === "pms" && lk?.targetType === "email").forEach(lk => {
+          const rec = (project.emails || []).find(e => e.id === lk.targetId);
+          if (rec) {
+            const isCurrent = matchingEmailRecordIds.has(rec.id);
+            lines.push(`&nbsp;&nbsp;<b>${num}</b> LINKED ${isCurrent ? "✓ THIS EMAIL" : "→ open:"}<br>` +
+              `&nbsp;&nbsp;&nbsp;sub: "${(rec.subject || "").slice(0, 50)}"<br>` +
+              `&nbsp;&nbsp;&nbsp;from: ${rec.fromAddress || "?"} | date: ${String(rec.date || "").slice(0, 10)}`);
+          } else {
+            lines.push(`&nbsp;&nbsp;<b>${num}</b> LINKED → email record ${(lk.targetId||"").slice(0,16)} not found`);
+          }
+        });
+
+        return lines.join("<br>");
+      }).filter(Boolean).join("<br>");
+
       dbgBanner.innerHTML =
-        `<b>DBG-CHIP:</b><br>` +
-        `ewsId: ${dbgInfo.ewsId}<br>` +
-        `internetMsgId: ${dbgInfo.internetMsgId}<br>` +
-        `restId: ${dbgInfo.restId}<br>` +
-        `project.emails records: ${dbgInfo.projectEmails}<br>` +
-        `current item matches: ${dbgInfo.matchedRecords} email record(s)<br>` +
-        `RFIs total: ${dbgInfo.rfisTotal} | with source IDs: ${dbgInfo.rfisWithSourceIds} | SOURCE path matches: ${dbgInfo.sourcePathMatches}<br>` +
-        srcLines + `<br>` +
-        `RFIs with any links[]: ${dbgInfo.rfisWithAnyLinks}<br>` +
-        (allRfiLinks.length > 0
-          ? allRfiLinks.map(r => {
-              const targetDetail = (r.linkTargetDetails || []).map(d => {
-                if (!d.found) return `&nbsp;&nbsp;&nbsp;&nbsp;${d.id}: NOT FOUND in project.emails`;
-                const why = d.inMatchSet ? "✓ in matchSet" :
-                  `✗ sub:${d.subjectMatch?"✓":"✗"} from:${d.fromMatch?"✓":"✗"} date:${d.dateMatch?"✓":"✗"}`;
-                return `&nbsp;&nbsp;&nbsp;&nbsp;${d.id}: ${why}<br>` +
-                  `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;stored: sub="${d.subject}" from=${d.fromAddress} date=${d.date}<br>` +
-                  `&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;current: sub="${d.curSubject}" from=${d.curFrom} date=${d.curDate}`;
-              }).join("<br>");
-              return `&nbsp;&nbsp;${r.number}: ${r.linkCount} link(s), ${r.linkedMatchCount} match current email<br>` +
-                `&nbsp;&nbsp;&nbsp;matchSet ids: [${r.matchingEmailIds.join(", ")}]<br>` +
-                targetDetail;
-            }).join("<br>")
-          : "&nbsp;&nbsp;(no RFI on this project has any links[] entries)");
+        `<b>DBG-CHIP:</b> current: ${dbgInfo.matchedRecords} match(es) | ` +
+        `SOURCE matches: ${dbgInfo.sourcePathMatches} | LINKED matches: ${allRfiLinks.filter(r => r.linkedMatchCount > 0).length}<br>` +
+        `<b>To see each chip, open this email:</b><br>` +
+        (rfiGuideLines || "&nbsp;&nbsp;(no RFIs have source IDs or links on this project)");
     }
   } catch (e) {
     console.warn("[DBG-CHIP] diagnostic failed:", e.message);
