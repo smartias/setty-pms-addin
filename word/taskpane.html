@@ -461,15 +461,32 @@
         <div class="filename" id="docFilename">Loading…</div>
       </div>
 
-      <!-- Document status bar — persisted in document settings so all collaborators see the same state -->
-      <div class="status-bar" id="statusBar" title="Click to change status">
+      <!-- Document name — used for all save operations -->
+      <div id="titleFieldWrap" class="title-field">
+        <label for="titleInput">Document Name</label>
+        <input type="text" id="titleInput" placeholder="Document name" />
+      </div>
+
+      <!-- Destination — save location; updates as folder is browsed -->
+      <div id="destCard" style="margin-bottom:8px;">
+        <div class="dest-display">
+          <span>📂</span>
+          <span class="dest-path" id="destFolderDisplay">Select a project below</span>
+          <button id="destChangeBtn" class="dest-change-btn" style="display:none">✏ change</button>
+        </div>
+        <div class="opt-edit" id="spFolderEdit">
+          <div class="sp-picker" style="margin-top:0">
+            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
+            <div class="sp-folders" id="spFolders"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Document status — set automatically when PDF is exported -->
+      <div class="status-bar" id="statusBar">
         <span class="status-dot" id="statusDot"></span>
         <span class="status-label-text" id="statusLabelText">Draft</span>
         <span class="status-hint" id="statusHint"></span>
-        <span style="color:var(--muted);font-size:11px;">▾</span>
-      </div>
-      <div class="status-picker" id="statusPicker" style="display:none">
-        <div id="statusPickerList"></div>
       </div>
 
       <!-- Done-editing checklist — hidden when Final -->
