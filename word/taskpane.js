@@ -39,6 +39,7 @@ let docFirstPageText = "";
 let saveInFlight = false;
 let docStatus = "draft"; // persisted in Office document settings
 let doneEditingList = []; // [{ name, email, ts }] — persisted in document settings
+let draftSaved = false;   // true once a .docx draft has been uploaded to SharePoint
 // SharePoint folder picker state. spCurrentPath is drive-relative (e.g.
 // "24-105 Acme HVAC/Documents"). Defaults to the project folder root when
 // the SharePoint checkbox is first ticked.
@@ -161,6 +162,8 @@ function updateQuickLinks() {
 function updateDestCard() {
   const card = document.getElementById("destCard");
   if (!card) return;
+  // Once a draft is filed the destination is locked — hide the chip.
+  if (draftSaved) { card.style.display = "none"; return; }
   const hasFolder = !!(selectedProject?.projectFolderUrl);
   card.style.display = hasFolder ? "block" : "none";
   if (hasFolder) {
@@ -311,8 +314,17 @@ async function getToken() {
 async function onSignedIn() {
   showView("mainView");
   await Promise.all([loadProjects(), loadDocumentContext(), loadDocStatus(), loadDoneEditing()]);
+  loadSelectedProject();
+  loadDraftSaved();
   renderProjectList();
-  applyAutoSuggest();
+  // A project tagged in a previous session wins over a fresh auto-suggest.
+  if (selectedProject) {
+    updateSaveButtons();
+    refreshSpPickerForProject();
+    collapseProjectPickerToPill();
+  } else {
+    applyAutoSuggest();
+  }
   renderStatusBar();
   renderDoneEditing();
 }
@@ -365,6 +377,57 @@ async function loadProjects() {
     }
   } catch (e) {
     console.error("Failed to load projects:", e);
+  }
+}
+
+// ─── DOCUMENT SETTINGS PERSISTENCE ─────────────────────────────────────────────
+// The tagged project and document status are stored in the document's own
+// settings so they travel inside the .docx and are restored when the file is
+// reopened. saveAsync must run before the add-in reads the file out for upload,
+// otherwise the uploaded copy is missing the tags.
+function persistDocSettings() {
+  try {
+    Office.context.document.settings.set("settyPms:projectId", selectedProject?.id || "");
+    Office.context.document.settings.set("settyPms:docStatus", docStatus);
+    Office.context.document.settings.set("settyPms:draftSaved", draftSaved);
+  } catch (e) {
+    console.warn("Could not stage document settings:", e.message);
+  }
+}
+
+function flushSettings() {
+  return new Promise((resolve) => {
+    try {
+      Office.context.document.settings.saveAsync(r => {
+        if (r.status !== Office.AsyncResultStatus.Succeeded) {
+          console.warn("settings.saveAsync failed:", r.error?.message);
+        }
+        resolve();
+      });
+    } catch (e) {
+      console.warn("settings.saveAsync threw:", e.message);
+      resolve();
+    }
+  });
+}
+
+// Restore the project tagged on this document in an earlier session. Must run
+// after loadProjects() so allProjects is populated.
+function loadSelectedProject() {
+  try {
+    const id = Office.context.document.settings.get("settyPms:projectId");
+    if (id) selectedProject = allProjects.find(p => p.id === id) || null;
+  } catch (e) {
+    console.warn("Could not read saved project:", e.message);
+  }
+}
+
+// Restore whether a .docx draft has already been filed to SharePoint.
+function loadDraftSaved() {
+  try {
+    draftSaved = Office.context.document.settings.get("settyPms:draftSaved") === true;
+  } catch (e) {
+    draftSaved = false;
   }
 }
 
@@ -522,7 +585,7 @@ function renderProjectList(suggestedIds = []) {
     </div>`;
   }).join("");
   list.querySelectorAll(".project-row").forEach(row => {
-    row.onclick = () => {
+    row.onclick = async () => {
       const id = row.getAttribute("data-id");
       selectedProject = allProjects.find(p => p.id === id) || null;
       updateSaveButtons();
@@ -535,6 +598,9 @@ function renderProjectList(suggestedIds = []) {
       document.getElementById("insertStatus").className = "status";
       // Close the folder picker if it was open for the previous project
       document.getElementById("spFolderEdit").classList.remove("active");
+      // Tag the document with the chosen project so it survives a reopen.
+      persistDocSettings();
+      await flushSettings();
     };
   });
 }
@@ -549,8 +615,10 @@ function updateSaveButtons() {
   oneBtn.disabled    = !selectedProject || saveInFlight;
   oneBtn.textContent = "Save to OneNote" + projTag;
 
-  draftBtn.disabled    = !spReady || saveInFlight;
-  draftBtn.textContent = "💾 Save Draft" + (spReady ? projTag : "");
+  draftBtn.disabled     = !spReady || saveInFlight;
+  draftBtn.textContent  = "💾 Save Draft" + (spReady ? projTag : "");
+  // Save Draft is one-shot — it disappears once a draft has been filed.
+  draftBtn.style.display = draftSaved ? "none" : "";
 
   pdfBtn.disabled    = !spReady || saveInFlight;
   pdfBtn.textContent = spReady ? `📄 Export PDF to SharePoint${projTag}` : "📄 Export PDF to SharePoint";
@@ -1060,6 +1128,11 @@ async function doSaveDraft() {
   const uploadFilename = baseName.replace(/\.docx$/i, "") + ".docx";
   try {
     setStatus("spStatus", "info", "⏳ Exporting .docx…");
+    // Mark the document draft-saved and bake the tags in before reading it out,
+    // so the uploaded copy carries everything when someone reopens it.
+    draftSaved = true;
+    persistDocSettings();
+    await flushSettings();
     const docxBlob = await getDocumentAsDocxBlob();
     setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
     const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath);
@@ -1067,10 +1140,15 @@ async function doSaveDraft() {
     document.getElementById("spLink").innerHTML =
       `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>`;
   } catch (e) {
+    // Upload failed — the draft isn't really saved, so don't lock the UI.
+    draftSaved = false;
+    persistDocSettings();
+    await flushSettings();
     setStatus("spStatus", "error", e.message);
   } finally {
     saveInFlight = false;
     updateSaveButtons();
+    updateDestCard();
   }
 }
 
@@ -1099,7 +1177,9 @@ async function doSavePdf() {
       selectedProject, pdfBlob, uploadFilename, "application/pdf", spCurrentPath
     );
     // Mark as Final. The done-editing list is kept as a record of who signed
-    // off before the document was printed.
+    // off before the document was printed. The project tag is staged too so the
+    // open document keeps it (saveDocStatus flushes both to the file).
+    persistDocSettings();
     await saveDocStatus("final");
     renderDoneEditing();
     setStatus("spStatus", "success", "✓ PDF saved to SharePoint — document marked Final");
