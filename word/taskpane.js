@@ -311,13 +311,48 @@ async function loadProjects() {
 }
 
 // ─── DOCUMENT CONTEXT ─────────────────────────────────────────────────────────
+
+// Office.js exposes the document URL only via this async, callback-based API —
+// there is no synchronous `Office.context.document.url`. Returns "" for an
+// unsaved document.
+function getDocumentUrl() {
+  return new Promise((resolve) => {
+    Office.context.document.getFilePropertiesAsync((result) => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) {
+        resolve(result.value.url || "");
+      } else {
+        console.warn("getFilePropertiesAsync failed:", result.error?.message);
+        resolve("");
+      }
+    });
+  });
+}
+
+// TODO(you): Decide the default page title when the document has not been
+// saved yet (no filename exists). `loadDocumentContext` calls this only when
+// `getDocumentUrl()` returns "". It should return a non-empty string that the
+// title input is pre-filled with.
+//
+// Trade-offs to weigh:
+//  - A static string like "Untitled" is predictable but every unsaved doc
+//    collides on the same OneNote page title.
+//  - A date-stamped title ("Document 2026-05-20") is unique per day and
+//    self-documents when it was filed — but still collides within a day.
+//  - You could also pull from `docFirstPageText` (the first ~2000 chars of the
+//    document body, already loaded below) to guess a meaningful title.
+function deriveUnsavedTitle() {
+  // <-- implement here
+}
+
 async function loadDocumentContext() {
-  // Filename
-  docFilename = (Office.context.document.url || "")
-    .split(/[\\/]/).pop() || "Untitled.docx";
-  document.getElementById("docFilename").textContent = docFilename;
-  // Pre-fill page title with filename minus extension
-  const defaultTitle = docFilename.replace(/\.[^.]+$/, "");
+  // Filename — resolved via the async Office API (see getDocumentUrl above).
+  const docUrl = await getDocumentUrl();
+  docFilename = docUrl.split(/[\\/]/).pop() || "";
+  document.getElementById("docFilename").textContent = docFilename || "(unsaved document)";
+  // Pre-fill page title with filename minus extension, or the unsaved fallback.
+  const defaultTitle = docFilename
+    ? docFilename.replace(/\.[^.]+$/, "")
+    : deriveUnsavedTitle();
   const titleInput = document.getElementById("titleInput");
   titleInput.value = defaultTitle;
   document.getElementById("titleCurrent").textContent = defaultTitle;
@@ -831,6 +866,11 @@ async function doSaveToSharePoint() {
   saveInFlight = true;
   updateSaveButtons();
   document.getElementById("spLink").innerHTML = "";
+  // Unsaved documents have no docFilename — fall back to the title the user
+  // chose so the SharePoint upload always has a real name.
+  const titleInput = document.getElementById("titleInput");
+  const baseName = (titleInput.value || "").trim() || "Document";
+  const uploadFilename = docFilename || baseName + ".docx";
   try {
     setStatus("spStatus", "info", "⏳ Exporting document…");
     const [docxBlob, pdfBlob] = await Promise.all([
@@ -839,10 +879,10 @@ async function doSaveToSharePoint() {
     ]);
 
     setStatus("spStatus", "info", "⏳ Uploading .docx to SharePoint…");
-    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, docFilename, spCurrentPath);
+    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath);
 
     setStatus("spStatus", "info", "⏳ Uploading PDF to SharePoint…");
-    const pdfFilename = docFilename.replace(/\.docx$/i, "") + ".pdf";
+    const pdfFilename = uploadFilename.replace(/\.docx$/i, "") + ".pdf";
     const pdfItem = await uploadFileToSharePoint(
       selectedProject, pdfBlob, pdfFilename, "application/pdf", spCurrentPath
     );
