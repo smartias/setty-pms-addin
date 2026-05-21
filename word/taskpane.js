@@ -119,7 +119,6 @@ function setupListeners() {
   document.getElementById("openPmsBtn").onclick       = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick  = openSelectedProjectSpFolder;
   document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
-  document.getElementById("statusBar").onclick        = toggleStatusPicker;
   document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
 }
 
@@ -387,20 +386,27 @@ function getDocumentUrl() {
   });
 }
 
-// TODO(you): Decide the default page title when the document has not been
-// saved yet (no filename exists). `loadDocumentContext` calls this only when
-// `getDocumentUrl()` returns "". It should return a non-empty string that the
-// title input is pre-filled with.
-//
-// Trade-offs to weigh:
-//  - A static string like "Untitled" is predictable but every unsaved doc
-//    collides on the same OneNote page title.
-//  - A date-stamped title ("Document 2026-05-20") is unique per day and
-//    self-documents when it was filed — but still collides within a day.
-//  - You could also pull from `docFirstPageText` (the first ~2000 chars of the
-//    document body, already loaded below) to guess a meaningful title.
+// Default name for a document that has never been saved (no filename yet).
+// Date-stamped so unsaved docs don't all collide on the same OneNote page
+// title; the user can still type over it in the Document Name field.
 function deriveUnsavedTitle() {
-  // <-- implement here
+  const d = new Date();
+  const stamp = d.getFullYear() + "-"
+    + String(d.getMonth() + 1).padStart(2, "0") + "-"
+    + String(d.getDate()).padStart(2, "0");
+  return "Document " + stamp;
+}
+
+// Turn a document URL into a readable folder path. SharePoint-hosted docs are
+// shown project-library-relative; anything else falls back to the decoded
+// directory portion of the URL.
+function prettyDocLocation(url) {
+  const noFile = String(url).replace(/[\\/][^\\/]*$/, "");
+  if (noFile.startsWith(SP_BASE_URL)) {
+    const rel = decodeURIComponent(noFile.slice(SP_BASE_URL.length).replace(/^\/+/, ""));
+    return rel || "(library root)";
+  }
+  try { return decodeURIComponent(noFile); } catch { return noFile; }
 }
 
 async function loadDocumentContext() {
@@ -408,7 +414,15 @@ async function loadDocumentContext() {
   const docUrl = await getDocumentUrl();
   docFilename = docUrl.split(/[\\/]/).pop() || "";
   document.getElementById("docFilename").textContent = docFilename || "(unsaved document)";
-  // Pre-fill page title with filename minus extension, or the unsaved fallback.
+  // Show where the document currently lives so a reopened file's location is
+  // visible at a glance.
+  const locEl = document.getElementById("docLocation");
+  if (locEl) {
+    locEl.textContent = docUrl ? "📂 " + prettyDocLocation(docUrl) : "Not yet saved";
+    locEl.style.display = "block";
+  }
+  // Pre-fill the Document Name field with the filename minus extension, or the
+  // unsaved fallback. This value drives the saved filename and OneNote title.
   const defaultTitle = docFilename
     ? docFilename.replace(/\.[^.]+$/, "")
     : deriveUnsavedTitle();
@@ -919,9 +933,6 @@ function renderStatusBar() {
   if (dot)  dot.style.background  = opt.dot;
   if (lbl)  lbl.textContent       = opt.label;
   if (hint) hint.textContent      = opt.hint;
-  // Status bar is non-interactive when Final (no going back manually)
-  const bar = document.getElementById("statusBar");
-  if (bar) bar.style.cursor = docStatus === "final" ? "default" : "pointer";
 }
 
 // ─── DONE-EDITING ─────────────────────────────────────────────────────────────
@@ -966,13 +977,16 @@ function renderDoneEditing() {
   const toggleBtn  = document.getElementById("toggleDoneBtn");
   if (!section) return;
 
-  // Hidden when the document is Final — editing phase is over
-  section.style.display = docStatus === "final" ? "none" : "block";
-  if (docStatus === "final") return;
+  // Stays visible even when Final — the record of who signed off before the
+  // document was printed is useful history. Only the "Mark me done" toggle is
+  // hidden once final, since the editing phase is over.
+  const isFinal = docStatus === "final";
+  section.style.display = "block";
+  if (toggleBtn) toggleBtn.style.display = isFinal ? "none" : "";
 
   const email   = (msalAccount?.username || "").toLowerCase();
   const iAmDone = doneEditingList.some(d => (d.email || "").toLowerCase() === email);
-  if (toggleBtn) {
+  if (toggleBtn && !isFinal) {
     toggleBtn.textContent = iAmDone ? "✓ I'm done" : "Mark me done";
     toggleBtn.classList.toggle("is-done", iAmDone);
   }
@@ -997,31 +1011,6 @@ function formatTimeAgo(ts) {
   const h = Math.floor(m / 60);
   if (h < 24) return h + "h ago";
   return Math.floor(h / 24) + "d ago";
-}
-
-function toggleStatusPicker() {
-  if (docStatus === "final") return; // Final is set automatically; no manual override
-  const picker = document.getElementById("statusPicker");
-  const opening = picker.style.display === "none";
-  picker.style.display = opening ? "block" : "none";
-  if (opening) renderStatusPickerOptions();
-}
-
-function renderStatusPickerOptions() {
-  const list = document.getElementById("statusPickerList");
-  if (!list) return;
-  list.innerHTML = DOC_STATUS_OPTIONS.map(opt => `
-    <div class="status-picker-option${opt.value === docStatus ? " active" : ""}" data-val="${opt.value}">
-      <span class="status-dot" style="background:${opt.dot}"></span>
-      <span>${escapeHtml(opt.label)}</span>
-      <span class="opt-hint">${escapeHtml(opt.hint)}</span>
-    </div>`).join("");
-  list.querySelectorAll(".status-picker-option").forEach(row => {
-    row.onclick = async () => {
-      await saveDocStatus(row.getAttribute("data-val"));
-      document.getElementById("statusPicker").style.display = "none";
-    };
-  });
 }
 
 // ─── SAVE FLOWS ───────────────────────────────────────────────────────────────
@@ -1063,8 +1052,12 @@ async function doSaveDraft() {
   updateSaveButtons();
   document.getElementById("spLink").innerHTML = "";
   const titleInput = document.getElementById("titleInput");
-  const baseName = (titleInput.value || "").trim() || "Document";
-  const uploadFilename = docFilename || baseName + ".docx";
+  // The Document Name field drives the saved filename — fall back to the
+  // original filename, then a generic name only if both are empty.
+  const baseName = (titleInput.value || "").trim()
+    || docFilename.replace(/\.[^.]+$/, "")
+    || "Document";
+  const uploadFilename = baseName.replace(/\.docx$/i, "") + ".docx";
   try {
     setStatus("spStatus", "info", "⏳ Exporting .docx…");
     const docxBlob = await getDocumentAsDocxBlob();
@@ -1093,8 +1086,11 @@ async function doSavePdf() {
   updateSaveButtons();
   document.getElementById("spLink").innerHTML = "";
   const titleInput = document.getElementById("titleInput");
-  const baseName = (titleInput.value || "").trim() || "Document";
-  const uploadFilename = (docFilename || baseName + ".docx").replace(/\.docx$/i, "") + ".pdf";
+  // The Document Name field drives the saved filename.
+  const baseName = (titleInput.value || "").trim()
+    || docFilename.replace(/\.[^.]+$/, "")
+    || "Document";
+  const uploadFilename = baseName.replace(/\.[^.]+$/, "") + ".pdf";
   try {
     setStatus("spStatus", "info", "⏳ Exporting PDF…");
     const pdfBlob = await getDocumentAsPdfBlob();
@@ -1102,9 +1098,8 @@ async function doSavePdf() {
     const pdfItem = await uploadFileToSharePoint(
       selectedProject, pdfBlob, uploadFilename, "application/pdf", spCurrentPath
     );
-    // Mark as Final and clear the done-editing list — PDF export = document is finalized.
-    doneEditingList = [];
-    await saveDoneEditingList();
+    // Mark as Final. The done-editing list is kept as a record of who signed
+    // off before the document was printed.
     await saveDocStatus("final");
     renderDoneEditing();
     setStatus("spStatus", "success", "✓ PDF saved to SharePoint — document marked Final");

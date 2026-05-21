@@ -57,6 +57,7 @@
     }
     .doc-info .label { color: var(--muted); font-size: 11px; }
     .doc-info .filename { font-weight: 600; word-break: break-all; }
+    .doc-info .doc-location { color: var(--muted); font-size: 11px; margin-top: 3px; word-break: break-all; }
     label {
       display: block;
       font-size: 11px;
@@ -349,10 +350,8 @@
       border-radius: 4px;
       margin-bottom: 10px;
       font-size: 12px;
-      cursor: pointer;
       user-select: none;
     }
-    .status-bar:hover { border-color: var(--accent); }
     .status-dot {
       width: 8px; height: 8px;
       border-radius: 50%;
@@ -360,26 +359,6 @@
     }
     .status-label-text { font-weight: 600; flex: 1; }
     .status-hint { font-size: 11px; color: var(--muted); }
-    .status-picker {
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--panel);
-      margin-bottom: 10px;
-      overflow: hidden;
-    }
-    .status-picker-option {
-      padding: 8px 10px;
-      cursor: pointer;
-      font-size: 12px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      border-bottom: 1px solid var(--border);
-    }
-    .status-picker-option:last-child { border-bottom: none; }
-    .status-picker-option:hover { background: #2d2d2d; }
-    .status-picker-option.active { background: var(--navy-light); }
-    .status-picker-option .opt-hint { font-size: 11px; color: var(--muted); margin-left: auto; text-align: right; max-width: 110px; line-height: 1.3; }
     /* Done-editing section */
     .done-section {
       background: var(--panel);
@@ -459,6 +438,7 @@
       <div class="doc-info">
         <div class="label">DOCUMENT</div>
         <div class="filename" id="docFilename">Loading…</div>
+        <div class="doc-location" id="docLocation" style="display:none"></div>
       </div>
 
       <!-- Document name — used for all save operations -->
@@ -468,11 +448,11 @@
       </div>
 
       <!-- Destination — save location; updates as folder is browsed -->
-      <div id="destCard" style="margin-bottom:8px;">
+      <div id="destCard" style="display:none; margin-bottom:8px;">
         <div class="dest-display">
           <span>📂</span>
-          <span class="dest-path" id="destFolderDisplay">Select a project below</span>
-          <button id="destChangeBtn" class="dest-change-btn" style="display:none">✏ change</button>
+          <span class="dest-path" id="destFolderDisplay">project root</span>
+          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
         </div>
         <div class="opt-edit" id="spFolderEdit">
           <div class="sp-picker" style="margin-top:0">
@@ -489,7 +469,7 @@
         <span class="status-hint" id="statusHint"></span>
       </div>
 
-      <!-- Done-editing checklist — hidden when Final -->
+      <!-- Done-editing checklist — kept as a sign-off record after Final -->
       <div id="doneEditingSection" class="done-section" style="display:none">
         <div class="done-section-header">
           <span class="done-section-label">Done editing</span>
@@ -515,27 +495,6 @@
           <button id="openPmsBtn" class="btn-quick-link" disabled>🔗 Open in PMS</button>
           <button id="openSpFolderBtn" class="btn-quick-link" disabled>📂 SP Folder</button>
         </div>
-      </div>
-
-      <!-- Destination card — shows save target; replaces buried opt-line folder row -->
-      <div id="destCard" style="display:none; margin-bottom:8px;">
-        <div class="dest-display">
-          <span>📂</span>
-          <span class="dest-path" id="destFolderDisplay">project root</span>
-          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
-        </div>
-        <div class="opt-edit" id="spFolderEdit">
-          <div class="sp-picker" style="margin-top:0">
-            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
-            <div class="sp-folders" id="spFolders"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- OneNote title — visible labeled field so it's set before clicking Save -->
-      <div id="titleFieldWrap" class="title-field" style="display:none">
-        <label for="titleInput">📓 OneNote page title</label>
-        <input type="text" id="titleInput" placeholder="Page title" />
       </div>
 
       <!-- Save row — two buttons side by side, prominent and at the top -->
