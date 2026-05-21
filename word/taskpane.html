@@ -292,6 +292,58 @@
     /* Section heading reused but tighter */
     .section-tight { margin-top: 14px; }
     .section-tight .save-section-title { margin-bottom: 6px; }
+
+    /* ── Document status bar ───────────────────────────────────────────── */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .status-bar:hover { border-color: var(--accent); }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-label-text { font-weight: 600; flex: 1; }
+    .status-hint { font-size: 11px; color: var(--muted); }
+    .status-picker {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+    .status-picker-option {
+      padding: 8px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .status-picker-option:last-child { border-bottom: none; }
+    .status-picker-option:hover { background: #2d2d2d; }
+    .status-picker-option.active { background: var(--navy-light); }
+    .status-picker-option .opt-hint { font-size: 11px; color: var(--muted); margin-left: auto; text-align: right; max-width: 110px; line-height: 1.3; }
+    /* PDF button — full width, below the main save row */
+    #savePdfBtn {
+      margin-top: 6px;
+      background: #14532d;
+      color: #4ade80;
+      border: 1px solid #166534;
+    }
+    #savePdfBtn:hover:not(:disabled) { background: #166534; }
+    #savePdfBtn:disabled { opacity: 0.4; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -314,6 +366,17 @@
         <div class="filename" id="docFilename">Loading…</div>
       </div>
 
+      <!-- Document status bar — persisted in document settings so all collaborators see the same state -->
+      <div class="status-bar" id="statusBar" title="Click to change status">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-label-text" id="statusLabelText">Draft</span>
+        <span class="status-hint" id="statusHint"></span>
+        <span style="color:var(--muted);font-size:11px;">▾</span>
+      </div>
+      <div class="status-picker" id="statusPicker" style="display:none">
+        <div id="statusPickerList"></div>
+      </div>
+
       <!-- Project: search + list (visible until selection), then collapses to a compact pill -->
       <div id="projectPickerWrap">
         <div id="projectSearchWrap" class="field">
@@ -331,8 +394,9 @@
       <!-- Save row — two buttons side by side, prominent and at the top -->
       <div class="save-row">
         <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
-        <button id="saveSpBtn" disabled>Save to SharePoint</button>
+        <button id="saveSpDraftBtn" disabled>💾 Save Draft</button>
       </div>
+      <button id="savePdfBtn" disabled>📄 Export PDF to SharePoint</button>
 
       <!-- Compact options under the save row: title for OneNote, folder for SP -->
       <div class="opt-line">

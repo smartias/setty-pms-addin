@@ -20,6 +20,14 @@ const PROJECTS_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 const LAST_ACCOUNT_STORAGE_KEY = "settyPmsWord:lastMsalAccountHomeId";
 const TARGET_SECTION_NAME = "Documents"; // fixed section per product decision
 
+// ─── DOCUMENT STATUS ─────────────────────────────────────────────────────────
+const DOC_STATUS_OPTIONS = [
+  { value: "draft",    label: "Draft",            dot: "#888",    hint: "Still editing" },
+  { value: "review",   label: "Ready for Review", dot: "#4a9eff", hint: "Shared for feedback" },
+  { value: "approved", label: "Approved",         dot: "#a78bfa", hint: "Cleared to finalize" },
+  { value: "sent",     label: "Sent to Client",   dot: "#4ade80", hint: "Document delivered" },
+];
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let msalApp = null;
 let msalAccount = null;
@@ -29,6 +37,7 @@ let selectedProject = null;
 let docFilename = "";
 let docFirstPageText = "";
 let saveInFlight = false;
+let docStatus = "draft"; // persisted in Office document settings
 // SharePoint folder picker state. spCurrentPath is drive-relative (e.g.
 // "24-105 Acme HVAC/Documents"). Defaults to the project folder root when
 // the SharePoint checkbox is first ticked.
@@ -94,19 +103,21 @@ Office.onReady(async (info) => {
 });
 
 function setupListeners() {
-  document.getElementById("signInBtn").onclick      = doSignIn;
-  document.getElementById("signOutBtn").onclick     = doSignOut;
-  document.getElementById("saveOneNoteBtn").onclick = doSaveToOneNote;
-  document.getElementById("saveSpBtn").onclick      = doSaveToSharePoint;
-  document.getElementById("insertNameBtn").onclick   = () => doInsertField("name");
-  document.getElementById("insertNumberBtn").onclick = () => doInsertField("number");
-  document.getElementById("insertClientBtn").onclick = () => doInsertField("client");
+  document.getElementById("signInBtn").onclick        = doSignIn;
+  document.getElementById("signOutBtn").onclick       = doSignOut;
+  document.getElementById("saveOneNoteBtn").onclick   = doSaveToOneNote;
+  document.getElementById("saveSpDraftBtn").onclick   = doSaveDraft;
+  document.getElementById("savePdfBtn").onclick       = doSavePdf;
+  document.getElementById("insertNameBtn").onclick    = () => doInsertField("name");
+  document.getElementById("insertNumberBtn").onclick  = () => doInsertField("number");
+  document.getElementById("insertClientBtn").onclick  = () => doInsertField("client");
   document.getElementById("insertPocToggleBtn").onclick = togglePocPicker;
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
   document.getElementById("pocSearch").addEventListener("input", renderPocList);
-  document.getElementById("pillChangeLink").onclick    = expandProjectPicker;
-  document.getElementById("titleEditLink").onclick     = () => toggleOpt("titleEdit", "titleInput");
-  document.getElementById("spFolderEditLink").onclick  = () => toggleOpt("spFolderEdit");
+  document.getElementById("pillChangeLink").onclick   = expandProjectPicker;
+  document.getElementById("titleEditLink").onclick    = () => toggleOpt("titleEdit", "titleInput");
+  document.getElementById("spFolderEditLink").onclick = () => toggleOpt("spFolderEdit");
+  document.getElementById("statusBar").onclick        = toggleStatusPicker;
 }
 
 // Collapse the search + list into the compact pill once a project is chosen.
@@ -254,9 +265,10 @@ async function getToken() {
 
 async function onSignedIn() {
   showView("mainView");
-  await Promise.all([loadProjects(), loadDocumentContext()]);
+  await Promise.all([loadProjects(), loadDocumentContext(), loadDocStatus()]);
   renderProjectList();
   applyAutoSuggest();
+  renderStatusBar();
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -474,22 +486,31 @@ function renderProjectList(suggestedIds = []) {
 }
 
 function updateSaveButtons() {
-  const oneBtn = document.getElementById("saveOneNoteBtn");
-  const spBtn  = document.getElementById("saveSpBtn");
-  const projTag = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
-  oneBtn.disabled = !selectedProject || saveInFlight;
+  const oneBtn     = document.getElementById("saveOneNoteBtn");
+  const draftBtn   = document.getElementById("saveSpDraftBtn");
+  const pdfBtn     = document.getElementById("savePdfBtn");
+  const projTag    = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
+  const spReady    = !!(selectedProject && selectedProject.projectFolderUrl);
+  const pdfAllowed = spReady && docStatus !== "draft";
+
+  oneBtn.disabled   = !selectedProject || saveInFlight;
   oneBtn.textContent = "Save to OneNote" + projTag;
-  // SharePoint requires a project AND a linked SharePoint folder
-  const spReady = !!(selectedProject && selectedProject.projectFolderUrl);
-  spBtn.disabled = !spReady || saveInFlight;
-  spBtn.textContent = "Save to SharePoint" + (spReady ? projTag : "");
-  // Insert buttons — all three require a project. POC also needs the picker
-  // closed-state to be reset when the project changes.
+
+  draftBtn.disabled   = !spReady || saveInFlight;
+  draftBtn.textContent = "💾 Save Draft" + (spReady ? projTag : "");
+
+  pdfBtn.disabled   = !pdfAllowed || saveInFlight;
+  pdfBtn.textContent = pdfAllowed
+    ? `📄 Export PDF to SharePoint${projTag}`
+    : docStatus === "draft"
+      ? "📄 Export PDF  (mark Ready to enable)"
+      : "📄 Export PDF to SharePoint";
+
   const hasProject = !!selectedProject;
-  document.getElementById("insertNameBtn").disabled       = !hasProject;
-  document.getElementById("insertNumberBtn").disabled     = !hasProject;
-  document.getElementById("insertClientBtn").disabled     = !hasProject;
-  document.getElementById("insertPocToggleBtn").disabled  = !hasProject;
+  document.getElementById("insertNameBtn").disabled      = !hasProject;
+  document.getElementById("insertNumberBtn").disabled    = !hasProject;
+  document.getElementById("insertClientBtn").disabled    = !hasProject;
+  document.getElementById("insertPocToggleBtn").disabled = !hasProject;
 }
 
 // ─── SLICE DECODE ─────────────────────────────────────────────────────────────
@@ -829,6 +850,66 @@ async function doInsertPocBlock(person) {
   }
 }
 
+// ─── DOCUMENT STATUS ─────────────────────────────────────────────────────────
+async function loadDocStatus() {
+  try {
+    const saved = Office.context.document.settings.get("settyPms:docStatus");
+    if (saved && DOC_STATUS_OPTIONS.find(o => o.value === saved)) docStatus = saved;
+  } catch (e) {
+    console.warn("Could not read doc status:", e.message);
+  }
+}
+
+async function saveDocStatus(status) {
+  docStatus = status;
+  try {
+    Office.context.document.settings.set("settyPms:docStatus", status);
+    await new Promise((resolve, reject) => {
+      Office.context.document.settings.saveAsync(r =>
+        r.status === Office.AsyncResultStatus.Succeeded ? resolve() : reject(new Error(r.error?.message))
+      );
+    });
+  } catch (e) {
+    console.warn("Could not persist doc status:", e.message);
+  }
+  renderStatusBar();
+  updateSaveButtons();
+}
+
+function renderStatusBar() {
+  const opt  = DOC_STATUS_OPTIONS.find(o => o.value === docStatus) || DOC_STATUS_OPTIONS[0];
+  const dot  = document.getElementById("statusDot");
+  const lbl  = document.getElementById("statusLabelText");
+  const hint = document.getElementById("statusHint");
+  if (dot)  dot.style.background  = opt.dot;
+  if (lbl)  lbl.textContent       = opt.label;
+  if (hint) hint.textContent      = opt.hint;
+}
+
+function toggleStatusPicker() {
+  const picker = document.getElementById("statusPicker");
+  const opening = picker.style.display === "none";
+  picker.style.display = opening ? "block" : "none";
+  if (opening) renderStatusPickerOptions();
+}
+
+function renderStatusPickerOptions() {
+  const list = document.getElementById("statusPickerList");
+  if (!list) return;
+  list.innerHTML = DOC_STATUS_OPTIONS.map(opt => `
+    <div class="status-picker-option${opt.value === docStatus ? " active" : ""}" data-val="${opt.value}">
+      <span class="status-dot" style="background:${opt.dot}"></span>
+      <span>${escapeHtml(opt.label)}</span>
+      <span class="opt-hint">${escapeHtml(opt.hint)}</span>
+    </div>`).join("");
+  list.querySelectorAll(".status-picker-option").forEach(row => {
+    row.onclick = async () => {
+      await saveDocStatus(row.getAttribute("data-val"));
+      document.getElementById("statusPicker").style.display = "none";
+    };
+  });
+}
+
 // ─── SAVE FLOWS ───────────────────────────────────────────────────────────────
 async function doSaveToOneNote() {
   if (!selectedProject) { setStatus("oneNoteStatus", "error", "Pick a project first."); return; }
@@ -856,7 +937,8 @@ async function doSaveToOneNote() {
   }
 }
 
-async function doSaveToSharePoint() {
+// Saves the .docx to SharePoint — safe to use at any status, any time.
+async function doSaveDraft() {
   if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
   if (!selectedProject.projectFolderUrl) {
     setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
@@ -866,31 +948,53 @@ async function doSaveToSharePoint() {
   saveInFlight = true;
   updateSaveButtons();
   document.getElementById("spLink").innerHTML = "";
-  // Unsaved documents have no docFilename — fall back to the title the user
-  // chose so the SharePoint upload always has a real name.
   const titleInput = document.getElementById("titleInput");
   const baseName = (titleInput.value || "").trim() || "Document";
   const uploadFilename = docFilename || baseName + ".docx";
   try {
-    setStatus("spStatus", "info", "⏳ Exporting document…");
-    const [docxBlob, pdfBlob] = await Promise.all([
-      getDocumentAsDocxBlob(),
-      getDocumentAsPdfBlob(),
-    ]);
-
-    setStatus("spStatus", "info", "⏳ Uploading .docx to SharePoint…");
+    setStatus("spStatus", "info", "⏳ Exporting .docx…");
+    const docxBlob = await getDocumentAsDocxBlob();
+    setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
     const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath);
-
-    setStatus("spStatus", "info", "⏳ Uploading PDF to SharePoint…");
-    const pdfFilename = uploadFilename.replace(/\.docx$/i, "") + ".pdf";
-    const pdfItem = await uploadFileToSharePoint(
-      selectedProject, pdfBlob, pdfFilename, "application/pdf", spCurrentPath
-    );
-
-    setStatus("spStatus", "success", "✓ Saved .docx and PDF to SharePoint");
+    setStatus("spStatus", "success", "✓ Draft saved to SharePoint");
     document.getElementById("spLink").innerHTML =
-      `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>` +
-      `&nbsp;&nbsp;<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
+      `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>`;
+  } catch (e) {
+    setStatus("spStatus", "error", e.message);
+  } finally {
+    saveInFlight = false;
+    updateSaveButtons();
+  }
+}
+
+// Exports a PDF and saves it to SharePoint. Only available when status is not Draft.
+async function doSavePdf() {
+  if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
+  if (!selectedProject.projectFolderUrl) {
+    setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
+    return;
+  }
+  if (docStatus === "draft") {
+    setStatus("spStatus", "error", "Mark the document as Ready for Review or higher before exporting a PDF.");
+    return;
+  }
+  if (saveInFlight) return;
+  saveInFlight = true;
+  updateSaveButtons();
+  document.getElementById("spLink").innerHTML = "";
+  const titleInput = document.getElementById("titleInput");
+  const baseName = (titleInput.value || "").trim() || "Document";
+  const uploadFilename = (docFilename || baseName + ".docx").replace(/\.docx$/i, "") + ".pdf";
+  try {
+    setStatus("spStatus", "info", "⏳ Exporting PDF…");
+    const pdfBlob = await getDocumentAsPdfBlob();
+    setStatus("spStatus", "info", "⏳ Uploading PDF to SharePoint…");
+    const pdfItem = await uploadFileToSharePoint(
+      selectedProject, pdfBlob, uploadFilename, "application/pdf", spCurrentPath
+    );
+    setStatus("spStatus", "success", "✓ PDF saved to SharePoint");
+    document.getElementById("spLink").innerHTML =
+      `<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
   } catch (e) {
     setStatus("spStatus", "error", e.message);
   } finally {
