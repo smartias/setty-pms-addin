@@ -19,14 +19,14 @@ const PROJECTS_CACHE_KEY = "settyPmsWord:projectsCache";
 const PROJECTS_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 const LAST_ACCOUNT_STORAGE_KEY = "settyPmsWord:lastMsalAccountHomeId";
 const TARGET_SECTION_NAME = "Documents"; // fixed section per product decision
+const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
 
 // ─── DOCUMENT STATUS ─────────────────────────────────────────────────────────
 const DOC_STATUS_OPTIONS = [
-  { value: "draft",    label: "Draft",            dot: "#888",    hint: "Still editing" },
-  { value: "review",   label: "Ready for Review", dot: "#4a9eff", hint: "Shared for feedback" },
-  { value: "approved", label: "Approved",         dot: "#a78bfa", hint: "Cleared to finalize" },
-  { value: "sent",     label: "Sent to Client",   dot: "#4ade80", hint: "Document delivered" },
+  { value: "draft", label: "Draft", dot: "#888",    hint: "Still editing" },
+  { value: "final", label: "Final", dot: "#4ade80", hint: "PDF exported"  },
 ];
+const DOC_DONE_KEY = "settyPms:doneEditing";
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let msalApp = null;
@@ -38,6 +38,7 @@ let docFilename = "";
 let docFirstPageText = "";
 let saveInFlight = false;
 let docStatus = "draft"; // persisted in Office document settings
+let doneEditingList = []; // [{ name, email, ts }] — persisted in document settings
 // SharePoint folder picker state. spCurrentPath is drive-relative (e.g.
 // "24-105 Acme HVAC/Documents"). Defaults to the project folder root when
 // the SharePoint checkbox is first ticked.
@@ -115,26 +116,71 @@ function setupListeners() {
   document.getElementById("searchInput").addEventListener("input", () => renderProjectList());
   document.getElementById("pocSearch").addEventListener("input", renderPocList);
   document.getElementById("pillChangeLink").onclick   = expandProjectPicker;
-  document.getElementById("titleEditLink").onclick    = () => toggleOpt("titleEdit", "titleInput");
-  document.getElementById("spFolderEditLink").onclick = () => toggleOpt("spFolderEdit");
+  document.getElementById("openPmsBtn").onclick       = openSelectedProjectInPms;
+  document.getElementById("openSpFolderBtn").onclick  = openSelectedProjectSpFolder;
+  document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
   document.getElementById("statusBar").onclick        = toggleStatusPicker;
+  document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
 }
 
 // Collapse the search + list into the compact pill once a project is chosen.
 function collapseProjectPickerToPill() {
   if (!selectedProject) return;
-  document.getElementById("projectSearchWrap").style.display = "none";
-  document.getElementById("projectPill").style.display = "flex";
-  document.getElementById("pillProjectNumber").textContent = selectedProject.projectNumber || "";
-  document.getElementById("pillProjectName").textContent   = selectedProject.name || "";
+  document.getElementById("projectSearchWrap").style.display  = "none";
+  document.getElementById("projectPill").style.display        = "flex";
+  document.getElementById("pillProjectNumber").textContent    = selectedProject.projectNumber || "";
+  document.getElementById("pillProjectName").textContent      = selectedProject.name || "";
+  // Quick links
+  const ql = document.getElementById("projectQuickLinks");
+  if (ql) ql.style.display = "grid";
+  updateQuickLinks();
+  // Destination card — only when project has a SharePoint folder
+  updateDestCard();
+  // Title field for OneNote — always visible once a project is picked
+  const tf = document.getElementById("titleFieldWrap");
+  if (tf) tf.style.display = "block";
 }
+
 function expandProjectPicker() {
   document.getElementById("projectSearchWrap").style.display = "block";
-  document.getElementById("projectPill").style.display = "none";
+  document.getElementById("projectPill").style.display       = "none";
+  const ql = document.getElementById("projectQuickLinks");
+  if (ql) ql.style.display = "none";
   const s = document.getElementById("searchInput");
   s.value = "";
   s.focus();
   renderProjectList();
+}
+
+function updateQuickLinks() {
+  const pmsBtn = document.getElementById("openPmsBtn");
+  const spBtn  = document.getElementById("openSpFolderBtn");
+  if (pmsBtn) pmsBtn.disabled = !selectedProject;
+  if (spBtn)  spBtn.disabled  = !(selectedProject?.projectFolderUrl);
+}
+
+function updateDestCard() {
+  const card = document.getElementById("destCard");
+  if (!card) return;
+  const hasFolder = !!(selectedProject?.projectFolderUrl);
+  card.style.display = hasFolder ? "block" : "none";
+  if (hasFolder) {
+    const display = document.getElementById("destFolderDisplay");
+    const rel = spCurrentPath && spProjectRootPath && spCurrentPath.startsWith(spProjectRootPath)
+      ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
+      : "";
+    if (display) display.textContent = rel || "project root";
+  }
+}
+
+function openSelectedProjectInPms() {
+  if (!selectedProject) return;
+  window.open(PMS_PROJECT_BASE_URL + selectedProject.id, "_blank");
+}
+
+function openSelectedProjectSpFolder() {
+  if (!selectedProject?.projectFolderUrl) return;
+  window.open(selectedProject.projectFolderUrl, "_blank");
 }
 
 function toggleOpt(editId, focusId) {
@@ -149,22 +195,22 @@ function toggleOpt(editId, focusId) {
 // Called whenever selectedProject changes.
 async function refreshSpPickerForProject() {
   const folders = document.getElementById("spFolders");
-  const crumbs = document.getElementById("spBreadcrumbs");
-  const summary = document.getElementById("spFolderCurrent");
+  const crumbs  = document.getElementById("spBreadcrumbs");
   if (!selectedProject) {
-    crumbs.textContent = "Pick a project to enable folder browsing.";
-    folders.innerHTML = "";
-    summary.textContent = "(pick a project)";
+    if (crumbs)  crumbs.textContent  = "Pick a project to enable folder browsing.";
+    if (folders) folders.innerHTML   = "";
+    updateDestCard();
     return;
   }
   if (!selectedProject.projectFolderUrl) {
-    crumbs.textContent = "This project has no SharePoint folder linked.";
-    folders.innerHTML = '<div class="sp-empty">Create one in the PMS first to enable saving here.</div>';
-    summary.textContent = "(no SharePoint folder)";
+    if (crumbs)  crumbs.textContent  = "This project has no SharePoint folder linked.";
+    if (folders) folders.innerHTML   = '<div class="sp-empty">Create one in the PMS first to enable saving here.</div>';
+    updateDestCard();
     return;
   }
   spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl) || "";
-  spCurrentPath = spProjectRootPath;
+  spCurrentPath     = spProjectRootPath;
+  updateDestCard();
   await renderSpPicker();
 }
 
@@ -180,9 +226,9 @@ async function renderSpPicker() {
     .concat(parts.map((p, i) => ` / <span data-depth="${i + 1}">${escapeHtml(p)}</span>`))
     .join("");
   crumbs.innerHTML = "Save to: " + crumbHtml;
-  // Mirror the current folder into the compact summary line above the picker.
-  document.getElementById("spFolderCurrent").textContent =
-    parts.length ? parts.join(" / ") : "project root";
+  // Mirror the current folder into the destination card display.
+  const destDisplay = document.getElementById("destFolderDisplay");
+  if (destDisplay) destDisplay.textContent = parts.length ? parts.join(" / ") : "project root";
   crumbs.querySelectorAll("span").forEach(s => {
     s.onclick = async () => {
       const depth = parseInt(s.getAttribute("data-depth"), 10);
@@ -265,10 +311,11 @@ async function getToken() {
 
 async function onSignedIn() {
   showView("mainView");
-  await Promise.all([loadProjects(), loadDocumentContext(), loadDocStatus()]);
+  await Promise.all([loadProjects(), loadDocumentContext(), loadDocStatus(), loadDoneEditing()]);
   renderProjectList();
   applyAutoSuggest();
   renderStatusBar();
+  renderDoneEditing();
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -366,12 +413,7 @@ async function loadDocumentContext() {
     ? docFilename.replace(/\.[^.]+$/, "")
     : deriveUnsavedTitle();
   const titleInput = document.getElementById("titleInput");
-  titleInput.value = defaultTitle;
-  document.getElementById("titleCurrent").textContent = defaultTitle;
-  // Keep the summary line in sync as the user edits the title.
-  titleInput.addEventListener("input", () => {
-    document.getElementById("titleCurrent").textContent = titleInput.value || "(empty — will use filename)";
-  });
+  if (titleInput) titleInput.value = defaultTitle;
 
   // First-page text via Word.run — used by the auto-suggest scorer.
   // Capped at the first ~2000 chars; project numbers/names typically appear
@@ -477,34 +519,27 @@ function renderProjectList(suggestedIds = []) {
       document.getElementById("pocSearch").value = "";
       setStatus("insertStatus", "info", "");
       document.getElementById("insertStatus").className = "status";
-      // Collapse any open option editors when project changes — their state
-      // (title input, folder picker) is project-specific and would be stale.
-      document.getElementById("titleEdit").classList.remove("active");
+      // Close the folder picker if it was open for the previous project
       document.getElementById("spFolderEdit").classList.remove("active");
     };
   });
 }
 
 function updateSaveButtons() {
-  const oneBtn     = document.getElementById("saveOneNoteBtn");
-  const draftBtn   = document.getElementById("saveSpDraftBtn");
-  const pdfBtn     = document.getElementById("savePdfBtn");
-  const projTag    = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
-  const spReady    = !!(selectedProject && selectedProject.projectFolderUrl);
-  const pdfAllowed = spReady && docStatus !== "draft";
+  const oneBtn   = document.getElementById("saveOneNoteBtn");
+  const draftBtn = document.getElementById("saveSpDraftBtn");
+  const pdfBtn   = document.getElementById("savePdfBtn");
+  const projTag  = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
+  const spReady  = !!(selectedProject && selectedProject.projectFolderUrl);
 
-  oneBtn.disabled   = !selectedProject || saveInFlight;
+  oneBtn.disabled    = !selectedProject || saveInFlight;
   oneBtn.textContent = "Save to OneNote" + projTag;
 
-  draftBtn.disabled   = !spReady || saveInFlight;
+  draftBtn.disabled    = !spReady || saveInFlight;
   draftBtn.textContent = "💾 Save Draft" + (spReady ? projTag : "");
 
-  pdfBtn.disabled   = !pdfAllowed || saveInFlight;
-  pdfBtn.textContent = pdfAllowed
-    ? `📄 Export PDF to SharePoint${projTag}`
-    : docStatus === "draft"
-      ? "📄 Export PDF  (mark Ready to enable)"
-      : "📄 Export PDF to SharePoint";
+  pdfBtn.disabled    = !spReady || saveInFlight;
+  pdfBtn.textContent = spReady ? `📄 Export PDF to SharePoint${projTag}` : "📄 Export PDF to SharePoint";
 
   const hasProject = !!selectedProject;
   document.getElementById("insertNameBtn").disabled      = !hasProject;
@@ -884,9 +919,88 @@ function renderStatusBar() {
   if (dot)  dot.style.background  = opt.dot;
   if (lbl)  lbl.textContent       = opt.label;
   if (hint) hint.textContent      = opt.hint;
+  // Status bar is non-interactive when Final (no going back manually)
+  const bar = document.getElementById("statusBar");
+  if (bar) bar.style.cursor = docStatus === "final" ? "default" : "pointer";
+}
+
+// ─── DONE-EDITING ─────────────────────────────────────────────────────────────
+async function loadDoneEditing() {
+  try {
+    const raw = Office.context.document.settings.get(DOC_DONE_KEY);
+    doneEditingList = (typeof raw === "string" ? JSON.parse(raw) : raw) || [];
+  } catch {
+    doneEditingList = [];
+  }
+}
+
+async function saveDoneEditingList() {
+  try {
+    Office.context.document.settings.set(DOC_DONE_KEY, JSON.stringify(doneEditingList));
+    await new Promise((resolve, reject) => {
+      Office.context.document.settings.saveAsync(r =>
+        r.status === Office.AsyncResultStatus.Succeeded ? resolve() : reject(new Error(r.error?.message))
+      );
+    });
+  } catch (e) {
+    console.warn("Could not persist done list:", e.message);
+  }
+}
+
+async function toggleCurrentUserDone() {
+  const email = (msalAccount?.username || "").toLowerCase();
+  const name  = msalAccount?.name || email;
+  const idx   = doneEditingList.findIndex(d => (d.email || "").toLowerCase() === email);
+  if (idx >= 0) {
+    doneEditingList.splice(idx, 1);
+  } else {
+    doneEditingList.push({ name, email, ts: Date.now() });
+  }
+  await saveDoneEditingList();
+  renderDoneEditing();
+}
+
+function renderDoneEditing() {
+  const section    = document.getElementById("doneEditingSection");
+  const listEl     = document.getElementById("doneEditingList");
+  const toggleBtn  = document.getElementById("toggleDoneBtn");
+  if (!section) return;
+
+  // Hidden when the document is Final — editing phase is over
+  section.style.display = docStatus === "final" ? "none" : "block";
+  if (docStatus === "final") return;
+
+  const email   = (msalAccount?.username || "").toLowerCase();
+  const iAmDone = doneEditingList.some(d => (d.email || "").toLowerCase() === email);
+  if (toggleBtn) {
+    toggleBtn.textContent = iAmDone ? "✓ I'm done" : "Mark me done";
+    toggleBtn.classList.toggle("is-done", iAmDone);
+  }
+  if (!listEl) return;
+  if (!doneEditingList.length) {
+    listEl.innerHTML = '<div class="done-empty">No one has marked done yet.</div>';
+    return;
+  }
+  listEl.innerHTML = doneEditingList.map(d =>
+    `<div class="done-item">
+      <span class="done-check">✓</span>
+      <span class="done-name">${escapeHtml(d.name || d.email)}</span>
+      <span class="done-time">${formatTimeAgo(d.ts)}</span>
+    </div>`
+  ).join("");
+}
+
+function formatTimeAgo(ts) {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1)  return "just now";
+  if (m < 60) return m + "m ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
 }
 
 function toggleStatusPicker() {
+  if (docStatus === "final") return; // Final is set automatically; no manual override
   const picker = document.getElementById("statusPicker");
   const opening = picker.style.display === "none";
   picker.style.display = opening ? "block" : "none";
@@ -967,15 +1081,11 @@ async function doSaveDraft() {
   }
 }
 
-// Exports a PDF and saves it to SharePoint. Only available when status is not Draft.
+// Exports a PDF and saves it to SharePoint. Auto-sets status to Final on success.
 async function doSavePdf() {
   if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
   if (!selectedProject.projectFolderUrl) {
     setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
-    return;
-  }
-  if (docStatus === "draft") {
-    setStatus("spStatus", "error", "Mark the document as Ready for Review or higher before exporting a PDF.");
     return;
   }
   if (saveInFlight) return;
@@ -992,7 +1102,12 @@ async function doSavePdf() {
     const pdfItem = await uploadFileToSharePoint(
       selectedProject, pdfBlob, uploadFilename, "application/pdf", spCurrentPath
     );
-    setStatus("spStatus", "success", "✓ PDF saved to SharePoint");
+    // Mark as Final and clear the done-editing list — PDF export = document is finalized.
+    doneEditingList = [];
+    await saveDoneEditingList();
+    await saveDocStatus("final");
+    renderDoneEditing();
+    setStatus("spStatus", "success", "✓ PDF saved to SharePoint — document marked Final");
     document.getElementById("spLink").innerHTML =
       `<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
   } catch (e) {

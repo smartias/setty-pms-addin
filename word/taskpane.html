@@ -292,6 +292,51 @@
     /* Section heading reused but tighter */
     .section-tight { margin-top: 14px; }
     .section-tight .save-section-title { margin-bottom: 6px; }
+    /* Quick project links — shown below the pill */
+    .quick-links-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 4px;
+      margin-bottom: 8px;
+    }
+    .btn-quick-link {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 500;
+      width: 100%;
+    }
+    .btn-quick-link:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .btn-quick-link:disabled { opacity: 0.35; cursor: not-allowed; }
+    /* Destination card — shows save target before clicking Save */
+    .dest-display {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 7px 10px;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: var(--muted);
+    }
+    .dest-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+    .dest-change-btn {
+      flex-shrink: 0; background: transparent; border: none;
+      color: var(--accent); font-size: 11px; font-weight: 600;
+      cursor: pointer; padding: 0; text-decoration: underline; font-family: inherit; width: auto;
+    }
+    .dest-change-btn:hover { color: #7cb9ff; }
+    /* Title field — visible labeled input, not hidden behind an opt-line */
+    .title-field { margin-bottom: 8px; }
+    .title-field label { margin-bottom: 3px; }
 
     /* ── Document status bar ───────────────────────────────────────────── */
     .status-bar {
@@ -335,6 +380,56 @@
     .status-picker-option:hover { background: #2d2d2d; }
     .status-picker-option.active { background: var(--navy-light); }
     .status-picker-option .opt-hint { font-size: 11px; color: var(--muted); margin-left: auto; text-align: right; max-width: 110px; line-height: 1.3; }
+    /* Done-editing section */
+    .done-section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+    .done-section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .done-section-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      flex: 1;
+    }
+    .done-toggle-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+      width: auto;
+    }
+    .done-toggle-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .done-toggle-btn.is-done { border-color: #166534; color: #4ade80; background: rgba(74,222,128,0.08); }
+    .done-toggle-btn.is-done:hover { background: rgba(74,222,128,0.15); }
+    .done-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .done-item .done-check { color: #4ade80; font-size: 11px; flex-shrink: 0; }
+    .done-item .done-name  { flex: 1; color: var(--text); }
+    .done-item .done-time  { font-size: 10px; color: var(--muted); }
+    .done-empty { font-size: 11px; color: var(--muted); font-style: italic; }
     /* PDF button — full width, below the main save row */
     #savePdfBtn {
       margin-top: 6px;
@@ -377,6 +472,15 @@
         <div id="statusPickerList"></div>
       </div>
 
+      <!-- Done-editing checklist — hidden when Final -->
+      <div id="doneEditingSection" class="done-section" style="display:none">
+        <div class="done-section-header">
+          <span class="done-section-label">Done editing</span>
+          <button id="toggleDoneBtn" class="done-toggle-btn">Mark me done</button>
+        </div>
+        <div id="doneEditingList"><div class="done-empty">No one has marked done yet.</div></div>
+      </div>
+
       <!-- Project: search + list (visible until selection), then collapses to a compact pill -->
       <div id="projectPickerWrap">
         <div id="projectSearchWrap" class="field">
@@ -389,6 +493,32 @@
           <span class="nm" id="pillProjectName"></span>
           <span class="change-link" id="pillChangeLink">change</span>
         </div>
+        <!-- Quick links — visible with the pill, hidden during search -->
+        <div id="projectQuickLinks" class="quick-links-row" style="display:none">
+          <button id="openPmsBtn" class="btn-quick-link" disabled>🔗 Open in PMS</button>
+          <button id="openSpFolderBtn" class="btn-quick-link" disabled>📂 SP Folder</button>
+        </div>
+      </div>
+
+      <!-- Destination card — shows save target; replaces buried opt-line folder row -->
+      <div id="destCard" style="display:none; margin-bottom:8px;">
+        <div class="dest-display">
+          <span>📂</span>
+          <span class="dest-path" id="destFolderDisplay">project root</span>
+          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
+        </div>
+        <div class="opt-edit" id="spFolderEdit">
+          <div class="sp-picker" style="margin-top:0">
+            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
+            <div class="sp-folders" id="spFolders"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- OneNote title — visible labeled field so it's set before clicking Save -->
+      <div id="titleFieldWrap" class="title-field" style="display:none">
+        <label for="titleInput">📓 OneNote page title</label>
+        <input type="text" id="titleInput" placeholder="Page title" />
       </div>
 
       <!-- Save row — two buttons side by side, prominent and at the top -->
@@ -397,28 +527,6 @@
         <button id="saveSpDraftBtn" disabled>💾 Save Draft</button>
       </div>
       <button id="savePdfBtn" disabled>📄 Export PDF to SharePoint</button>
-
-      <!-- Compact options under the save row: title for OneNote, folder for SP -->
-      <div class="opt-line">
-        <span>📓 Title:</span>
-        <span class="opt-current" id="titleCurrent">—</span>
-        <span class="opt-link" id="titleEditLink">edit</span>
-      </div>
-      <div class="opt-edit" id="titleEdit">
-        <input type="text" id="titleInput" placeholder="Page title" />
-      </div>
-
-      <div class="opt-line">
-        <span>📁 Folder:</span>
-        <span class="opt-current" id="spFolderCurrent">project root</span>
-        <span class="opt-link" id="spFolderEditLink">change</span>
-      </div>
-      <div class="opt-edit" id="spFolderEdit">
-        <div class="sp-picker" style="margin-top:0">
-          <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
-          <div class="sp-folders" id="spFolders"></div>
-        </div>
-      </div>
 
       <div id="oneNoteStatus" class="status"></div>
       <div id="oneNoteLink" class="footer-link"></div>
