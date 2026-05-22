@@ -64,6 +64,7 @@ const EMAIL_PROJECT_MAP_STORAGE_KEY = "settyPms:emailProjectMap";
 const EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY = "settyPms:conversationProjectMap";
 const TEAMS_SENT_MAP_STORAGE_KEY = "settyPms:teamsChannelSentMap";
 const EMAIL_THREAD_TAGS_TABLE = "pms_email_thread_tags";
+const EMAIL_WATCHLIST_TABLE = "pms_email_watchlist";
 const PROJECT_EMAILS_TABLE = "pms_project_emails";
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 Office.onReady(async (info) => {
@@ -80,6 +81,8 @@ Office.onReady(async (info) => {
       msalAccount = accounts.find(a => a.homeAccountId === lastAccountId) || accounts[0];
       msalApp.setActiveAccount(msalAccount);
       await onSignedIn();
+      // Surface the response watchlist once projects are loaded.
+      void renderResponseWatchlist();
     } else {
       showView("signInView");
     }
@@ -163,6 +166,8 @@ function applyComposeModeUiGuard() {
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
   document.getElementById("signOutBtn").onclick    = doSignOut;
+  const wlRefresh = document.getElementById("responseWatchlistRefresh");
+  if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   // 5-click easter egg on the SETTY PMS logo — reveals the cornerstone card.
@@ -522,6 +527,9 @@ function loadItemContext() {
     try { refreshLinkToTargetDropdown(); } catch {}
     try { refreshLoggedArtifactChips(); } catch {}
     maybeShowAecQuip();
+    // Score this client email; if it looks like it needs a reply, add it to
+    // the shared watchlist. Async + silent — never blocks item loading.
+    void maybeAddToWatchlist(myGen);
   }
 }
 function getCurrentMessageRestId() {
@@ -2611,6 +2619,283 @@ function renderProjectSuggestions() {
     };
   });
   block.style.display = "block";
+}
+
+// ─── RESPONSE-NEEDED CLASSIFIER ──────────────────────────────────────────────
+// Scores a CLIENT email by how likely it is to need a reply from us. Same
+// weighted-signal shape as suggestProjects(): accumulate points, collect the
+// reasons that fired, flag when the total clears RESPONSE_MIN_SCORE. We never
+// auto-act — this only decides "is this worth putting on the watchlist".
+//
+// TUNE: the phrase lists below are the part to adjust after real-world use.
+// Setty clients use a mix of blunt and polite phrasing, so MIN_SCORE is low
+// (3) — a single softer signal can still flag. Raise it if the panel gets
+// noisy; expand RESPONSE_POLITE_PHRASES if soft asks slip through.
+const RESPONSE_WEIGHTS = {
+  questionMarkInSubject:  4,
+  questionMarkInBody:     2,
+  interrogativeOpener:    3,
+  politeRequest:          2,
+  hasDueDate:             3,
+  urgencyWord:            2,
+  exclusionPhrase:       -5,   // explicit opt-out beats inferred signals
+};
+const RESPONSE_MIN_SCORE = 3;
+
+// Sentence-opening interrogatives — matched only at the start of a sentence so
+// a mid-sentence "how" ("…explained how we did it") doesn't count.
+const RESPONSE_INTERROGATIVES = [
+  "can you", "could you", "would you", "will you", "do you", "are you",
+  "is it", "have you", "when ", "what ", "where ", "how ", "why ",
+  "which ", "who ",
+];
+const RESPONSE_POLITE_PHRASES = [
+  "please confirm", "please advise", "please let me know", "please send",
+  "please provide", "let me know", "let us know", "get back to me",
+  "your thoughts", "any update", "awaiting your", "looking forward to your",
+  "circle back", "need your",
+];
+const RESPONSE_URGENCY_WORDS = [
+  "asap", "urgent", "time-sensitive", "time sensitive", "by eod",
+  "end of day", "no later than", "right away", "first thing",
+];
+const RESPONSE_EXCLUSIONS = [
+  "no response needed", "no reply needed", "no action required",
+  "no action needed", "for your records", "just an fyi", "no need to reply",
+];
+
+// Strip URLs so a "?utm=…" query string doesn't read as a question.
+function stripUrlsForScan(s) {
+  return (s || "").replace(/https?:\/\/\S+/gi, " ");
+}
+
+// subject, bodyText: raw strings from the email. emailReceivedDate: Date|string
+// used by extractDueDates to resolve year-less dates. Returns the same
+// { score, reasons } shape as suggestProjects(), plus a needsReply boolean and
+// any ISO dates found (so the watchlist row can store a due date).
+function needsResponse(subject, bodyText, emailReceivedDate) {
+  const subj = (subject || "").toLowerCase();
+  const body = stripUrlsForScan(trimToCurrentMessage(bodyText || "")).toLowerCase();
+  let score = 0;
+  const reasons = [];
+
+  if (subj.includes("?")) {
+    score += RESPONSE_WEIGHTS.questionMarkInSubject;
+    reasons.push("question in subject");
+  }
+  if (body.includes("?")) {
+    score += RESPONSE_WEIGHTS.questionMarkInBody;
+    reasons.push("question in body");
+  }
+  // Interrogative openers — split into sentences, check start-of-sentence only.
+  const sentences = body.split(/[.!?\n]+/).map(s => s.trim()).filter(Boolean);
+  if (sentences.some(s => RESPONSE_INTERROGATIVES.some(q => s.startsWith(q)))) {
+    score += RESPONSE_WEIGHTS.interrogativeOpener;
+    reasons.push("direct question");
+  }
+  if (RESPONSE_POLITE_PHRASES.some(p => body.includes(p) || subj.includes(p))) {
+    score += RESPONSE_WEIGHTS.politeRequest;
+    reasons.push("request phrase");
+  }
+  // Reuse the existing date detector — any due date is a deadline signal.
+  const dueDates = extractDueDates(bodyText || "", emailReceivedDate);
+  if (dueDates.length) {
+    score += RESPONSE_WEIGHTS.hasDueDate;
+    reasons.push("mentions a date");
+  }
+  if (RESPONSE_URGENCY_WORDS.some(w => body.includes(w) || subj.includes(w))) {
+    score += RESPONSE_WEIGHTS.urgencyWord;
+    reasons.push("urgency");
+  }
+  if (RESPONSE_EXCLUSIONS.some(x => body.includes(x) || subj.includes(x))) {
+    score += RESPONSE_WEIGHTS.exclusionPhrase;
+    reasons.push("explicit no-reply");
+  }
+
+  return {
+    score,
+    reasons,
+    needsReply: score >= RESPONSE_MIN_SCORE,
+    dueDates: dueDates.map(d => d.iso),
+  };
+}
+
+// ─── RESPONSE WATCHLIST — DATA LAYER ─────────────────────────────────────────
+// A client email that needsResponse() flags gets one row in the shared
+// pms_email_watchlist table, keyed on conversationId. Whether the row is still
+// "open" is NOT trusted from this table — it's re-verified against Graph at
+// render time (isThreadAwaitingReply). The table is just the watchlist.
+
+async function getWatchlistRow(conversationId) {
+  if (!conversationId) return null;
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&select=conversation_id,status&limit=1";
+  try {
+    const res = await fetch(url, { headers: SB_HEADERS });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0] || null;
+  } catch { return null; }
+}
+
+// Inserts a watchlist row only if the thread isn't already tracked. This is
+// what makes the classify-on-open hook safe to fire on every email view:
+// re-opening a thread the user already dismissed (or that's been answered)
+// must NOT resurrect it. Returns true only when a new row was created.
+async function addWatchlistEntryIfNew(entry) {
+  if (!entry?.conversation_id) return false;
+  if (await getWatchlistRow(entry.conversation_id)) return false;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE, {
+      method: "POST",
+      headers: { ...SB_HEADERS, "Prefer": "return=minimal" },
+      body: JSON.stringify(entry),
+    });
+    if (!res.ok) {
+      console.warn("Watchlist insert failed:", res.status, await res.text());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn("Watchlist insert failed:", e);
+    return false;
+  }
+}
+
+async function getWatchlistOpenItems() {
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
+    "?status=eq.watching&select=*&order=added_at.asc";
+  try {
+    const res = await fetch(url, { headers: SB_HEADERS });
+    if (!res.ok) return [];
+    return (await res.json()) || [];
+  } catch { return []; }
+}
+
+async function setWatchlistStatus(conversationId, status) {
+  if (!conversationId) return;
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId);
+  try {
+    await fetch(url, {
+      method: "PATCH",
+      headers: { ...SB_HEADERS, "Prefer": "return=minimal" },
+      body: JSON.stringify({ status, last_checked_at: new Date().toISOString() }),
+    });
+  } catch (e) { console.warn("Watchlist status update failed:", e); }
+}
+
+// The "answered?" check. Asks Graph for the single most recent message in the
+// thread: if its sender is outside Setty, we still owe a reply. A reply from
+// ANY @setty.com address — including a colleague's — counts as answered, so a
+// teammate handling it clears the item for everyone. Falls back to true (keep
+// watching) when Graph can't tell, so a flagged email is never silently lost.
+async function isThreadAwaitingReply(conversationId) {
+  if (!conversationId) return true;
+  const filter = "conversationId eq '" + conversationId.replace(/'/g, "''") + "'";
+  const path = "/me/messages?$filter=" + encodeURIComponent(filter) +
+    "&$orderby=" + encodeURIComponent("receivedDateTime desc") +
+    "&$top=1&$select=from,receivedDateTime";
+  try {
+    const data = await graphFetch("GET", path);
+    const latest = data?.value?.[0];
+    if (!latest) return true;
+    const sender = (latest.from?.emailAddress?.address || "").toLowerCase();
+    return !sender.endsWith("@setty.com");
+  } catch { return true; }
+}
+
+// Classify-on-open hook. Runs when a client email is viewed: scores it, and if
+// it looks like it needs a reply, adds it to the watchlist. Best-effort and
+// silent — any failure here must never block the rest of the taskpane.
+async function maybeAddToWatchlist(myGen) {
+  try {
+    if (currentItemKind !== "message" || !emailItem) return;
+    const from = (emailFromAddress || "").toLowerCase();
+    if (!from || from.endsWith("@setty.com")) return;   // client mail only
+
+    const token = await getToken();
+    const html  = await getEmailBodyHtml(token);
+    if (myGen !== itemContextGeneration) return;          // user moved on
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html || "";
+    const text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
+
+    const subject = (typeof emailItem.subject === "string") ? emailItem.subject : "";
+    const verdict = needsResponse(subject, text, emailItem.dateTimeCreated);
+    if (!verdict.needsReply) return;
+
+    const conversationId = await getCurrentConversationId();
+    if (!conversationId || myGen !== itemContextGeneration) return;
+
+    const client = getClientByEmail(emailFromAddress);
+    const added = await addWatchlistEntryIfNew({
+      conversation_id: conversationId,
+      subject: subject || "(No subject)",
+      client_email: emailFromAddress,
+      client_name: client?.name || emailFrom || "",
+      project_id: selectedProject?.id || null,
+      due_date: verdict.dueDates[0] || null,
+      score: verdict.score,
+      reasons: verdict.reasons,
+      added_by: msalAccount?.username || msalAccount?.name || "unknown",
+    });
+    if (added) void renderResponseWatchlist();
+  } catch (e) {
+    console.warn("[watchlist] add check failed:", e?.message || e);
+  }
+}
+
+// Renders the "needs a reply" panel: fetches open rows, verifies each thread
+// against Graph (flipping answered ones to 'answered'), shows the rest oldest
+// first. Called on add-in load and from the panel's ↻ button — deliberately
+// NOT on every email open, since each render costs one Graph call per item.
+let _watchlistRendering = false;
+async function renderResponseWatchlist() {
+  const block = document.getElementById("responseWatchlistBlock");
+  const list  = document.getElementById("responseWatchlistList");
+  const count = document.getElementById("responseWatchlistCount");
+  if (!block || !list || _watchlistRendering) return;
+  _watchlistRendering = true;
+  try {
+    const open = await getWatchlistOpenItems();
+    // Verify each thread in parallel — the open list is small in practice.
+    // TODO if it grows past ~15 items: switch to a single Graph $batch request.
+    const states = await Promise.all(open.map(r => isThreadAwaitingReply(r.conversation_id)));
+    const stillOpen = [];
+    open.forEach((row, i) => {
+      if (states[i]) stillOpen.push(row);
+      else void setWatchlistStatus(row.conversation_id, "answered");
+    });
+    if (!stillOpen.length) { block.style.display = "none"; list.innerHTML = ""; return; }
+    if (count) count.textContent = String(stillOpen.length);
+    list.innerHTML = stillOpen.map(r => {
+      const proj    = (allProjects || []).find(p => p.id === r.project_id);
+      const reasons = Array.isArray(r.reasons) ? r.reasons.join(" · ") : "";
+      const due     = r.due_date
+        ? `<span class="wl-due">due ${escHtml(new Date(r.due_date + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }))}</span>`
+        : "";
+      return `
+        <div class="wl-item">
+          <div class="wl-main">
+            <div class="wl-subject">${escHtml(r.subject || "(No subject)")}</div>
+            <div class="wl-meta">${escHtml(r.client_name || r.client_email || "")}${proj ? " · " + escHtml(proj.name) : ""} · flagged ${escHtml(_relativeTime(r.added_at))}</div>
+            <div class="wl-reasons">${escHtml(reasons)} ${due}</div>
+          </div>
+          <button type="button" class="wl-dismiss" data-cid="${escHtml(r.conversation_id)}" title="Not awaiting a reply — dismiss">×</button>
+        </div>`;
+    }).join("");
+    list.querySelectorAll(".wl-dismiss").forEach(el => {
+      el.onclick = async () => {
+        await setWatchlistStatus(el.dataset.cid, "dismissed");
+        void renderResponseWatchlist();
+      };
+    });
+    block.style.display = "block";
+  } finally {
+    _watchlistRendering = false;
+  }
 }
 
 // Cached per-item body fetch — avoids re-hitting Graph each time
