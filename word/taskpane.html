@@ -409,15 +409,34 @@
     .done-item .done-name  { flex: 1; color: var(--text); }
     .done-item .done-time  { font-size: 10px; color: var(--muted); }
     .done-empty { font-size: 11px; color: var(--muted); font-style: italic; }
-    /* PDF button — full width, below the main save row */
-    #savePdfBtn {
-      margin-top: 6px;
-      background: #14532d;
-      color: #4ade80;
-      border: 1px solid #166534;
+    /* PDF button — full width, below the main save row. Color comes from the
+       .brand-bluebeam class; only the layout spacing lives here. */
+    #savePdfBtn { margin-top: 6px; }
+
+    /* ─── Brand-colored save buttons ────────────────────────────────────
+       Each save button is tinted to its destination app, with a white
+       letter-tile icon echoing that app's icon (W / N / B). */
+    .brand-btn {
+      display: flex; align-items: center; justify-content: center;
+      gap: 8px;
     }
-    #savePdfBtn:hover:not(:disabled) { background: #166534; }
-    #savePdfBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .brand-ico {
+      flex-shrink: 0;
+      width: 18px; height: 18px;
+      border-radius: 4px;
+      background: #fff;
+      font-size: 11px; font-weight: 800; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .brand-word     { background: #2B579A; }   /* Microsoft Word blue      */
+    .brand-onenote  { background: #7719AA; }   /* Microsoft OneNote purple */
+    .brand-bluebeam { background: #0072CE; }   /* Bluebeam blue            */
+    .brand-word:hover:not(:disabled)     { background: #1f4178; }
+    .brand-onenote:hover:not(:disabled)  { background: #5f1488; }
+    .brand-bluebeam:hover:not(:disabled) { background: #005ba6; }
+    .brand-word     .brand-ico { color: #2B579A; }
+    .brand-onenote  .brand-ico { color: #7719AA; }
+    .brand-bluebeam .brand-ico { color: #0072CE; }
 
     /* ─── Celebrations ──────────────────────────────────────────────────
        Fun, lightweight feedback for the add-in's key moments. Every effect
@@ -628,12 +647,24 @@
         </div>
       </div>
 
-      <!-- Save row — two buttons side by side, prominent and at the top -->
+      <!-- Save row — two buttons side by side, prominent and at the top.
+           Each button is tinted to its destination app (Word / OneNote /
+           Bluebeam) with a matching white letter-tile icon. JS updates only
+           the .brand-label span, so the icon survives every relabel. -->
       <div class="save-row">
-        <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
-        <button id="saveSpDraftBtn" disabled>💾 Save Draft</button>
+        <button id="saveOneNoteBtn" class="brand-btn brand-onenote" disabled>
+          <span class="brand-ico">N</span>
+          <span class="brand-label" id="saveOneNoteLabel">Save to OneNote</span>
+        </button>
+        <button id="saveSpDraftBtn" class="brand-btn brand-word" disabled>
+          <span class="brand-ico">W</span>
+          <span class="brand-label" id="saveSpDraftLabel">Save Draft</span>
+        </button>
       </div>
-      <button id="savePdfBtn" disabled>📄 Export PDF to SharePoint</button>
+      <button id="savePdfBtn" class="brand-btn brand-bluebeam" disabled>
+        <span class="brand-ico">B</span>
+        <span class="brand-label" id="savePdfLabel">Export PDF to SharePoint</span>
+      </button>
 
       <div id="oneNoteStatus" class="status"></div>
       <div id="oneNoteLink" class="footer-link"></div>
