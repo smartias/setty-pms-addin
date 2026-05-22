@@ -2824,17 +2824,26 @@ async function setWatchlistStatus(conversationId, status) {
 // watching) when Graph can't tell, so a flagged email is never silently lost.
 async function isThreadAwaitingReply(conversationId) {
   if (!conversationId) return true;
+  // Fetch the conversation's messages and pick the newest CLIENT-SIDE. We must
+  // NOT add $orderby here: Graph rejects $filter + $orderby on /me/messages when
+  // they reference different properties (conversationId vs receivedDateTime),
+  // returning a 400 — which would land in the catch below and make every thread
+  // look permanently unanswered. Sorting in JS sidesteps the limitation.
   const filter = "conversationId eq '" + conversationId.replace(/'/g, "''") + "'";
   const path = "/me/messages?$filter=" + encodeURIComponent(filter) +
-    "&$orderby=" + encodeURIComponent("receivedDateTime desc") +
-    "&$top=1&$select=from,receivedDateTime";
+    "&$top=50&$select=from,receivedDateTime,sentDateTime";
   try {
     const data = await graphFetch("GET", path);
-    const latest = data?.value?.[0];
-    if (!latest) return true;
-    const sender = (latest.from?.emailAddress?.address || "").toLowerCase();
-    return !sender.endsWith("@setty.com");
-  } catch { return true; }
+    const msgs = data?.value || [];
+    if (!msgs.length) return true;
+    const when = m => new Date(m.receivedDateTime || m.sentDateTime || 0).getTime();
+    msgs.sort((a, b) => when(b) - when(a));
+    const latestSender = (msgs[0].from?.emailAddress?.address || "").toLowerCase();
+    return !latestSender.endsWith("@setty.com");   // latest msg from Setty = answered
+  } catch (e) {
+    console.warn("[watchlist] thread check failed:", e?.message || e);
+    return true;   // genuinely couldn't tell — keep watching rather than drop it
+  }
 }
 
 // Classify-on-open hook. Runs when a client email is viewed: scores it, and if
