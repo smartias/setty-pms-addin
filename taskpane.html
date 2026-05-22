@@ -3,1093 +3,627 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <!-- Cache-bust: critical for the add-in since Outlook task panes cache aggressively. -->
-  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
-  <meta http-equiv="Pragma" content="no-cache"/>
-  <meta http-equiv="Expires" content="0"/>
-  <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-05-11-rename-fix";</script>
+  <title>Setty PMS Filer</title>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-  <script src="msal-browser.min.js"></script>
-  <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
-  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
-  <!-- docx: generates DOCX cover sheets for RFI Responses and Submittal Reviews
-       (matches the library transmittal.html uses, same version). The blob is
-       uploaded directly to SharePoint /OUT — we don't need file-saver since
-       we're not offering a local download. -->
-  <script src="https://unpkg.com/docx@8.2.3/build/index.umd.js"></script>
-  <!-- canvas-confetti is loaded lazily on first celebration (see loadConfetti
-       in taskpane.js) so it doesn't slow down pane open. ~5KB on first
-       celebration, then browser-cached. -->
+  <script src="../msal-browser.min.js"></script>
   <style>
-    /* Fluent-light palette — designed to feel native inside Outlook.
-       Setty red (#C00000) is reserved as a logo accent only, not a UI color. */
     :root {
-      --bg:           #ffffff;
-      --surface:      #faf9f8;
-      --surface-2:    #f3f2f1;
-      --border:       #e1dfdd;
-      --border-strong:#c8c6c4;
-      --text:         #242424;
-      --text-soft:    #616161;
-      --text-faint:   #8a8886;
-      --primary:      #0f6cbd;
-      --primary-hov:  #115ea3;
-      --primary-soft: #eaf3fb;
-      --success:      #107c10;
-      --success-bg:   #dff6dd;
-      --warn:         #8a4f00;
-      --warn-bg:      #fff4ce;
-      --error:        #c50f1f;
-      --error-bg:     #fde7e9;
-      --setty-red:    #C00000;
+      --navy: #003865;
+      --navy-light: #0a4a7a;
+      --bg: #1a1a1a;
+      --panel: #232323;
+      --border: #3a3a3a;
+      --text: #f5f5f5;
+      --muted: #999;
+      --accent: #4a9eff;
+      --success: #4ade80;
+      --error: #f87171;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * { box-sizing: border-box; }
     body {
-      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+      margin: 0;
+      font-family: 'Segoe UI', sans-serif;
       background: var(--bg);
       color: var(--text);
-      font-size: 14px;
-      line-height: 1.4;
-      padding: 12px;
-      min-height: 100vh;
+      font-size: 13px;
     }
     .header {
+      background: var(--navy);
+      padding: 12px 16px;
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-bottom: 14px;
-      padding-bottom: 10px;
-      border-bottom: 2px solid var(--setty-red);
     }
     .header-logo {
-      font-size: 15px;
       font-weight: 700;
-      color: var(--setty-red);
       letter-spacing: 0.5px;
+      font-size: 14px;
     }
     .header-sub {
       font-size: 11px;
-      color: var(--text-faint);
+      color: rgba(255,255,255,0.7);
+      margin-left: auto;
     }
-    .email-preview {
-      background: var(--surface);
+    .container { padding: 16px; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .doc-info {
+      background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 4px;
-      padding: 8px 10px;
-      margin-bottom: 12px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      font-size: 12px;
     }
-    .email-subject {
-      font-weight: 600;
-      font-size: 13px;
-      color: var(--text);
-      margin-bottom: 2px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .email-meta {
-      font-size: 11px;
-      color: var(--text-faint);
-    }
+    .doc-info .label { color: var(--muted); font-size: 11px; }
+    .doc-info .filename { font-weight: 600; word-break: break-all; }
+    .doc-info .doc-location { color: var(--muted); font-size: 11px; margin-top: 3px; word-break: break-all; }
     label {
       display: block;
-      font-size: 12px;
-      color: var(--text-soft);
+      font-size: 11px;
+      color: var(--muted);
       margin-bottom: 4px;
-      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
     }
-    select, input[type="text"], input[type="date"], textarea {
+    input[type="text"], input[type="search"] {
       width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border-strong);
-      border-radius: 4px;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
       color: var(--text);
-      padding: 6px 8px;
-      font-size: 13px;
-      font-family: inherit;
-      margin-bottom: 10px;
-      outline: none;
-      transition: border-color 0.1s;
-    }
-    select:focus, input:focus, textarea:focus {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 1px var(--primary);
-    }
-    textarea { resize: vertical; min-height: 60px; }
-    .btn {
-      width: 100%;
-      padding: 7px 12px;
       border-radius: 4px;
-      border: 1px solid transparent;
       font-size: 13px;
-      font-weight: 600;
       font-family: inherit;
-      cursor: pointer;
-      margin-bottom: 6px;
-      transition: background 0.1s, border-color 0.1s;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      min-height: 32px;
     }
-    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    /* Primary — solid blue, the only "look at me" button */
-    .btn-primary {
-      background: var(--primary);
+    input:focus { outline: none; border-color: var(--accent); }
+    .field { margin-bottom: 14px; }
+    .project-list {
+      max-height: 260px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+    }
+    .project-row {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .project-row:last-child { border-bottom: none; }
+    .project-row:hover { background: #2d2d2d; }
+    .project-row.selected { background: var(--navy-light); }
+    .project-row.suggested { border-left: 3px solid var(--accent); }
+    .project-row .pn { color: var(--accent); font-weight: 600; font-size: 11px; }
+    .project-row .nm { font-size: 12px; }
+    .project-row .cl { color: var(--muted); font-size: 11px; }
+    button {
+      background: var(--navy);
       color: #fff;
-      border-color: var(--primary);
-    }
-    .btn-primary:hover:not(:disabled) { background: var(--primary-hov); border-color: var(--primary-hov); }
-    /* Secondary — subtle, used for everything else; reads as a "regular" button */
-    .btn-secondary {
-      background: var(--bg);
-      color: var(--text);
-      border-color: var(--border-strong);
-    }
-    .btn-secondary:hover:not(:disabled) { background: var(--surface-2); }
-    /* Ghost — barely visible, used for tertiary actions */
-    .btn-ghost {
-      background: transparent;
-      color: var(--text-soft);
-      border-color: transparent;
-    }
-    .btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
-    /* Legacy color classes mapped to subdued accents (used in subviews — note/RFI/etc.) */
-    .btn-blue    { background: var(--primary-soft); color: var(--primary-hov); border-color: #b7daf2; }
-    .btn-blue:hover:not(:disabled)    { background: #d6e9f7; }
-    .btn-green   { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
-    .btn-green:hover:not(:disabled)   { background: #c8eec8; }
-    .btn-purple  { background: #f3edff; color: #5b2cad; border-color: #d9c8f5; }
-    .btn-purple:hover:not(:disabled)  { background: #e7daff; }
-    .btn-teal    { background: #e0f5f0; color: #0e6d5c; border-color: #b8e2d6; }
-    .btn-teal:hover:not(:disabled)    { background: #cdebe1; }
-    .btn-orange  { background: var(--warn-bg); color: var(--warn); border-color: #f1d875; }
-    .btn-orange:hover:not(:disabled)  { background: #ffeaa3; }
-    /* Microsoft-branded action buttons. Solid fills (vs the soft pastel
-       variants above) so they read as primary "this opens a Microsoft app"
-       affordances — matches the visual weight of the Teams / OneNote logos. */
-    .btn-onenote { background: #7719AA; color: #fff; border-color: #7719AA; }
-    .btn-onenote:hover:not(:disabled) { background: #5e147f; }
-    .btn-teams   { background: #6264A7; color: #fff; border-color: #6264A7; }
-    .btn-teams:hover:not(:disabled)   { background: #4f519e; }
-    .btn-teams-sent { background: #107c41; color: #fff; border-color: #107c41; }
-    .btn-teams-sent:hover:not(:disabled) { background: #0d6435; }
-    .divider {
       border: none;
-      border-top: 1px solid var(--border);
-      margin: 10px 0;
-    }
-    /* Twin-save row — SharePoint and Project Record presented as peer actions.
-       Grid keeps both buttons full-width within their column on the narrow Outlook pane. */
-    .save-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
-      margin-bottom: 4px;
-    }
-    .save-row .btn { margin-bottom: 0; }
-    /* Quick text + templates grid — 2x2, compact, copies to clipboard */
-    .quick-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 4px;
-      margin-bottom: 6px;
-    }
-    .btn-quick {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      font-size: 11px;
-      padding: 6px 8px;
+      padding: 10px 14px;
       border-radius: 4px;
       cursor: pointer;
-      text-align: center;
-      line-height: 1.2;
-      min-height: 28px;
+      font-size: 13px;
+      font-weight: 600;
+      width: 100%;
       font-family: inherit;
     }
-    .btn-quick:hover:not(:disabled) { background: var(--surface-2); border-color: var(--primary); }
-    .btn-quick:disabled { opacity: 0.5; cursor: not-allowed; }
-    .quick-section-label {
-      font-size: 10px;
-      color: var(--text-soft);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin: 8px 0 4px;
-      font-weight: 600;
-    }
-    .save-row-caption {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
-      font-size: 10.5px;
-      color: var(--text-faint);
-      line-height: 1.25;
-      margin-bottom: 10px;
-      padding: 0 2px;
-    }
-    .save-row-caption span { text-align: center; }
-    /* Emphasis dimming — used by applyEmailFlowEmphasis to soften the off-flow button
-       without disabling it. User can still click; it just visually steps back. */
-    .btn.btn-deemph { opacity: 0.7; }
-    .btn.btn-deemph:hover:not(:disabled) { opacity: 1; }
-    /* Post-save confirmation card — replaces the save row once the email is filed.
-       Big circular checkmark + summary text. Subtle pop-in animation on appearance. */
-    #saveConfirmation {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      background: var(--success-bg);
-      border: 1px solid #b6e3b6;
-      border-radius: 6px;
-      padding: 12px 14px;
-      margin-bottom: 14px;
-    }
-    #saveConfirmation .sc-icon {
-      flex-shrink: 0;
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      background: #fff;
-      border: 2px solid var(--success);
-      color: var(--success);
-      font-size: 18px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      line-height: 1;
-    }
-    #saveConfirmation .sc-text { min-width: 0; }
-    #saveConfirmation .sc-primary {
-      font-weight: 600;
-      font-size: 13px;
-      color: var(--success);
-      line-height: 1.3;
-    }
-    #saveConfirmation .sc-secondary {
-      font-size: 11px;
-      color: var(--text-soft);
-      margin-top: 2px;
-      line-height: 1.4;
-    }
-    #saveConfirmation #scSharePointLink {
-      display: inline-flex;
-      align-items: center;
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--primary);
-      text-decoration: none;
-      margin-top: 6px;
-    }
-    #saveConfirmation #scSharePointLink:hover { color: var(--primary-hov); text-decoration: underline; }
-    #saveConfirmation.entering { animation: sc-pop-in 0.42s cubic-bezier(0.2, 1.2, 0.4, 1); }
-    @keyframes sc-pop-in {
-      from { opacity: 0; transform: scale(0.92); }
-      to   { opacity: 1; transform: scale(1); }
-    }
-    #saveConfirmation.entering .sc-icon { animation: sc-check-pop 0.55s cubic-bezier(0.2, 1.4, 0.4, 1); }
-    @keyframes sc-check-pop {
-      0%   { transform: scale(0); }
-      60%  { transform: scale(1.18); }
-      100% { transform: scale(1); }
-    }
-    /* Quick-access row — compact ghost buttons beneath the project badge for jumping
-       to the project page in PMS or its SharePoint folder. Lives at the top so it
-       reads as part of the project context, not a save action. */
-    .quick-links {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
-      margin: -4px 0 10px;
-    }
-    .quick-links .btn {
-      margin-bottom: 0;
-      min-height: 26px;
-      padding: 3px 6px;
-      font-size: 11.5px;
+    button:hover:not(:disabled) { background: var(--navy-light); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-secondary {
+      background: transparent;
       border: 1px solid var(--border);
+      color: var(--muted);
+      font-weight: 400;
+      font-size: 12px;
+      padding: 6px 10px;
+      width: auto;
     }
-    .quick-links .btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
-    /* Ambient AEC quip line — italic, faded, centered. Pure flavor. Fades in
-       so it feels like an observation, not a notification. */
-    #aecQuipLine {
-      font-size: 11px;
-      font-style: italic;
-      color: var(--text-faint);
-      text-align: center;
-      margin: -6px 0 10px;
-      padding: 0 6px;
-      animation: quip-fade-in 0.6s ease-out;
-    }
-    @keyframes quip-fade-in {
-      from { opacity: 0; transform: translateY(-2px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-    /* Hidden credits overlay — revealed by 5x click on SETTY PMS logo. */
-    #creditsOverlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.55);
-      z-index: 99998;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      animation: credits-overlay-in 0.25s ease-out;
-    }
-    #creditsOverlay.show { display: flex; }
-    .credits-card {
-      background: #fff;
-      border-top: 4px solid var(--setty-red);
-      border-radius: 10px;
-      padding: 22px 26px;
-      max-width: 280px;
-      text-align: center;
-      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
-      animation: credits-card-pop 0.45s cubic-bezier(0.2, 1.3, 0.4, 1);
-    }
-    .credits-title {
-      font-size: 18px;
-      font-weight: 800;
-      color: var(--setty-red);
-      letter-spacing: 1.5px;
-    }
-    .credits-tagline {
-      font-size: 13px;
-      color: var(--text);
-      font-style: italic;
-      margin-top: 8px;
-      line-height: 1.5;
-    }
-    .credits-meta {
-      font-size: 11px;
-      color: var(--text-soft);
+    .status {
       margin-top: 10px;
-      letter-spacing: 0.5px;
-    }
-    .credits-hint {
-      font-size: 10px;
-      color: var(--text-faint);
-      margin-top: 14px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-    @keyframes credits-overlay-in {
-      from { opacity: 0; }
-      to   { opacity: 1; }
-    }
-    @keyframes credits-card-pop {
-      from { opacity: 0; transform: scale(0.85) translateY(8px); }
-      to   { opacity: 1; transform: scale(1) translateY(0); }
-    }
-    .header-logo { cursor: pointer; user-select: none; }
-    /* Celebration toast — appears at the top of the pane on weekly milestone hits.
-       Gold gradient + slide-down + pop motion so the moment feels rewarding. */
-    #celebrationToast {
-      position: fixed;
-      top: 14px;
-      left: 50%;
-      transform: translateX(-50%) translateY(-16px) scale(0.92);
-      background: linear-gradient(135deg, #ffd86b 0%, #f5a623 100%);
-      color: #4a2800;
-      font-weight: 700;
-      font-size: 13px;
-      padding: 9px 18px;
-      border-radius: 999px;
-      box-shadow: 0 6px 18px rgba(245, 166, 35, 0.4), 0 2px 4px rgba(0, 0, 0, 0.15);
-      z-index: 9999;
-      opacity: 0;
-      transition: opacity 0.32s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.42s cubic-bezier(0.2, 1.4, 0.4, 1);
-      pointer-events: none;
-      white-space: nowrap;
-      max-width: calc(100% - 28px);
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    #celebrationToast.show {
-      opacity: 1;
-      transform: translateX(-50%) translateY(0) scale(1);
-    }
-    /* First-save variant — fires exactly once per user. Goes bigger: rainbow
-       gradient, larger text/padding, deeper shadow. The fireworks confetti
-       pattern in JS does most of the visual heavy lifting; this just makes
-       the toast feel like the headline rather than a footnote. */
-    #celebrationToast.first-save {
-      font-size: 14px;
-      font-weight: 800;
-      padding: 12px 22px;
-      letter-spacing: 0.2px;
-      background: linear-gradient(135deg, #ff6b9d 0%, #ffd86b 35%, #6bd4ff 70%, #b46bff 100%);
-      color: #1a1a1a;
-      box-shadow: 0 10px 32px rgba(255, 107, 157, 0.45), 0 4px 10px rgba(0, 0, 0, 0.2);
-    }
-    .status-msg {
       padding: 8px 10px;
       border-radius: 4px;
       font-size: 12px;
-      margin-bottom: 10px;
       display: none;
-      border: 1px solid transparent;
     }
-    .status-msg.show { display: block; }
-    .status-msg.success { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
-    .status-msg.error   { background: var(--error-bg);   color: var(--error);   border-color: #f1c0c4; }
-    .status-msg.info    { background: var(--primary-soft); color: var(--primary-hov); border-color: #b7daf2; }
-    .section-title {
-      font-size: 11px;
+    .status.info    { display: block; background: #1e3a5f; color: #93c5fd; }
+    .status.success { display: block; background: #14532d; color: var(--success); }
+    .status.error   { display: block; background: #3f1d1d; color: var(--error); }
+    .suggested-badge {
+      background: var(--accent);
+      color: #000;
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 2px;
+      margin-left: 6px;
       font-weight: 700;
-      color: var(--text-soft);
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      margin: 4px 0 8px;
+      vertical-align: middle;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView { display: none; }
-    #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
-    .back-btn {
-      background: none;
-      border: none;
-      color: var(--text-soft);
+    .footer-link {
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .footer-link a { color: var(--accent); }
+    .sp-picker {
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+      padding: 8px 10px;
+    }
+    .sp-breadcrumbs {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      word-break: break-all;
+    }
+    .sp-breadcrumbs span { color: var(--accent); cursor: pointer; }
+    .sp-breadcrumbs span:hover { text-decoration: underline; }
+    .sp-folders {
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .sp-folder-row {
+      padding: 5px 6px;
       cursor: pointer;
       font-size: 12px;
-      font-family: inherit;
-      margin-bottom: 10px;
-      padding: 2px 0;
+      border-radius: 3px;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
     }
-    .back-btn:hover { color: var(--primary); }
-    .spinner {
-      display: inline-block;
-      width: 14px; height: 14px;
-      border: 2px solid rgba(15,108,189,0.2);
-      border-top-color: var(--primary);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
+    .sp-folder-row:hover { background: #2d2d2d; }
+    .sp-folder-row.up { color: var(--muted); }
+    .sp-empty { color: var(--muted); font-size: 11px; padding: 4px 6px; }
+    .sp-loading { color: var(--muted); font-size: 11px; padding: 4px 6px; font-style: italic; }
+    .save-section {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 14px;
+      background: rgba(255,255,255,0.02);
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .mode-tab { flex: 1; font-size: 12px; padding: 6px 8px; }
-    .project-search-wrapper { position: relative; margin-bottom: 8px; }
-    .project-search-wrapper input { margin-bottom: 0; }
-    #projectDropdown {
-      position: absolute;
-      top: 100%;
-      left: 0; right: 0;
-      background: var(--bg);
-      border: 1px solid var(--primary);
-      border-top: none;
-      border-radius: 0 0 4px 4px;
+    .save-section-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .save-section-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .save-section-sub code {
+      background: var(--panel);
+      padding: 1px 5px;
+      border-radius: 2px;
+      font-size: 10px;
+    }
+    .insert-row {
+      display: flex;
+      gap: 6px;
+    }
+    .btn-insert {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 8px 10px;
+      flex: 1;
+    }
+    .btn-insert:hover:not(:disabled) {
+      background: #2d2d2d;
+      border-color: var(--accent);
+    }
+    .poc-list {
       max-height: 200px;
       overflow-y: auto;
-      z-index: 100;
-      display: none;
-      box-shadow: 0 4px 8px rgba(0,0,0,0.08);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--panel);
+      margin-top: 6px;
     }
-    .proj-option {
-      padding: 8px 10px;
-      cursor: pointer;
+    .poc-group-header {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 6px 10px 2px;
+      background: rgba(0,0,0,0.2);
       border-bottom: 1px solid var(--border);
     }
-    .proj-option:last-child { border-bottom: none; }
-    .proj-option:hover { background: var(--primary-soft); }
-    .proj-option .proj-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
-    .proj-option .proj-name { font-size: 13px; color: var(--text); font-weight: 500; }
+    .poc-row {
+      padding: 7px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .poc-row:last-child { border-bottom: none; }
+    .poc-row:hover { background: #2d2d2d; }
+    .poc-row .poc-name { font-weight: 600; }
+    .poc-row .poc-meta { color: var(--muted); font-size: 11px; }
+    .poc-empty { padding: 10px; color: var(--muted); font-size: 11px; text-align: center; }
+    /* Compact selected-project pill */
+    .project-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .project-pill .pn { color: var(--accent); font-weight: 700; }
+    .project-pill .nm { flex: 1; color: var(--text); }
+    .project-pill .change-link {
+      color: var(--accent);
+      cursor: pointer;
+      font-size: 11px;
+      text-decoration: underline;
+    }
+    /* Save row — two buttons side by side at the top */
+    .save-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .save-row button { flex: 1; padding: 9px 8px; font-size: 12px; }
+    /* Tight option line under each save button (title for OneNote, folder for SP) */
+    .opt-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      padding: 4px 2px;
+      flex-wrap: wrap;
+    }
+    .opt-line .opt-current { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .opt-line .opt-link { color: var(--accent); cursor: pointer; text-decoration: underline; flex-shrink: 0; }
+    .opt-edit { display: none; margin-top: 4px; }
+    .opt-edit.active { display: block; }
+    /* Section heading reused but tighter */
+    .section-tight { margin-top: 14px; }
+    .section-tight .save-section-title { margin-bottom: 6px; }
+    /* Quick project links — shown below the pill */
+    .quick-links-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 4px;
+      margin-bottom: 8px;
+    }
+    .btn-quick-link {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 11px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 500;
+      width: 100%;
+    }
+    .btn-quick-link:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    .btn-quick-link:disabled { opacity: 0.35; cursor: not-allowed; }
+    /* Destination card — shows save target before clicking Save */
+    .dest-display {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 7px 10px;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: var(--muted);
+    }
+    .dest-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+    .dest-change-btn {
+      flex-shrink: 0; background: transparent; border: none;
+      color: var(--accent); font-size: 11px; font-weight: 600;
+      cursor: pointer; padding: 0; text-decoration: underline; font-family: inherit; width: auto;
+    }
+    .dest-change-btn:hover { color: #7cb9ff; }
+    /* Title field — visible labeled input, not hidden behind an opt-line */
+    .title-field { margin-bottom: 8px; }
+    .title-field label { margin-bottom: 3px; }
 
-    /* Suggestion chips — shown when no project is tagged yet */
-    .suggestion-block {
-      background: var(--primary-soft);
-      border: 1px solid #b7daf2;
+    /* ── Document status bar ───────────────────────────────────────────── */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      user-select: none;
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-label-text { font-weight: 600; flex: 1; }
+    .status-hint { font-size: 11px; color: var(--muted); }
+    /* Done-editing section */
+    .done-section {
+      background: var(--panel);
+      border: 1px solid var(--border);
       border-radius: 4px;
       padding: 8px 10px;
       margin-bottom: 10px;
+      font-size: 12px;
     }
-    .suggestion-label {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--primary-hov);
+    .done-section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
       margin-bottom: 6px;
-      display: flex;
-      align-items: center;
-      gap: 4px;
     }
-    .suggestion-chip {
-      display: block;
-      width: 100%;
-      text-align: left;
-      background: var(--bg);
-      border: 1px solid var(--border-strong);
-      border-radius: 4px;
-      padding: 6px 8px;
-      margin-bottom: 4px;
-      cursor: pointer;
-      font-family: inherit;
-      transition: border-color 0.1s, background 0.1s;
+    .done-section-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      flex: 1;
     }
-    .suggestion-chip:hover { border-color: var(--primary); background: #fff; }
-    .suggestion-chip:last-child { margin-bottom: 0; }
-    .suggestion-chip .sc-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
-    .suggestion-chip .sc-name { font-size: 13px; color: var(--text); font-weight: 600; }
-    .suggestion-chip .sc-reason { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
-    /* Date variant — compact single-line chip emphasizing the milestone-create action.
-       No context snippet (it never read cleanly out of email HTML), so the chip stays small. */
-    .suggestion-chip.date-chip {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 6px 10px;
-      gap: 8px;
-    }
-    .suggestion-chip.date-chip .sc-date { font-size: 13px; color: var(--text); font-weight: 600; }
-    .suggestion-chip.date-chip .sc-cta { font-size: 11px; color: var(--primary); font-weight: 600; white-space: nowrap; }
-    .suggestion-chip.date-chip:hover .sc-cta { color: var(--primary-hov); }
-    /* Date-chip row — chip + small × dismiss button side by side. The dismiss
-       lets users prune false positives ("the meeting on Tuesday" wasn't a
-       deadline) without acting on them. Persists per-email in localStorage. */
-    .date-chip-row {
-      display: flex;
-      align-items: stretch;
-      gap: 4px;
-      margin-bottom: 4px;
-    }
-    .date-chip-row .suggestion-chip { flex: 1; margin-bottom: 0; }
-    .date-chip-row .chip-dismiss {
-      flex-shrink: 0;
-      width: 28px;
+    .done-toggle-btn {
       background: transparent;
       border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--text-faint);
-      font-size: 16px;
-      line-height: 1;
-      cursor: pointer;
-      padding: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: color 0.1s, border-color 0.1s, background 0.1s;
-    }
-    .date-chip-row .chip-dismiss:hover {
-      color: var(--error);
-      border-color: #f1c0c4;
-      background: var(--error-bg);
-    }
-
-    .pill {
-      display: inline-block;
-      font-size: 10px;
+      color: var(--muted);
+      font-size: 11px;
       font-weight: 600;
-      padding: 1px 6px;
-      border-radius: 10px;
-      margin-right: 4px;
-      border: 1px solid transparent;
-    }
-    .pill.added { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
-    .date-card {
-      padding: 10px 12px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      margin-bottom: 6px;
+      padding: 3px 8px;
+      border-radius: 3px;
       cursor: pointer;
-      transition: border-color 0.1s, background 0.1s;
+      font-family: inherit;
+      width: auto;
     }
-    .date-card:hover { border-color: var(--primary); background: #fff; }
-    .participant-row {
+    .done-toggle-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .done-toggle-btn.is-done { border-color: #166534; color: #4ade80; background: rgba(74,222,128,0.08); }
+    .done-toggle-btn.is-done:hover { background: rgba(74,222,128,0.15); }
+    .done-item {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 10px;
-      background: var(--bg);
-      border: 1px solid var(--border-strong);
-      border-radius: 4px;
-      margin-bottom: 4px;
-      cursor: pointer;
-      transition: border-color 0.1s, background 0.1s;
-    }
-    .participant-row:hover { border-color: var(--primary); background: var(--surface); }
-    .participant-row.added { background: var(--success-bg); border-color: #b6e3b6; }
-    .participant-row.added:hover { background: #c8eec8; }
-
-    /* Native <details> styling for the "More" expander */
-    details.more-expander { margin-top: 6px; }
-    details.more-expander > summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 6px 0;
+      gap: 6px;
+      padding: 3px 0;
       font-size: 12px;
-      font-weight: 600;
-      color: var(--text-soft);
-      user-select: none;
-      display: flex;
-      align-items: center;
-      gap: 4px;
+      color: var(--muted);
     }
-    details.more-expander > summary::-webkit-details-marker { display: none; }
-    details.more-expander > summary::before {
-      content: "▸";
-      font-size: 10px;
-      color: var(--text-faint);
-      transition: transform 0.15s;
-      display: inline-block;
+    .done-item .done-check { color: #4ade80; font-size: 11px; flex-shrink: 0; }
+    .done-item .done-name  { flex: 1; color: var(--text); }
+    .done-item .done-time  { font-size: 10px; color: var(--muted); }
+    .done-empty { font-size: 11px; color: var(--muted); font-style: italic; }
+    /* PDF button — full width, below the main save row */
+    #savePdfBtn {
+      margin-top: 6px;
+      background: #14532d;
+      color: #4ade80;
+      border: 1px solid #166534;
     }
-    details.more-expander[open] > summary::before { transform: rotate(90deg); }
-    details.more-expander > summary:hover { color: var(--primary); }
-    details.more-expander > .more-body { padding-top: 4px; }
+    #savePdfBtn:hover:not(:disabled) { background: #166534; }
+    #savePdfBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ─── Celebrations ──────────────────────────────────────────────────
+       Fun, lightweight feedback for the add-in's key moments. Every effect
+       is decorative: the #wordFx layer disables pointer-events and each
+       animation cleans itself up. All effects are skipped under
+       prefers-reduced-motion (see fxOn() in taskpane.js). */
+    #wordFx {
+      position: fixed; inset: 0; z-index: 9999;
+      pointer-events: none; overflow: hidden;
+    }
+
+    /* 1 — Paper airplane: flies off-pane on a successful OneNote save. */
+    .fx-plane {
+      position: absolute; width: 28px; height: 28px;
+      background: var(--accent);
+      clip-path: polygon(100% 50%, 0% 0%, 34% 50%, 0% 100%);
+      filter: drop-shadow(0 2px 3px rgba(0,0,0,.55));
+      animation: fxPlaneFly 1.15s cubic-bezier(.4,0,.7,.6) forwards;
+    }
+    @keyframes fxPlaneFly {
+      0%   { transform: translate(-50%,-50%) rotate(-10deg) scale(.5); opacity: 0; }
+      14%  { transform: translate(-50%,-50%) rotate(-10deg) scale(1);  opacity: 1; }
+      100% { transform: translate(110px,-380px) rotate(-34deg) scale(.7); opacity: 0; }
+    }
+
+    /* 2 — File drop: a page falls into a folder on a SharePoint save. */
+    .fx-drop {
+      position: absolute; transform: translate(-50%,-50%);
+      animation: fxDropFade 1.25s ease forwards;
+    }
+    @keyframes fxDropFade { 0%,72% { opacity: 1; } 100% { opacity: 0; } }
+    .fx-drop .fx-folder { font-size: 36px; display: block; line-height: 1; }
+    .fx-drop .fx-folder.fx-gulp { animation: fxGulp .34s ease .42s; }
+    .fx-drop .fx-page {
+      position: absolute; left: 50%; top: 0; font-size: 22px;
+      animation: fxFall .5s cubic-bezier(.5,0,.9,.55) forwards;
+    }
+    @keyframes fxGulp {
+      0%,100% { transform: scaleY(1) scaleX(1); }
+      45%     { transform: scaleY(.72) scaleX(1.14); }
+    }
+    @keyframes fxFall {
+      0%   { transform: translate(-50%,-44px) rotate(-12deg); opacity: 0; }
+      25%  { opacity: 1; }
+      100% { transform: translate(-50%,8px) rotate(8deg) scale(.35); opacity: 0; }
+    }
+
+    /* 3 — Auto-suggest: the project pill pops + glows when the tool guesses. */
+    .fx-pill-pop  { animation: fxPillPop .5s cubic-bezier(.34,1.56,.64,1); }
+    .fx-pill-glow { animation: fxPillGlow 1.5s ease; }
+    @keyframes fxPillPop {
+      0%   { transform: scale(.82); opacity: .2; }
+      55%  { transform: scale(1.05); opacity: 1; }
+      100% { transform: scale(1); }
+    }
+    @keyframes fxPillGlow {
+      0%,100% { box-shadow: 0 0 0 0 rgba(74,158,255,0); }
+      28%     { box-shadow: 0 0 0 3px rgba(74,158,255,.5); }
+    }
+    .fx-sparkle {
+      position: absolute; font-size: 14px;
+      animation: fxSparkle 1s ease forwards;
+    }
+    @keyframes fxSparkle {
+      0%   { transform: translate(0,0) scale(.3); opacity: 0; }
+      30%  { opacity: 1; }
+      100% { transform: translate(var(--dx,0), var(--dy,-26px)) scale(1); opacity: 0; }
+    }
+
+    /* 4 — Welcome: header-logo wiggle + a greeting toast on sign-in. */
+    .fx-logo-wiggle { display: inline-block; animation: fxLogoWiggle .65s ease; }
+    @keyframes fxLogoWiggle {
+      0%,100% { transform: rotate(0) scale(1); }
+      25%     { transform: rotate(-8deg) scale(1.08); }
+      60%     { transform: rotate(6deg)  scale(1.08); }
+    }
+    .fx-welcome {
+      position: fixed; left: 10px; right: 10px; bottom: 10px;
+      background: var(--navy-light); border: 1px solid var(--accent);
+      color: #fff; text-align: center; border-radius: 6px;
+      padding: 9px 12px; font-size: 12px; font-weight: 600;
+      z-index: 9998; box-shadow: 0 4px 14px rgba(0,0,0,.5);
+      animation: fxWelcome 3.4s cubic-bezier(.22,.61,.36,1) forwards;
+    }
+    @keyframes fxWelcome {
+      0%   { transform: translateY(150%); opacity: 0; }
+      10%  { transform: translateY(0);    opacity: 1; }
+      88%  { transform: translateY(0);    opacity: 1; }
+      100% { transform: translateY(150%); opacity: 0; }
+    }
   </style>
 </head>
 <body>
-<div id="celebrationToast" aria-live="polite"></div>
-<!-- Hidden credits overlay — revealed by clicking the SETTY PMS logo 5x.
-     Pure easter egg, no app function. Click anywhere to dismiss. -->
-<div id="creditsOverlay">
-  <div class="credits-card">
-    <div class="credits-title">SETTY PMS</div>
-    <div class="credits-tagline">Built with hard hats and clipboards.</div>
-    <div class="credits-meta">2026 · Setty &amp; Associates</div>
-    <div class="credits-hint">click anywhere to close</div>
-  </div>
-</div>
-
-<!-- Loading state — visible immediately, hidden once Office.onReady fires -->
-<div id="loadingView" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:12px;">
-  <div class="spinner" style="width:24px;height:24px;border-width:3px;"></div>
-  <div style="font-size:12px;color:#64748b;">Loading…</div>
-</div>
-
-<!-- Sign In View -->
-<div id="signInView">
   <div class="header">
-    <div>
-      <div class="header-logo">SETTY PMS</div>
-      <div class="header-sub">Project Management System</div>
+    <div class="header-logo">SETTY PMS</div>
+    <div class="header-sub">Word → OneNote</div>
+  </div>
+
+  <div class="container">
+
+    <div id="signInView" class="view">
+      <p style="color:var(--muted);font-size:12px;">Sign in with your Setty Microsoft account to send this document to a project.</p>
+      <button id="signInBtn">Sign in</button>
+      <div id="signInStatus" class="status"></div>
     </div>
-  </div>
-  <p style="color:var(--text);font-size:13px;margin-bottom:10px;font-weight:600;">
-    Connect this email to your projects in one click.
-  </p>
-  <ul style="color:var(--text-soft);font-size:12px;margin-bottom:16px;line-height:1.7;padding-left:18px;">
-    <li>File emails &amp; attachments to the right SharePoint folder</li>
-    <li>Log meetings as notes — synced to OneNote</li>
-    <li>Capture RFIs, submittals, action items, milestones</li>
-    <li>Auto-suggest the project from the subject line</li>
-  </ul>
-  <button class="btn btn-primary" id="signInBtn">Sign in with Microsoft</button>
-  <div id="signInStatus" class="status-msg" style="margin-top:10px;"></div>
-  <p style="color:var(--text-faint);font-size:11px;margin-top:14px;line-height:1.5;">
-    Tip: after signing in, click the 📌 pin in the top-right of this pane so it stays open as you move between emails.
-  </p>
-</div>
 
-<!-- Main View -->
-<div id="mainView">
-  <div class="header">
-    <div style="flex:1">
-      <div class="header-logo">SETTY PMS</div>
+    <div id="mainView" class="view">
+      <div class="doc-info">
+        <div class="label">DOCUMENT</div>
+        <div class="filename" id="docFilename">Loading…</div>
+        <div class="doc-location" id="docLocation" style="display:none"></div>
+      </div>
+
+      <!-- Document name — used for all save operations -->
+      <div id="titleFieldWrap" class="title-field">
+        <label for="titleInput">Document Name</label>
+        <input type="text" id="titleInput" placeholder="Document name" />
+      </div>
+
+      <!-- Destination — save location; updates as folder is browsed -->
+      <div id="destCard" style="display:none; margin-bottom:8px;">
+        <div class="dest-display">
+          <span>📂</span>
+          <span class="dest-path" id="destFolderDisplay">project root</span>
+          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
+        </div>
+        <div class="opt-edit" id="spFolderEdit">
+          <div class="sp-picker" style="margin-top:0">
+            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
+            <div class="sp-folders" id="spFolders"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Document status — set automatically when PDF is exported -->
+      <div class="status-bar" id="statusBar">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-label-text" id="statusLabelText">Draft</span>
+        <span class="status-hint" id="statusHint"></span>
+      </div>
+
+      <!-- Done-editing checklist — kept as a sign-off record after Final -->
+      <div id="doneEditingSection" class="done-section" style="display:none">
+        <div class="done-section-header">
+          <span class="done-section-label">Done editing</span>
+          <button id="toggleDoneBtn" class="done-toggle-btn">Mark me done</button>
+        </div>
+        <div id="doneEditingList"><div class="done-empty">No one has marked done yet.</div></div>
+      </div>
+
+      <!-- Project: search + list (visible until selection), then collapses to a compact pill -->
+      <div id="projectPickerWrap">
+        <div id="projectSearchWrap" class="field">
+          <label for="searchInput">Project</label>
+          <input type="search" id="searchInput" placeholder="Search by number, name, or client…" autocomplete="off" />
+          <div class="project-list" id="projectList"></div>
+        </div>
+        <div id="projectPill" class="project-pill" style="display:none">
+          <span class="pn" id="pillProjectNumber"></span>
+          <span class="nm" id="pillProjectName"></span>
+          <span class="change-link" id="pillChangeLink">change</span>
+        </div>
+        <!-- Quick links — visible with the pill, hidden during search -->
+        <div id="projectQuickLinks" class="quick-links-row" style="display:none">
+          <button id="openPmsBtn" class="btn-quick-link" disabled>🔗 Open in PMS</button>
+          <button id="openSpFolderBtn" class="btn-quick-link" disabled>📂 SP Folder</button>
+        </div>
+      </div>
+
+      <!-- Save row — two buttons side by side, prominent and at the top -->
+      <div class="save-row">
+        <button id="saveOneNoteBtn" disabled>Save to OneNote</button>
+        <button id="saveSpDraftBtn" disabled>💾 Save Draft</button>
+      </div>
+      <button id="savePdfBtn" disabled>📄 Export PDF to SharePoint</button>
+
+      <div id="oneNoteStatus" class="status"></div>
+      <div id="oneNoteLink" class="footer-link"></div>
+      <div id="spStatus" class="status"></div>
+      <div id="spLink" class="footer-link"></div>
+
+      <!-- Insert: smaller, lower in the pane since saves are the primary action -->
+      <div class="section-tight">
+        <div class="save-section-title">Insert at cursor</div>
+        <div class="insert-row">
+          <button id="insertNameBtn" class="btn-insert" disabled>Project Name</button>
+          <button id="insertNumberBtn" class="btn-insert" disabled>Project Number</button>
+        </div>
+        <div class="insert-row" style="margin-top:6px">
+          <button id="insertClientBtn" class="btn-insert" disabled>Client Name</button>
+          <button id="insertPocToggleBtn" class="btn-insert" disabled>POC Block…</button>
+        </div>
+        <div id="pocPicker" style="display:none;margin-top:8px">
+          <input type="search" id="pocSearch" placeholder="Search by name, company, email…" autocomplete="off" />
+          <div class="poc-list" id="pocList"></div>
+        </div>
+        <div id="insertStatus" class="status"></div>
+      </div>
+
+      <div style="margin-top:14px;text-align:center">
+        <button id="signOutBtn" class="btn-secondary">Sign out</button>
+      </div>
     </div>
-    <button class="btn-ghost btn" style="width:auto;padding:4px 10px;font-size:11px;min-height:0;" id="signOutBtn">Sign out</button>
+
   </div>
 
-  <div class="email-preview">
-    <div class="email-subject" id="emailSubject">Loading…</div>
-    <div class="email-meta" id="emailMeta"></div>
-  </div>
-  <!-- Rare ambient observation. ~8% of email opens. Pure flavor, no info. -->
-  <div id="aecQuipLine" style="display:none;"></div>
-
-  <!-- Project suggestion chips — shown when no project tag exists for this thread -->
-  <div id="suggestionBlock" class="suggestion-block" style="display:none;">
-    <div class="suggestion-label">💡 <span id="suggestionLabelText">Possible projects</span></div>
-    <div id="suggestionChips"></div>
-  </div>
-
-  <div class="project-search-wrapper">
-    <label>Project</label>
-    <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
-    <div id="projectDropdown"></div>
-  </div>
-  <div id="selectedProjectBadge" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;font-size:13px;color:var(--success);font-weight:600;align-items:center;justify-content:space-between;gap:6px;">
-    <span id="selectedProjectBadgeText"></span>
-    <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:var(--text-soft);font-size:16px;line-height:1;cursor:pointer;padding:0 2px;" title="Clear tagged project for this email">×</button>
-  </div>
-  <div id="projectPipelineHint" style="display:none;margin:-4px 0 10px;padding:6px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;"></div>
-
-  <!-- SharePoint folder hint — shows when a project is selected but doesn't
-       have a folder yet. Lets the user open the project in PMS to set it up
-       before trying to file an email with attachments. -->
-  <div id="projectSpFolderHint" style="display:none;margin:-4px 0 10px;padding:8px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;line-height:1.5;">
-    📂 SharePoint folder not set up for this project yet. <a href="#" id="spFolderHintLink" style="color:var(--primary);font-weight:700;text-decoration:none;white-space:nowrap;">Open in PMS to create one →</a>
-  </div>
-
-  <!-- Quick access — surfaces the two most-used project-context jumps right next to
-       the project name, so they read as part of the project card, not buried in "More". -->
-  <div id="projectQuickLinks" class="quick-links" style="display:none;">
-    <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open in PMS</button>
-    <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 SharePoint Folder</button>
-  </div>
-
-  <div id="actionStatus" class="status-msg"></div>
-
-  <!-- Date suggestion chips — shown when the email body contains date candidates and a project is selected.
-       Mirrors the project-suggestion pattern: surfaced automatically, never modal. -->
-  <div id="dateSuggestionBlock" class="suggestion-block" style="display:none;">
-    <div class="suggestion-label">📅 <span id="dateSuggestionLabelText">Possible date</span></div>
-    <div id="dateSuggestionChips"></div>
-  </div>
-
-  <!-- OneNote link banner — shown when current item has a linked note page -->
-  <div id="oneNoteLinkBanner" style="display:none;margin-bottom:10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;padding:8px 10px;">
-    <div style="font-size:11px;font-weight:700;color:var(--success);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px;">📓 Meeting Notes Logged</div>
-    <a id="oneNoteLinkAnchor" href="#" target="_blank" style="font-size:13px;font-weight:600;color:var(--primary);text-decoration:none;">Open in OneNote →</a>
-  </div>
-
-  <!-- "Already logged as RFI / Submittal" chip row. Populated by
-       refreshLoggedArtifactChips() based on RFI/Submittal records whose
-       sourceItemId matches the current email. Empty by default. -->
-  <div id="loggedAsArtifactChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;"></div>
-
-  <!-- Optional link target: when the selected project has open RFIs or
-       Submittals, this dropdown lets the user link the current email to one.
-       Picking a target + hitting Save SP/Save to Project files the email
-       normally AND copies it into the linked RFI/Sub's /IN folder, plus
-       updates the RFI/Sub's links[] to reference the email record.
-       Populated by refreshLinkToTargetDropdown(). Hidden when no open
-       RFIs/Subs exist on the selected project. -->
-  <div id="linkToRow" style="display:none;margin-bottom:8px;">
-    <label style="font-size:11px;color:#64748b;font-weight:600;display:block;margin-bottom:3px;">
-      📎 Also link this email to:
-      <span style="font-weight:400;font-size:10px;">(files a copy into the RFI/Sub's /IN folder)</span>
-    </label>
-    <select id="linkToTarget" style="width:100%;">
-      <option value="">— Standalone (no linking) —</option>
-    </select>
-  </div>
-
-  <!-- Primary action zone — the 80/20 actions, always visible.
-       Twin-save row: SharePoint (email + attachments) and Project Record (email body copy). -->
-  <div class="save-row">
-    <button class="btn btn-primary" id="saveSpBtn">📁 Save to SharePoint</button>
-    <button class="btn btn-primary" id="saveRecordBtn">🗂️ Save to Project</button>
-  </div>
-  <div class="save-row-caption">
-    <span id="saveSpCaption">Email + attachments → SharePoint + record</span>
-    <span id="saveRecordCaption">Email body → project record only</span>
-  </div>
-  <!-- Post-save confirmation — replaces the save buttons once the email is filed.
-       Big check + summary line so the "done" state actually feels done.
-       Optional SharePoint link surfaces only when the email was filed there. -->
-  <div id="saveConfirmation" style="display:none;">
-    <div class="sc-icon">✓</div>
-    <div class="sc-text">
-      <div class="sc-primary"></div>
-      <div class="sc-secondary"></div>
-      <a id="scSharePointLink" href="#" style="display:none;">📂 Open SharePoint folder →</a>
-    </div>
-  </div>
-  <button class="btn btn-onenote" id="logNoteBtn">📓 Log as Note</button>
-  <button class="btn btn-teams" id="sendToTeamsBtn">💬 Send to Teams Channel</button>
-  <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
-
-  <!-- More — collapsed by default; persists open state in localStorage -->
-  <details class="more-expander" id="moreActions">
-    <summary>More actions</summary>
-    <div class="more-body">
-      <button class="btn btn-secondary" id="logRfiBtn">🔵 Log as RFI</button>
-      <button class="btn btn-secondary" id="logSubBtn">📋 Log as Submittal</button>
-      <hr class="divider"/>
-      <button class="btn btn-secondary" id="manualMilestoneBtn">📅 New Milestone</button>
-      <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
-      <hr class="divider"/>
-      <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
-    </div>
-  </details>
-
-  <!-- Quick text + templates — copy text to clipboard for pasting into a reply.
-       Wrapped in #quickTemplatesSection so the JS guard can show/hide it as a
-       single unit. Only visible in Compose mode (Reply / Forward / New) since
-       that's the only context where the templates are useful. -->
-  <div id="quickTemplatesSection">
-    <div class="quick-section-label">✉ Quick text</div>
-    <div class="quick-grid">
-      <button class="btn-quick" data-tpl="ack">Received</button>
-      <button class="btn-quick" data-tpl="attached">Attached</button>
-      <button class="btn-quick" data-tpl="checking-schedule">Checking schedule</button>
-      <button class="btn-quick" data-tpl="fee-schedule">Fee Schedule</button>
-    </div>
-    <div class="quick-section-label">✉ Templates</div>
-    <div class="quick-grid">
-      <button class="btn-quick" data-tpl="schedule-update">✉ Schedule Update</button>
-      <button class="btn-quick" data-tpl="intro">✉ Project Introduction</button>
-      <button class="btn-quick" data-tpl="onhold">✉ Project On Hold</button>
-      <button class="btn-quick" data-tpl="sitesurvey">✉ Site Survey Request</button>
-    </div>
-    <div id="quickTextStatus" class="status" style="display:none"></div>
-  </div>
-</div>
-
-<!-- Note View -->
-<div id="noteView">
-  <button class="back-btn" id="noteBack">← Back</button>
-  <div class="section-title">Log as Note</div>
-  <label>Category</label>
-  <select id="noteCategory">
-    <option value="Client Meeting">Client Meeting</option>
-    <option value="Internal Meeting">Internal Meeting</option>
-    <option value="Site Visit">Site Visit</option>
-    <option value="Client Communication">Client Communication</option>
-    <option value="Decision">Decision</option>
-    <option value="Issue">Issue</option>
-    <option value="Internal">Internal</option>
-    <option value="General">General</option>
-  </select>
-  <label>Note Body</label>
-  <textarea id="noteBody" rows="4" placeholder="Summary, decisions, action items…"></textarea>
-  <div id="noteStatus" class="status-msg"></div>
-  <div id="noteOneNoteLink" style="margin-top:6px"></div>
-  <button class="btn btn-blue" id="saveNoteBtn">💾 Save Note</button>
-</div>
-
-<!-- Action Item View -->
-<div id="actionItemView">
-  <button class="back-btn" id="actionItemBack">← Back</button>
-  <div class="section-title">New Action Item</div>
-  <label>Action Item</label>
-  <textarea id="actionItemBody" rows="4" placeholder="What needs to be done?"></textarea>
-  <label>Owner</label>
-  <select id="actionItemOwner">
-    <option value="">— Select team member —</option>
-  </select>
-  <label>Due Date</label>
-  <input type="date" id="actionItemDueDate"/>
-  <div id="actionItemStatus" class="status-msg"></div>
-  <button class="btn btn-blue" id="saveActionItemBtn">💾 Save Action Item</button>
-</div>
-
-<!-- RFI View -->
-<div id="rfiView">
-  <button class="back-btn" id="rfiBack">← Back</button>
-  <div style="display:flex;gap:6px;margin-bottom:12px;">
-    <button class="btn btn-blue mode-tab" id="rfiModeNew">➕ New RFI</button>
-    <button class="btn btn-ghost mode-tab" id="rfiModeExisting">📂 File to Existing</button>
-  </div>
-
-  <div id="rfiNewForm">
-    <div class="section-title">New RFI</div>
-    <label>RFI Number <span style="color:#64748b;font-weight:400;font-size:10px;">(auto-suggested — overwrite if assigned by contractor)</span></label>
-    <input type="text" id="rfiNumber" placeholder="e.g. RFI-001 or external number"/>
-    <label>Title</label>
-    <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
-    <label>Discipline</label>
-    <select id="rfiDiscipline">
-      <option value="">— Select —</option>
-      <option>Mechanical</option>
-      <option>Electrical</option>
-      <option>Plumbing</option>
-      <option>Fire Protection</option>
-      <option>General</option>
-      <option>Architectural</option>
-      <option>Structural</option>
-    </select>
-    <label>From (GC / Prime)</label>
-    <input type="text" id="rfiFrom" placeholder="Contractor name"/>
-    <label>Received Via</label>
-    <select id="rfiReceivedVia">
-      <option value="Email">Email</option>
-      <option value="Procore">Procore</option>
-      <option value="ACC">ACC</option>
-      <option value="Other">Other</option>
-    </select>
-    <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiAssignHint"></span></label>
-    <select id="rfiAssignedTo">
-      <option value="">— Unassigned —</option>
-    </select>
-    <label>Full Question / Description</label>
-    <textarea id="rfiDescription" rows="4" placeholder="Full RFI question text — what's being asked, what's the issue, what response is needed…"></textarea>
-    <label>Internal Notes <span style="color:#64748b;font-weight:400;font-size:10px;">(optional)</span></label>
-    <textarea id="rfiNotes" rows="2" placeholder="Internal notes — context for your team, not the contractor"></textarea>
-    <div id="rfiStatus" class="status-msg"></div>
-    <button class="btn btn-blue" id="saveRfiBtn">💾 Log New RFI</button>
-  </div>
-
-  <div id="rfiExistingForm" style="display:none;">
-    <div class="section-title">File Email to Existing RFI</div>
-    <p style="font-size:11px;color:#64748b;margin-bottom:10px;line-height:1.5;">
-      Select an RFI to file this email and any attachments into its SharePoint folder.
-    </p>
-    <label>RFI</label>
-    <select id="rfiExistingSelect" style="margin-bottom:10px;"></select>
-    <div id="rfiExistingStatus" class="status-msg"></div>
-    <button class="btn btn-blue" id="fileRfiBtn">📁 File Email to RFI</button>
-  </div>
-</div>
-
-<!-- Submittal View -->
-<div id="subView">
-  <button class="back-btn" id="subBack">← Back</button>
-  <div style="display:flex;gap:6px;margin-bottom:12px;">
-    <button class="btn btn-purple mode-tab" id="subModeNew">➕ New Submittal</button>
-    <button class="btn btn-ghost mode-tab" id="subModeExisting">📂 File to Existing</button>
-  </div>
-
-  <div id="subNewForm">
-    <div class="section-title">New Submittal</div>
-    <label>Submittal Number <span style="color:#64748b;font-weight:400;font-size:10px;">(auto-suggested — overwrite if assigned by contractor)</span></label>
-    <input type="text" id="subNumber" placeholder="e.g. SUB-001 or external number"/>
-    <label>Spec Section</label>
-    <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
-    <label>Description</label>
-    <input type="text" id="subDesc" placeholder="Submittal description"/>
-    <label>Discipline</label>
-    <select id="subDiscipline">
-      <option value="">— Select —</option>
-      <option>Mechanical</option>
-      <option>Electrical</option>
-      <option>Plumbing</option>
-      <option>Fire Protection</option>
-      <option>General</option>
-      <option>Architectural</option>
-      <option>Structural</option>
-    </select>
-    <label>From (GC / Prime)</label>
-    <input type="text" id="subFrom" placeholder="Contractor name"/>
-    <label>Received Via</label>
-    <select id="subReceivedVia">
-      <option value="Email">Email</option>
-      <option value="Procore">Procore</option>
-      <option value="ACC">ACC</option>
-      <option value="Other">Other</option>
-    </select>
-    <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="subAssignHint"></span></label>
-    <select id="subAssignedTo">
-      <option value="">— Unassigned —</option>
-    </select>
-    <label>Full Description / Scope</label>
-    <textarea id="subFullDescription" rows="4" placeholder="What's being submitted, what needs to be reviewed, special requirements…"></textarea>
-    <label>Internal Notes <span style="color:#64748b;font-weight:400;font-size:10px;">(optional)</span></label>
-    <textarea id="subNotes" rows="2" placeholder="Internal notes — context for your team"></textarea>
-    <div id="subStatus" class="status-msg"></div>
-    <button class="btn btn-purple" id="saveSubBtn">💾 Log New Submittal</button>
-  </div>
-
-  <div id="subExistingForm" style="display:none;">
-    <div class="section-title">File Email to Existing Submittal</div>
-    <p style="font-size:11px;color:#64748b;margin-bottom:10px;line-height:1.5;">
-      Select a submittal to file this email and any attachments into its SharePoint folder.
-    </p>
-    <label>Submittal</label>
-    <select id="subExistingSelect" style="margin-bottom:10px;"></select>
-    <div id="subExistingStatus" class="status-msg"></div>
-    <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
-  </div>
-</div>
-
-<!-- RFI Response View — opened from the "Log Response" button when an RFI is
-     still Open. Generates a DOCX cover sheet, uploads it to the RFI's /OUT
-     folder, opens a prefilled draft email back to the RFI sender, and flips
-     status to Responded. -->
-<div id="rfiResponseView" style="display:none;">
-  <button class="back-btn" id="rfiResponseBack">← Back</button>
-  <div class="section-title">Log RFI Response</div>
-  <div id="rfiResponseHeader" style="font-size:13px;color:#1e293b;background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
-  <label>Response / Resolution</label>
-  <textarea id="rfiResponseText" rows="6" placeholder="The formal response that will go to the contractor…"></textarea>
-  <label>Date Responded</label>
-  <input type="date" id="rfiResponseDate"/>
-  <label>New Status</label>
-  <select id="rfiResponseStatus">
-    <option value="Responded">Responded</option>
-    <option value="Closed">Closed</option>
-    <option value="Pending Sub Response">Pending Sub Response</option>
-  </select>
-  <div id="rfiResponseStatusMsg" class="status-msg"></div>
-  <button class="btn btn-blue" id="submitRfiResponseBtn">📤 Log Response · Generate DOCX · Draft Email</button>
-</div>
-
-<!-- Submittal Review View — same pattern as RFI Response, but with stamp
-     (Approved / Approved as Noted / Revise and Resubmit / Rejected) and
-     review comments instead of a free-form response. -->
-<div id="subReviewView" style="display:none;">
-  <button class="back-btn" id="subReviewBack">← Back</button>
-  <div class="section-title">Log Submittal Review</div>
-  <div id="subReviewHeader" style="font-size:13px;color:#1e293b;background:#ede9fe;border:1px solid #c4b5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
-  <label>Stamp</label>
-  <select id="subReviewStamp">
-    <option value="Approved">Approved</option>
-    <option value="Approved as Noted">Approved as Noted</option>
-    <option value="Revise and Resubmit">Revise and Resubmit</option>
-    <option value="Rejected">Rejected</option>
-  </select>
-  <label>Review Comments</label>
-  <textarea id="subReviewComments" rows="6" placeholder="Comments returning with the submittal…"></textarea>
-  <label>Date Returned</label>
-  <input type="date" id="subReviewDate"/>
-  <label>New Status</label>
-  <select id="subReviewStatus">
-    <option value="Returned">Returned</option>
-    <option value="Closed">Closed</option>
-  </select>
-  <div id="subReviewStatusMsg" class="status-msg"></div>
-  <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log Review · Generate DOCX · Draft Email</button>
-</div>
-
-<!-- Dates View -->
-<div id="datesView">
-  <button class="back-btn" id="datesBack">← Back</button>
-  <div class="section-title">New Milestone</div>
-  <div id="datesList"></div>
-
-  <!-- Milestone form — revealed when a date card is clicked -->
-  <div id="milestoneForm" style="display:none;margin-top:16px;padding:14px;background:#151b2e;border:1px solid #2d3452;border-radius:8px;">
-    <div class="section-title" style="margin-bottom:10px;">New Non-Billable Milestone</div>
-    <label>Name</label>
-    <input type="text" id="milestoneName" placeholder="e.g. Submit comments to GC"/>
-    <label>Due Date</label>
-    <input type="date" id="milestoneDate"/>
-    <div id="milestoneStatus" class="status-msg"></div>
-    <button class="btn btn-blue" id="saveMilestoneBtn">💾 Save Milestone to Project</button>
-  </div>
-</div>
-
-<!-- People View -->
-<div id="peopleView">
-  <button class="back-btn" id="peopleBack">← Back</button>
-  <div class="section-title">Participants</div>
-  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
-    Select a participant to add them to Clients or a Project POC. Duplicate contacts are skipped automatically.
-  </p>
-  <div id="participantList"></div>
-</div>
-
-<!-- Contact View -->
-<div id="contactView">
-  <button class="back-btn" id="contactBack">← Back</button>
-  <div class="section-title">Extracted Contact</div>
-  <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
-    Parsed from email signature when available. Review and edit before saving.
-  </p>
-  <label>Name</label>
-  <input type="text" id="contactName"/>
-  <label>Title</label>
-  <input type="text" id="contactTitle"/>
-  <label>Company</label>
-  <input type="text" id="contactCompany" list="companyList" placeholder="Select existing or type new…"/>
-  <datalist id="companyList"></datalist>
-  <label>Email</label>
-  <input type="text" id="contactEmail"/>
-  <label>Phone</label>
-  <input type="text" id="contactPhone"/>
-  <label>Save to</label>
-  <select id="contactSaveTo">
-    <option value="client">Client / Company Directory</option>
-    <option value="poc">Project POC (selected project)</option>
-  </select>
-  <div id="contactStatus" class="status-msg"></div>
-  <button class="btn btn-teal" id="saveContactBtn">💾 Save Contact</button>
-</div>
-
-<script src="taskpane.js"></script>
+  <script src="taskpane.js"></script>
 </body>
 </html>
