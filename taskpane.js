@@ -2680,37 +2680,50 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
   const body = stripUrlsForScan(trimToCurrentMessage(bodyText || "")).toLowerCase();
   let score = 0;
   const reasons = [];
+  // A "content signal" is real evidence of an ASK — a question, a request, a
+  // deadline. The recipient signals (addressed to you / named in greeting) are
+  // NOT content: a thank-you note is still addressed to you. needsReply
+  // requires at least one content signal, so recipient signals can only
+  // amplify a genuine ask — never originate a flag on their own.
+  let contentSignal = false;
 
   if (subj.includes("?")) {
     score += RESPONSE_WEIGHTS.questionMarkInSubject;
     reasons.push("question in subject");
+    contentSignal = true;
   }
   if (body.includes("?")) {
     score += RESPONSE_WEIGHTS.questionMarkInBody;
     reasons.push("question in body");
+    contentSignal = true;
   }
   // Interrogative openers — split into sentences, check start-of-sentence only.
   const sentences = body.split(/[.!?\n]+/).map(s => s.trim()).filter(Boolean);
   if (sentences.some(s => RESPONSE_INTERROGATIVES.some(q => s.startsWith(q)))) {
     score += RESPONSE_WEIGHTS.interrogativeOpener;
     reasons.push("direct question");
+    contentSignal = true;
   }
   if (RESPONSE_POLITE_PHRASES.some(p => body.includes(p) || subj.includes(p))) {
     score += RESPONSE_WEIGHTS.politeRequest;
     reasons.push("request phrase");
+    contentSignal = true;
   }
   // Reuse the existing date detector — any due date is a deadline signal.
   const dueDates = extractDueDates(bodyText || "", emailReceivedDate);
   if (dueDates.length) {
     score += RESPONSE_WEIGHTS.hasDueDate;
     reasons.push("mentions a date");
+    contentSignal = true;
   }
   if (RESPONSE_URGENCY_WORDS.some(w => body.includes(w) || subj.includes(w))) {
     score += RESPONSE_WEIGHTS.urgencyWord;
     reasons.push("urgency");
+    contentSignal = true;
   }
   // Recipient signals — computed by the caller (needs the recipient list and
   // the signed-in user's name, which a pure subject+body function can't see).
+  // These are boosters only: they add weight but never set contentSignal.
   if (opts.addressedToMe) {
     score += RESPONSE_WEIGHTS.addressedToMe;
     reasons.push("addressed to you");
@@ -2727,7 +2740,9 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
   return {
     score,
     reasons,
-    needsReply: score >= RESPONSE_MIN_SCORE,
+    // Both gates: a genuine ask must be present AND the weighted score must
+    // clear the bar. A thank-you note addressed to you fails the first gate.
+    needsReply: contentSignal && score >= RESPONSE_MIN_SCORE,
     dueDates: dueDates.map(d => d.iso),
   };
 }
