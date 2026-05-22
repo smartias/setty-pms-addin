@@ -2943,9 +2943,18 @@ async function renderResponseWatchlist() {
         </div>`;
     }).join("");
     list.querySelectorAll(".wl-dismiss").forEach(el => {
-      el.onclick = async () => {
-        await setWatchlistStatus(el.dataset.cid, "dismissed");
-        void renderResponseWatchlist();
+      el.onclick = () => {
+        // Optimistic UI: drop the chip immediately so the click feels instant.
+        // The Supabase write runs in the background — a dismiss is low-stakes,
+        // so we don't block on it or roll back on failure (a failed write just
+        // means the chip reappears on the next reload, and the user re-clicks).
+        const cid  = el.dataset.cid;
+        const item = el.closest(".wl-item");
+        if (item) item.remove();
+        const remaining = list.querySelectorAll(".wl-item").length;
+        if (count) count.textContent = String(remaining);
+        if (!remaining) block.style.display = "none";
+        void setWatchlistStatus(cid, "dismissed");
       };
     });
     block.style.display = "block";
