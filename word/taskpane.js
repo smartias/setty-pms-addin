@@ -664,17 +664,21 @@ function updateSaveButtons() {
   const projTag  = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
   const spReady  = !!(selectedProject && selectedProject.projectFolderUrl);
 
-  oneBtn.disabled    = !selectedProject || saveInFlight;
-  oneBtn.textContent = "Save to OneNote" + projTag;
+  // Relabel via the .brand-label span only — writing textContent on the button
+  // itself would wipe the icon tile inside it.
+  oneBtn.disabled = !selectedProject || saveInFlight;
+  document.getElementById("saveOneNoteLabel").textContent = "Save to OneNote" + projTag;
 
-  draftBtn.disabled     = !spReady || saveInFlight;
+  draftBtn.disabled = !spReady || saveInFlight;
   // Re-saving is allowed: a filed draft can be updated in place, so the button
   // stays put and just relabels to make the repeat action obvious.
-  draftBtn.textContent  = (draftSaved ? "💾 Update Draft" : "💾 Save Draft") + (spReady ? projTag : "");
+  document.getElementById("saveSpDraftLabel").textContent =
+    (draftSaved ? "Update Draft" : "Save Draft") + (spReady ? projTag : "");
   draftBtn.style.display = "";
 
-  pdfBtn.disabled    = !spReady || saveInFlight;
-  pdfBtn.textContent = spReady ? `📄 Export PDF to SharePoint${projTag}` : "📄 Export PDF to SharePoint";
+  pdfBtn.disabled = !spReady || saveInFlight;
+  document.getElementById("savePdfLabel").textContent =
+    "Export PDF to SharePoint" + (spReady ? projTag : "");
 
   const hasProject = !!selectedProject;
   document.getElementById("insertNameBtn").disabled      = !hasProject;
