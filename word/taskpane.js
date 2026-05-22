@@ -41,6 +41,9 @@ let docStatus = "draft"; // persisted in Office document settings
 let doneEditingList = []; // [{ name, email, ts }] — persisted in document settings
 let draftSaved = false;     // true once a .docx draft has been uploaded to SharePoint
 let draftFolderPath = "";   // drive-relative SP folder the draft was filed to
+let draftBaseName = "";     // intended filename at last save (from Document Name field)
+let draftFileName = "";     // actual filename SharePoint stored the draft under
+let draftWebUrl = "";       // SharePoint webUrl of the filed .docx (for "open the copy")
 // SharePoint folder picker state. spCurrentPath is drive-relative (e.g.
 // "24-105 Acme HVAC/Documents"). Defaults to the project folder root when
 // the SharePoint checkbox is first ticked.
@@ -163,8 +166,8 @@ function updateQuickLinks() {
 function updateDestCard() {
   const card = document.getElementById("destCard");
   if (!card) return;
-  // Once a draft is filed the destination is locked — hide the chip.
-  if (draftSaved) { card.style.display = "none"; return; }
+  // The destination picker stays available even after a draft is filed — it
+  // shows where the *next* save (Update Draft / PDF) will go.
   const hasFolder = !!(selectedProject?.projectFolderUrl);
   card.style.display = hasFolder ? "block" : "none";
   if (hasFolder) {
@@ -173,6 +176,40 @@ function updateDestCard() {
       ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
       : "";
     if (display) display.textContent = rel || "project root";
+  }
+  updateFiledCard();
+}
+
+// Confirmation card shown once a .docx draft has been filed to SharePoint.
+// Crucially it surfaces the "Open the SharePoint copy" action — the only way
+// to get true AutoSave, since this open document is a detached local copy.
+function updateFiledCard() {
+  const card = document.getElementById("draftFiledCard");
+  if (!card) return;
+  if (!draftSaved) { card.style.display = "none"; return; }
+  card.style.display = "block";
+  const nameEl = document.getElementById("filedName");
+  if (nameEl) {
+    const folder = draftFolderPath && spProjectRootPath && draftFolderPath.startsWith(spProjectRootPath)
+      ? draftFolderPath.slice(spProjectRootPath.length).replace(/^\/+/, "") || "project root"
+      : (draftFolderPath || "project root");
+    nameEl.textContent = (draftFileName || "(filed)") + "  ·  " + folder;
+  }
+  // The "open the copy" button only works if we know the SharePoint URL — a
+  // copy reopened from SharePoint itself may not carry one.
+  const openBtn = document.getElementById("openSpCopyBtn");
+  if (openBtn) {
+    if (draftWebUrl) {
+      openBtn.style.display = "block";
+      // Desktop Word opens the SharePoint copy via the ms-word: protocol so it
+      // lands in the desktop app; Word on the web just opens the file URL (the
+      // browser editor AutoSaves to SharePoint too).
+      const isWeb = Office.context.platform === Office.PlatformType.OfficeOnline;
+      openBtn.href   = isWeb ? draftWebUrl : ("ms-word:ofe|u|" + draftWebUrl);
+      openBtn.target = isWeb ? "_blank" : "_self";
+    } else {
+      openBtn.style.display = "none";
+    }
   }
 }
 
@@ -396,6 +433,9 @@ function persistDocSettings() {
     Office.context.document.settings.set("settyPms:docStatus", docStatus);
     Office.context.document.settings.set("settyPms:draftSaved", draftSaved);
     Office.context.document.settings.set("settyPms:draftFolderPath", draftFolderPath);
+    Office.context.document.settings.set("settyPms:draftBaseName", draftBaseName);
+    Office.context.document.settings.set("settyPms:draftFileName", draftFileName);
+    Office.context.document.settings.set("settyPms:draftWebUrl", draftWebUrl);
   } catch (e) {
     console.warn("Could not stage document settings:", e.message);
   }
@@ -431,11 +471,14 @@ function loadSelectedProject() {
 // Restore whether a .docx draft has already been filed to SharePoint.
 function loadDraftSaved() {
   try {
-    draftSaved = Office.context.document.settings.get("settyPms:draftSaved") === true;
+    draftSaved      = Office.context.document.settings.get("settyPms:draftSaved") === true;
     draftFolderPath = Office.context.document.settings.get("settyPms:draftFolderPath") || "";
+    draftBaseName   = Office.context.document.settings.get("settyPms:draftBaseName") || "";
+    draftFileName   = Office.context.document.settings.get("settyPms:draftFileName") || "";
+    draftWebUrl     = Office.context.document.settings.get("settyPms:draftWebUrl") || "";
   } catch (e) {
     draftSaved = false;
-    draftFolderPath = "";
+    draftFolderPath = draftBaseName = draftFileName = draftWebUrl = "";
   }
 }
 
@@ -625,9 +668,10 @@ function updateSaveButtons() {
   oneBtn.textContent = "Save to OneNote" + projTag;
 
   draftBtn.disabled     = !spReady || saveInFlight;
-  draftBtn.textContent  = "💾 Save Draft" + (spReady ? projTag : "");
-  // Save Draft is one-shot — it disappears once a draft has been filed.
-  draftBtn.style.display = draftSaved ? "none" : "";
+  // Re-saving is allowed: a filed draft can be updated in place, so the button
+  // stays put and just relabels to make the repeat action obvious.
+  draftBtn.textContent  = (draftSaved ? "💾 Update Draft" : "💾 Save Draft") + (spReady ? projTag : "");
+  draftBtn.style.display = "";
 
   pdfBtn.disabled    = !spReady || saveInFlight;
   pdfBtn.textContent = spReady ? `📄 Export PDF to SharePoint${projTag}` : "📄 Export PDF to SharePoint";
@@ -694,7 +738,7 @@ function spDrivePath(spFolderUrl) {
   if (!spFolderUrl || !spFolderUrl.startsWith(base)) return null;
   return decodeURIComponent(spFolderUrl.slice(base.length));
 }
-async function uploadFileToSharePoint(project, blob, filename, contentType, targetPathOverride) {
+async function uploadFileToSharePoint(project, blob, filename, contentType, targetPathOverride, conflictBehavior) {
   if (!project.projectFolderUrl) {
     throw new Error("Project has no SharePoint folder linked. Create one in the PMS first.");
   }
@@ -702,12 +746,13 @@ async function uploadFileToSharePoint(project, blob, filename, contentType, targ
   if (!targetPath) throw new Error("Project SharePoint folder URL is not in the expected library.");
   const token = await getToken();
   const safeName = filename.replace(/[\\/:*?"<>|]/g, "_");
-  // conflictBehavior=rename appends " (1)" / " (2)" so re-saves don't overwrite
-  // prior versions. SharePoint version history would track replaces too, but
-  // rename is more discoverable for non-power-users browsing the folder.
+  // conflictBehavior defaults to "rename" (appends " (1)" / " (2)" so a fresh
+  // upload never clobbers an unrelated file). The draft re-save passes
+  // "replace" to update a previously-filed draft in place — SharePoint version
+  // history still keeps every prior version.
   const url = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID
     + "/root:/" + encodeDrivePath(targetPath + "/" + safeName)
-    + ":/content?@microsoft.graph.conflictBehavior=rename";
+    + ":/content?@microsoft.graph.conflictBehavior=" + (conflictBehavior || "rename");
   const res = await fetch(url, {
     method: "PUT",
     headers: { "Authorization": "Bearer " + token, "Content-Type": contentType },
@@ -721,11 +766,11 @@ async function uploadFileToSharePoint(project, blob, filename, contentType, targ
   return { name: item.name, webUrl: item.webUrl };
 }
 
-function uploadDocxToSharePoint(project, blob, filename, targetPathOverride) {
+function uploadDocxToSharePoint(project, blob, filename, targetPathOverride, conflictBehavior) {
   return uploadFileToSharePoint(
     project, blob, filename,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    targetPathOverride
+    targetPathOverride, conflictBehavior
   );
 }
 
@@ -1136,26 +1181,44 @@ async function doSaveDraft() {
     || docFilename.replace(/\.[^.]+$/, "")
     || "Document";
   const uploadFilename = baseName.replace(/\.docx$/i, "") + ".docx";
+
+  // "Overwrite unless renamed": if this document already has a filed draft and
+  // neither the name nor the destination folder has changed, replace that file
+  // in place. Otherwise upload a fresh, rename-on-conflict copy.
+  const sameDraft = draftSaved
+    && uploadFilename === draftBaseName
+    && spCurrentPath  === draftFolderPath;
+
   try {
     setStatus("spStatus", "info", "⏳ Exporting .docx…");
-    // Mark the document draft-saved and bake the tags in before reading it out,
-    // so the uploaded copy carries everything when someone reopens it.
-    draftSaved = true;
-    draftFolderPath = spCurrentPath;
+    // Stage the project/status tags into the document before reading it out, so
+    // the uploaded copy carries them when someone reopens it.
     persistDocSettings();
     await flushSettings();
     const docxBlob = await getDocumentAsDocxBlob();
-    setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
-    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath);
-    setStatus("spStatus", "success", "✓ Draft saved to SharePoint");
+    setStatus("spStatus", "info", sameDraft ? "⏳ Updating the SharePoint copy…" : "⏳ Uploading to SharePoint…");
+    // A replace targets the file actually on SharePoint (draftFileName), which
+    // can differ from the intended name if the first save hit a name clash.
+    const item = sameDraft
+      ? await uploadDocxToSharePoint(selectedProject, docxBlob, draftFileName, draftFolderPath, "replace")
+      : await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath, "rename");
+
+    // Commit the filed-draft state — only now that the upload has succeeded.
+    draftSaved      = true;
+    draftBaseName   = uploadFilename;
+    draftFileName   = item.name;
+    draftFolderPath = spCurrentPath;
+    draftWebUrl     = item.webUrl || "";
+    persistDocSettings();
+    await flushSettings();
+
+    setStatus("spStatus", "success", sameDraft ? "✓ SharePoint copy updated" : "✓ Draft filed to SharePoint");
     fxFileDrop(document.getElementById("saveSpDraftBtn"), "💾");
     document.getElementById("spLink").innerHTML =
       `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>`;
   } catch (e) {
-    // Upload failed — the draft isn't really saved, so don't lock the UI.
-    draftSaved = false;
-    persistDocSettings();
-    await flushSettings();
+    // Upload failed — leave draftSaved untouched: a previously filed draft (if
+    // any) still exists, and a first-time save simply stays un-filed.
     setStatus("spStatus", "error", e.message);
   } finally {
     saveInFlight = false;

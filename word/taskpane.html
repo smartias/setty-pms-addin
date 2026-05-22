@@ -508,6 +508,31 @@
       88%  { transform: translateY(0);    opacity: 1; }
       100% { transform: translateY(150%); opacity: 0; }
     }
+
+    /* ─── Draft-filed confirmation card ─────────────────────────────────── */
+    .filed-card {
+      border: 1px solid #166534;
+      background: rgba(74,222,128,0.07);
+      border-radius: 4px;
+      padding: 10px 12px;
+    }
+    .filed-head { font-size: 12px; font-weight: 700; color: var(--success); }
+    .filed-name {
+      font-size: 11px; color: var(--text);
+      word-break: break-all; margin: 3px 0 9px;
+    }
+    .filed-open-btn {
+      display: block; text-align: center;
+      background: var(--navy); color: #fff;
+      padding: 9px 10px; border-radius: 4px;
+      font-size: 12px; font-weight: 600;
+      text-decoration: none; cursor: pointer;
+    }
+    .filed-open-btn:hover { background: var(--navy-light); }
+    .filed-hint {
+      font-size: 11px; color: var(--muted);
+      margin-top: 8px; line-height: 1.5;
+    }
   </style>
 </head>
 <body>
@@ -548,6 +573,22 @@
           <div class="sp-picker" style="margin-top:0">
             <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
             <div class="sp-folders" id="spFolders"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Draft-filed confirmation — appears once a .docx draft is filed to
+           SharePoint. "Open the SharePoint copy" is the real fix for AutoSave:
+           the document open here is a detached local copy that never syncs on
+           its own; the SharePoint-hosted copy AutoSaves natively. -->
+      <div id="draftFiledCard" style="display:none; margin-bottom:8px;">
+        <div class="filed-card">
+          <div class="filed-head">✓ Draft filed to SharePoint</div>
+          <div class="filed-name" id="filedName"></div>
+          <a id="openSpCopyBtn" class="filed-open-btn" style="display:none">✏️ Open the SharePoint copy in Word</a>
+          <div class="filed-hint">
+            This open document is a local copy — edits here won't sync. Open the
+            SharePoint copy to keep working with AutoSave.
           </div>
         </div>
       </div>
