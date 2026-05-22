@@ -418,6 +418,96 @@
     }
     #savePdfBtn:hover:not(:disabled) { background: #166534; }
     #savePdfBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ─── Celebrations ──────────────────────────────────────────────────
+       Fun, lightweight feedback for the add-in's key moments. Every effect
+       is decorative: the #wordFx layer disables pointer-events and each
+       animation cleans itself up. All effects are skipped under
+       prefers-reduced-motion (see fxOn() in taskpane.js). */
+    #wordFx {
+      position: fixed; inset: 0; z-index: 9999;
+      pointer-events: none; overflow: hidden;
+    }
+
+    /* 1 — Paper airplane: flies off-pane on a successful OneNote save. */
+    .fx-plane {
+      position: absolute; width: 28px; height: 28px;
+      background: var(--accent);
+      clip-path: polygon(100% 50%, 0% 0%, 34% 50%, 0% 100%);
+      filter: drop-shadow(0 2px 3px rgba(0,0,0,.55));
+      animation: fxPlaneFly 1.15s cubic-bezier(.4,0,.7,.6) forwards;
+    }
+    @keyframes fxPlaneFly {
+      0%   { transform: translate(-50%,-50%) rotate(-10deg) scale(.5); opacity: 0; }
+      14%  { transform: translate(-50%,-50%) rotate(-10deg) scale(1);  opacity: 1; }
+      100% { transform: translate(110px,-380px) rotate(-34deg) scale(.7); opacity: 0; }
+    }
+
+    /* 2 — File drop: a page falls into a folder on a SharePoint save. */
+    .fx-drop {
+      position: absolute; transform: translate(-50%,-50%);
+      animation: fxDropFade 1.25s ease forwards;
+    }
+    @keyframes fxDropFade { 0%,72% { opacity: 1; } 100% { opacity: 0; } }
+    .fx-drop .fx-folder { font-size: 36px; display: block; line-height: 1; }
+    .fx-drop .fx-folder.fx-gulp { animation: fxGulp .34s ease .42s; }
+    .fx-drop .fx-page {
+      position: absolute; left: 50%; top: 0; font-size: 22px;
+      animation: fxFall .5s cubic-bezier(.5,0,.9,.55) forwards;
+    }
+    @keyframes fxGulp {
+      0%,100% { transform: scaleY(1) scaleX(1); }
+      45%     { transform: scaleY(.72) scaleX(1.14); }
+    }
+    @keyframes fxFall {
+      0%   { transform: translate(-50%,-44px) rotate(-12deg); opacity: 0; }
+      25%  { opacity: 1; }
+      100% { transform: translate(-50%,8px) rotate(8deg) scale(.35); opacity: 0; }
+    }
+
+    /* 3 — Auto-suggest: the project pill pops + glows when the tool guesses. */
+    .fx-pill-pop  { animation: fxPillPop .5s cubic-bezier(.34,1.56,.64,1); }
+    .fx-pill-glow { animation: fxPillGlow 1.5s ease; }
+    @keyframes fxPillPop {
+      0%   { transform: scale(.82); opacity: .2; }
+      55%  { transform: scale(1.05); opacity: 1; }
+      100% { transform: scale(1); }
+    }
+    @keyframes fxPillGlow {
+      0%,100% { box-shadow: 0 0 0 0 rgba(74,158,255,0); }
+      28%     { box-shadow: 0 0 0 3px rgba(74,158,255,.5); }
+    }
+    .fx-sparkle {
+      position: absolute; font-size: 14px;
+      animation: fxSparkle 1s ease forwards;
+    }
+    @keyframes fxSparkle {
+      0%   { transform: translate(0,0) scale(.3); opacity: 0; }
+      30%  { opacity: 1; }
+      100% { transform: translate(var(--dx,0), var(--dy,-26px)) scale(1); opacity: 0; }
+    }
+
+    /* 4 — Welcome: header-logo wiggle + a greeting toast on sign-in. */
+    .fx-logo-wiggle { display: inline-block; animation: fxLogoWiggle .65s ease; }
+    @keyframes fxLogoWiggle {
+      0%,100% { transform: rotate(0) scale(1); }
+      25%     { transform: rotate(-8deg) scale(1.08); }
+      60%     { transform: rotate(6deg)  scale(1.08); }
+    }
+    .fx-welcome {
+      position: fixed; left: 10px; right: 10px; bottom: 10px;
+      background: var(--navy-light); border: 1px solid var(--accent);
+      color: #fff; text-align: center; border-radius: 6px;
+      padding: 9px 12px; font-size: 12px; font-weight: 600;
+      z-index: 9998; box-shadow: 0 4px 14px rgba(0,0,0,.5);
+      animation: fxWelcome 3.4s cubic-bezier(.22,.61,.36,1) forwards;
+    }
+    @keyframes fxWelcome {
+      0%   { transform: translateY(150%); opacity: 0; }
+      10%  { transform: translateY(0);    opacity: 1; }
+      88%  { transform: translateY(0);    opacity: 1; }
+      100% { transform: translateY(150%); opacity: 0; }
+    }
   </style>
 </head>
 <body>

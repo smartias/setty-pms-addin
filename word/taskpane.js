@@ -39,7 +39,8 @@ let docFirstPageText = "";
 let saveInFlight = false;
 let docStatus = "draft"; // persisted in Office document settings
 let doneEditingList = []; // [{ name, email, ts }] — persisted in document settings
-let draftSaved = false;   // true once a .docx draft has been uploaded to SharePoint
+let draftSaved = false;     // true once a .docx draft has been uploaded to SharePoint
+let draftFolderPath = "";   // drive-relative SP folder the draft was filed to
 // SharePoint folder picker state. spCurrentPath is drive-relative (e.g.
 // "24-105 Acme HVAC/Documents"). Defaults to the project folder root when
 // the SharePoint checkbox is first ticked.
@@ -212,6 +213,9 @@ async function refreshSpPickerForProject() {
   }
   spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl) || "";
   spCurrentPath     = spProjectRootPath;
+  // Once a draft has been filed, exports default to the folder it went to so
+  // the PDF lands next to the .docx.
+  if (draftSaved && draftFolderPath) spCurrentPath = draftFolderPath;
   updateDestCard();
   await renderSpPicker();
 }
@@ -327,6 +331,7 @@ async function onSignedIn() {
   }
   renderStatusBar();
   renderDoneEditing();
+  fxWelcome(fxFirstName());   // header-logo wiggle + greeting toast
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -390,6 +395,7 @@ function persistDocSettings() {
     Office.context.document.settings.set("settyPms:projectId", selectedProject?.id || "");
     Office.context.document.settings.set("settyPms:docStatus", docStatus);
     Office.context.document.settings.set("settyPms:draftSaved", draftSaved);
+    Office.context.document.settings.set("settyPms:draftFolderPath", draftFolderPath);
   } catch (e) {
     console.warn("Could not stage document settings:", e.message);
   }
@@ -426,8 +432,10 @@ function loadSelectedProject() {
 function loadDraftSaved() {
   try {
     draftSaved = Office.context.document.settings.get("settyPms:draftSaved") === true;
+    draftFolderPath = Office.context.document.settings.get("settyPms:draftFolderPath") || "";
   } catch (e) {
     draftSaved = false;
+    draftFolderPath = "";
   }
 }
 
@@ -553,6 +561,7 @@ function applyAutoSuggest() {
     updateSaveButtons();
     refreshSpPickerForProject();
     collapseProjectPickerToPill();
+    fxSuggestPill();   // celebrate the correct guess
   }
 }
 
@@ -1096,6 +1105,7 @@ async function doSaveToOneNote() {
     setStatus("oneNoteStatus", "info", "⏳ Sending to OneNote…");
     const page = await postPdfPrintoutToOneNote(selectedProject, pageTitle, pdfBlob);
     setStatus("oneNoteStatus", "success", "✓ Saved to OneNote");
+    fxPaperPlane(document.getElementById("saveOneNoteBtn"));
     if (page.webUrl) {
       document.getElementById("oneNoteLink").innerHTML =
         `<a href="${page.webUrl}" target="_blank">📓 Open in OneNote</a>`;
@@ -1131,12 +1141,14 @@ async function doSaveDraft() {
     // Mark the document draft-saved and bake the tags in before reading it out,
     // so the uploaded copy carries everything when someone reopens it.
     draftSaved = true;
+    draftFolderPath = spCurrentPath;
     persistDocSettings();
     await flushSettings();
     const docxBlob = await getDocumentAsDocxBlob();
     setStatus("spStatus", "info", "⏳ Uploading to SharePoint…");
     const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath);
     setStatus("spStatus", "success", "✓ Draft saved to SharePoint");
+    fxFileDrop(document.getElementById("saveSpDraftBtn"), "💾");
     document.getElementById("spLink").innerHTML =
       `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>`;
   } catch (e) {
@@ -1183,6 +1195,7 @@ async function doSavePdf() {
     await saveDocStatus("final");
     renderDoneEditing();
     setStatus("spStatus", "success", "✓ PDF saved to SharePoint — document marked Final");
+    fxFileDrop(document.getElementById("savePdfBtn"), "📄");
     document.getElementById("spLink").innerHTML =
       `<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
   } catch (e) {
@@ -1198,4 +1211,135 @@ function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
     "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
   }[c]));
+}
+
+// ─── CELEBRATIONS ─────────────────────────────────────────────────────────────
+// Fun, lightweight feedback for the add-in's key moments. Every effect is
+// decorative — it never blocks the UI and always cleans up after itself.
+
+// Master guard: false when the OS asks for reduced motion, so every effect
+// below becomes a no-op for users who opted out of animation.
+function fxOn() {
+  return !(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+
+// Shared full-pane overlay that hosts the floating effects.
+function fxLayer() {
+  let layer = document.getElementById("wordFx");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.id = "wordFx";
+    document.body.appendChild(layer);
+  }
+  return layer;
+}
+
+// Center point of an element, in viewport coordinates.
+function fxCenterOf(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+// 1 ─ Paper airplane: launches from `originEl` and flies off the pane.
+//     Fired on a successful "Save to OneNote".
+function fxPaperPlane(originEl) {
+  if (!fxOn() || !originEl) return;
+  const { x, y } = fxCenterOf(originEl);
+  const plane = document.createElement("div");
+  plane.className = "fx-plane";
+  plane.style.left = x + "px";
+  plane.style.top  = y + "px";
+  fxLayer().appendChild(plane);
+  setTimeout(() => plane.remove(), 1300);
+}
+
+// 2 ─ File drop: a page icon falls into a folder just above `originEl`.
+//     Fired on a successful SharePoint save (PDF export or .docx draft).
+function fxFileDrop(originEl, pageIcon) {
+  if (!fxOn() || !originEl) return;
+  const { x, y } = fxCenterOf(originEl);
+  const drop = document.createElement("div");
+  drop.className = "fx-drop";
+  drop.style.left = x + "px";
+  drop.style.top  = (y - 34) + "px";        // sit just above the clicked button
+  drop.innerHTML =
+    '<span class="fx-page">' + (pageIcon || "📄") + '</span>' +
+    '<span class="fx-folder fx-gulp">📁</span>';
+  fxLayer().appendChild(drop);
+  setTimeout(() => drop.remove(), 1300);
+}
+
+// 3 ─ Auto-suggest celebration: pops + glows the project pill and pings a
+//     few sparkles, so a correct guess feels intentional, not accidental.
+function fxSuggestPill() {
+  if (!fxOn()) return;
+  const pill = document.getElementById("projectPill");
+  if (!pill || pill.style.display === "none") return;
+  pill.classList.remove("fx-pill-pop", "fx-pill-glow");
+  void pill.offsetWidth;                     // restart the animations
+  pill.classList.add("fx-pill-pop", "fx-pill-glow");
+  setTimeout(() => pill.classList.remove("fx-pill-pop", "fx-pill-glow"), 1600);
+
+  const { x } = fxCenterOf(pill);
+  const top = pill.getBoundingClientRect().top;
+  ["✨", "⭐", "✨"].forEach((s, i) => {
+    const sp = document.createElement("div");
+    sp.className = "fx-sparkle";
+    sp.textContent = s;
+    sp.style.left = (x + (i - 1) * 28) + "px";
+    sp.style.top  = top + "px";
+    sp.style.setProperty("--dx", ((i - 1) * 16) + "px");
+    sp.style.setProperty("--dy", (-22 - i * 6) + "px");
+    fxLayer().appendChild(sp);
+    setTimeout(() => sp.remove(), 1100);
+  });
+}
+
+// 4 ─ Welcome: wiggles the header logo and slides in a greeting toast.
+function fxWelcome(firstName) {
+  if (!fxOn()) return;
+  const logo = document.querySelector(".header-logo");
+  if (logo) {
+    logo.classList.remove("fx-logo-wiggle");
+    void logo.offsetWidth;
+    logo.classList.add("fx-logo-wiggle");
+  }
+  const toast = document.createElement("div");
+  toast.className = "fx-welcome";
+  toast.textContent = pickGreeting(firstName);
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3500);
+}
+
+// Best-effort first name from the signed-in account's display name.
+function fxFirstName() {
+  const n = ((msalAccount && msalAccount.name) || "").trim();
+  if (!n) return "";
+  // Handle "Last, First" as well as "First Last".
+  if (n.includes(",")) return n.split(",")[1].trim().split(/\s+/)[0];
+  return n.split(/\s+/)[0];
+}
+
+// The greeting shown in the welcome toast. THIS IS YOURS TO WRITE — see chat.
+// Each entry is a function: it receives the first name ("" if unknown) and
+// returns the toast text.
+const WELCOME_GREETINGS = [
+  name => name ? `Welcome back, ${name}!` : "Welcome back!",
+  name => name ? `Welcome to the wordy party, ${name}!` : "Welcome to the wordy party!",
+  name => name ? `Word on the street: ${name}'s got docs to file.` : "Word on the street: docs to file.",
+  name => name ? `${name}, let's give this doc a forever home.` : "Let's give this doc a forever home.",
+  name => name ? `The doc whisperer returns. Hey, ${name}.` : "The doc whisperer returns.",
+  name => name ? `Filing time, ${name} — make it look easy.` : "Filing time — make it look easy.",
+  name => name ? `It won't file itself, ${name}. Lucky you've got us.` : "It won't file itself. Lucky you've got us.",
+  name => name ? `Look who's being organized today — hi, ${name}.` : "Look who's being organized today.",
+  name => name ? `Another masterpiece to file, ${name}?` : "Another masterpiece to file?",
+  name => name ? `${name}, let's turn "where'd I save that" into "filed."` : `Let's turn "where'd I save that" into "filed."`,
+  name => name ? `Your future self thanks you for filing this, ${name}.` : "Your future self thanks you for filing this.",
+  name => name ? `Fresh doc, fresh start. Let's file it, ${name}.` : "Fresh doc, fresh start. Let's file it.",
+  name => name ? `${name}, inbox-zero energy starts here.` : "Inbox-zero energy starts here.",
+  name => name ? `Hey ${name} — let's make this doc easy to find later.` : "Let's make this doc easy to find later.",
+];
+function pickGreeting(firstName) {
+  const pick = WELCOME_GREETINGS[Math.floor(Math.random() * WELCOME_GREETINGS.length)];
+  return pick(firstName || "");
 }
