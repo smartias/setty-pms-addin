@@ -2638,6 +2638,8 @@ const RESPONSE_WEIGHTS = {
   politeRequest:          2,
   hasDueDate:             3,
   urgencyWord:            2,
+  addressedToMe:          2,   // signed-in user is in the To field, not just CC
+  namedInSalutation:      3,   // the greeting names the signed-in user
   exclusionPhrase:       -5,   // explicit opt-out beats inferred signals
 };
 const RESPONSE_MIN_SCORE = 3;
@@ -2673,7 +2675,7 @@ function stripUrlsForScan(s) {
 // used by extractDueDates to resolve year-less dates. Returns the same
 // { score, reasons } shape as suggestProjects(), plus a needsReply boolean and
 // any ISO dates found (so the watchlist row can store a due date).
-function needsResponse(subject, bodyText, emailReceivedDate) {
+function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
   const subj = (subject || "").toLowerCase();
   const body = stripUrlsForScan(trimToCurrentMessage(bodyText || "")).toLowerCase();
   let score = 0;
@@ -2707,6 +2709,16 @@ function needsResponse(subject, bodyText, emailReceivedDate) {
     score += RESPONSE_WEIGHTS.urgencyWord;
     reasons.push("urgency");
   }
+  // Recipient signals — computed by the caller (needs the recipient list and
+  // the signed-in user's name, which a pure subject+body function can't see).
+  if (opts.addressedToMe) {
+    score += RESPONSE_WEIGHTS.addressedToMe;
+    reasons.push("addressed to you");
+  }
+  if (opts.namedInSalutation) {
+    score += RESPONSE_WEIGHTS.namedInSalutation;
+    reasons.push("greets you by name");
+  }
   if (RESPONSE_EXCLUSIONS.some(x => body.includes(x) || subj.includes(x))) {
     score += RESPONSE_WEIGHTS.exclusionPhrase;
     reasons.push("explicit no-reply");
@@ -2726,10 +2738,21 @@ function needsResponse(subject, bodyText, emailReceivedDate) {
 // "open" is NOT trusted from this table — it's re-verified against Graph at
 // render time (isThreadAwaitingReply). The table is just the watchlist.
 
-async function getWatchlistRow(conversationId) {
+// Identifies the current user for watchlist ownership. Used for BOTH the
+// added_by written on insert and the filter on read, so they always agree —
+// the panel only shows emails this user flagged.
+function watchlistUserKey() {
+  return msalAccount?.username || msalAccount?.name || "unknown";
+}
+
+// Looks up THIS user's row for a thread. Rows are keyed (conversation_id,
+// added_by), so a colleague's row for the same thread is invisible here — that
+// is what lets two people track the same thread independently.
+async function getMyWatchlistRow(conversationId) {
   if (!conversationId) return null;
   const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
     "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&added_by=eq." + encodeURIComponent(watchlistUserKey()) +
     "&select=conversation_id,status&limit=1";
   try {
     const res = await fetch(url, { headers: SB_HEADERS });
@@ -2739,13 +2762,14 @@ async function getWatchlistRow(conversationId) {
   } catch { return null; }
 }
 
-// Inserts a watchlist row only if the thread isn't already tracked. This is
-// what makes the classify-on-open hook safe to fire on every email view:
-// re-opening a thread the user already dismissed (or that's been answered)
-// must NOT resurrect it. Returns true only when a new row was created.
+// Inserts a watchlist row only if THIS user isn't already tracking the thread.
+// This is what makes the classify-on-open hook safe to fire on every email
+// view: re-opening a thread you already dismissed (or that's been answered)
+// must NOT resurrect your row. A colleague's row never blocks yours. Returns
+// true only when a new row was created.
 async function addWatchlistEntryIfNew(entry) {
   if (!entry?.conversation_id) return false;
-  if (await getWatchlistRow(entry.conversation_id)) return false;
+  if (await getMyWatchlistRow(entry.conversation_id)) return false;
   try {
     const res = await fetch(SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE, {
       method: "POST",
@@ -2765,7 +2789,8 @@ async function addWatchlistEntryIfNew(entry) {
 
 async function getWatchlistOpenItems() {
   const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
-    "?status=eq.watching&select=*&order=added_at.asc";
+    "?status=eq.watching&added_by=eq." + encodeURIComponent(watchlistUserKey()) +
+    "&select=*&order=added_at.asc";
   try {
     const res = await fetch(url, { headers: SB_HEADERS });
     if (!res.ok) return [];
@@ -2773,10 +2798,16 @@ async function getWatchlistOpenItems() {
   } catch { return []; }
 }
 
+// Updates only THIS user's row for the thread — dismiss and answered are both
+// per-user (each person owns their own row). When a teammate replies, every
+// participant's row independently flips to 'answered' on their next render via
+// the Graph check, so "answered" still behaves as shared even though the write
+// is per-row.
 async function setWatchlistStatus(conversationId, status) {
   if (!conversationId) return;
   const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
-    "?conversation_id=eq." + encodeURIComponent(conversationId);
+    "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&added_by=eq." + encodeURIComponent(watchlistUserKey());
   try {
     await fetch(url, {
       method: "PATCH",
@@ -2813,7 +2844,13 @@ async function maybeAddToWatchlist(myGen) {
   try {
     if (currentItemKind !== "message" || !emailItem) return;
     const from = (emailFromAddress || "").toLowerCase();
-    if (!from || from.endsWith("@setty.com")) return;   // client mail only
+    if (!from) return;
+    // Gate: the sender must be a company on the global client list. This is
+    // what keeps automated mail (Microsoft 365 notifications, newsletters,
+    // vendors) and internal @setty.com mail off the watchlist — getClientByEmail
+    // matches a known client by contact address or shared email domain.
+    const client = getClientByEmail(emailFromAddress);
+    if (!client) return;
 
     const token = await getToken();
     const html  = await getEmailBodyHtml(token);
@@ -2822,24 +2859,34 @@ async function maybeAddToWatchlist(myGen) {
     tmp.innerHTML = html || "";
     const text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
 
+    // Recipient signals — an email sent directly TO you, or one whose greeting
+    // names you, is far more likely to need your reply than a mass CC. Computed
+    // here because needsResponse() can't see the recipient list or your name.
+    const myAddr = (msalAccount?.username || "").toLowerCase();
+    const addressedToMe = !!myAddr &&
+      (emailItem.to || []).some(r => (r.emailAddress || "").toLowerCase() === myAddr);
+    const myFirstName = (msalAccount?.name || "").trim().split(/\s+/)[0].replace(/[^\w]/g, "");
+    const namedInSalutation = myFirstName.length >= 2 &&
+      new RegExp("\\b" + myFirstName + "\\b", "i").test(text.slice(0, 60));
+
     const subject = (typeof emailItem.subject === "string") ? emailItem.subject : "";
-    const verdict = needsResponse(subject, text, emailItem.dateTimeCreated);
+    const verdict = needsResponse(subject, text, emailItem.dateTimeCreated,
+      { addressedToMe, namedInSalutation });
     if (!verdict.needsReply) return;
 
     const conversationId = await getCurrentConversationId();
     if (!conversationId || myGen !== itemContextGeneration) return;
 
-    const client = getClientByEmail(emailFromAddress);
     const added = await addWatchlistEntryIfNew({
       conversation_id: conversationId,
       subject: subject || "(No subject)",
       client_email: emailFromAddress,
-      client_name: client?.name || emailFrom || "",
+      client_name: client.name || emailFrom || "",
       project_id: selectedProject?.id || null,
       due_date: verdict.dueDates[0] || null,
       score: verdict.score,
       reasons: verdict.reasons,
-      added_by: msalAccount?.username || msalAccount?.name || "unknown",
+      added_by: watchlistUserKey(),
     });
     if (added) void renderResponseWatchlist();
   } catch (e) {
