@@ -53,6 +53,7 @@ let draftWebUrl = "";       // SharePoint webUrl of the filed .docx (for "open t
 // the SharePoint checkbox is first ticked.
 let spCurrentPath = "";
 let spProjectRootPath = "";
+let _spFolders = [];   // folder names at the currently-browsed level (for the picker filter)
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 // Surface any unhandled error directly into the pane so a startup crash never
@@ -130,6 +131,8 @@ function setupListeners() {
   document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
   document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
   document.getElementById("titleInput").addEventListener("input", updateSavePreview);
+  const spSearch = document.getElementById("spFolderSearch");
+  if (spSearch) spSearch.addEventListener("input", () => renderSpFolderRows(spSearch.value));
   document.getElementById("conflictReplaceBtn").onclick = () => _conflictResolver && _conflictResolver("replace");
   document.getElementById("conflictRenameBtn").onclick  = () => _conflictResolver && _conflictResolver("rename");
   document.getElementById("conflictCancelBtn").onclick  = () => _conflictResolver && _conflictResolver("cancel");
@@ -307,6 +310,9 @@ function updateFiledCard() {
 // exact bug this replaces.
 function openSharePointCopy() {
   if (!draftWebUrl) return;
+  // The honest ceiling for the two-window confusion: Office.js can't close this
+  // local copy for the user, so tell them it's safe to abandon once Word opens.
+  setStatus("spStatus", "info", "Opening in Word… once it's up, you can close this window safely.");
   try {
     if (Office?.context?.ui?.openBrowserWindow) {
       Office.context.ui.openBrowserWindow(draftWebUrl);
@@ -379,39 +385,68 @@ async function renderSpPicker() {
       await renderSpPicker();
     };
   });
+  const search = document.getElementById("spFolderSearch");
+  if (search) { search.value = ""; search.style.display = "none"; }   // reset filter on every level change
   folders.innerHTML = '<div class="sp-loading">Loading folders…</div>';
   try {
     const token = await getToken();
-    // Root listing uses /root/children; a subfolder uses /root:/<path>:/children.
-    const driveBase = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID;
-    const url = (spCurrentPath
-      ? driveBase + "/root:/" + encodeDrivePath(spCurrentPath) + ":/children"
-      : driveBase + "/root/children")
-      + "?$select=name,folder&$filter=folder ne null&$top=200";
-    const res = await fetch(url, { headers: { "Authorization": "Bearer " + token } });
-    if (!res.ok) {
-      folders.innerHTML = '<div class="sp-empty">Could not list folders (' + res.status + ')</div>';
-      return;
-    }
-    const data = await res.json();
-    const subs = (data.value || []).filter(it => it.folder);
-    if (!subs.length) {
-      folders.innerHTML = '<div class="sp-empty">No subfolders here — saves will land in this folder.</div>';
-      return;
-    }
-    folders.innerHTML = subs.map(f =>
-      `<div class="sp-folder-row" data-name="${escapeHtml(f.name)}">📁 ${escapeHtml(f.name)}</div>`
-    ).join("");
-    folders.querySelectorAll(".sp-folder-row").forEach(row => {
-      row.onclick = async () => {
-        const name = row.getAttribute("data-name");
-        spCurrentPath = spCurrentPath ? spCurrentPath + "/" + name : name;
-        await renderSpPicker();
-      };
-    });
+    _spFolders = await fetchAllChildFolders(token, spCurrentPath);
+    // Only surface the filter box when the list is long enough to need it.
+    if (search) search.style.display = _spFolders.length > 8 ? "block" : "none";
+    renderSpFolderRows("");
   } catch (e) {
     folders.innerHTML = '<div class="sp-empty">Error: ' + escapeHtml(e.message) + '</div>';
   }
+}
+
+// Fetches ALL immediate subfolders of a drive-relative path, following
+// pagination so a level with >200 folders (e.g. the library root) isn't
+// silently truncated. Capped at ~3000 to stay sane. Returns sorted names.
+async function fetchAllChildFolders(token, path) {
+  const driveBase = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID;
+  let url = (path
+    ? driveBase + "/root:/" + encodeDrivePath(path) + ":/children"
+    : driveBase + "/root/children")
+    + "?$select=name,folder&$top=200";
+  const names = [];
+  let guard = 0;
+  while (url && guard < 15) {
+    const res = await fetch(url, { headers: { "Authorization": "Bearer " + token } });
+    if (!res.ok) throw new Error("list folders " + res.status);
+    const data = await res.json();
+    for (const it of (data.value || [])) if (it.folder) names.push(it.name);
+    url = data["@odata.nextLink"] || null;
+    guard++;
+  }
+  return names.sort((a, b) => a.localeCompare(b));
+}
+
+// Renders the (optionally filtered) folder rows from _spFolders into #spFolders.
+// Separate from the fetch so typing in the filter re-renders without re-hitting
+// Graph.
+function renderSpFolderRows(filter) {
+  const folders = document.getElementById("spFolders");
+  if (!folders) return;
+  if (!_spFolders.length) {
+    folders.innerHTML = '<div class="sp-empty">No subfolders here — saves will land in this folder.</div>';
+    return;
+  }
+  const q = (filter || "").trim().toLowerCase();
+  const list = q ? _spFolders.filter(n => n.toLowerCase().includes(q)) : _spFolders;
+  if (!list.length) {
+    folders.innerHTML = '<div class="sp-empty">No folders match “' + escapeHtml(filter) + '”.</div>';
+    return;
+  }
+  folders.innerHTML = list.map(name =>
+    `<div class="sp-folder-row" data-name="${escapeHtml(name)}">📁 ${escapeHtml(name)}</div>`
+  ).join("");
+  folders.querySelectorAll(".sp-folder-row").forEach(row => {
+    row.onclick = async () => {
+      const name = row.getAttribute("data-name");
+      spCurrentPath = spCurrentPath ? spCurrentPath + "/" + name : name;
+      await renderSpPicker();
+    };
+  });
 }
 
 function showView(id) {
@@ -498,6 +533,7 @@ function onDocMaybeChanged() {
   if (/^https?:\/\//i.test(currentDocUrl || "")) return;     // cloud copy AutoSaves — never "unsynced"
   dirtySinceFiled = true;
   updateFiledCard();
+  updateSaveButtons();   // reflect "● edits pending" on the update button
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -803,10 +839,13 @@ function updateSaveButtons() {
   document.getElementById("saveOneNoteLabel").textContent = "Save to OneNote" + projTag;
 
   draftBtn.disabled = !spReady || saveInFlight;
-  // Re-saving is allowed: a filed draft can be updated in place, so the button
-  // stays put and just relabels to make the repeat action obvious.
+  // Plain-language states. No project-tag suffix here — the labels are long and
+  // the pill above already shows the project. The "●" on a dirty update ties to
+  // the amber filed card's "● Unsynced edits" so they read as the same signal.
   document.getElementById("saveSpDraftLabel").textContent =
-    (draftSaved ? "Update Draft" : "Save Draft") + (spReady ? projTag : "");
+    !draftSaved        ? "File to SharePoint"
+    : dirtySinceFiled  ? "Update filed copy ●"
+    :                    "Update filed copy";
   draftBtn.style.display = "";
 
   pdfBtn.disabled = !spReady || saveInFlight;
