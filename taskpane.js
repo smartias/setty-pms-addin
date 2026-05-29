@@ -1846,6 +1846,13 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
 }
 async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
   if (!projectId || !emailRecord?.msgId) return;
+  // Phase 6 dual-write: write both slim index fields AND new body/metadata
+  // columns. Some fields (to/cc/preview/hasAttachments/attachmentNames/savedBy)
+  // are not yet captured upstream in the add-in's emailRecord — they default
+  // to empty/false. A future patch can enrich emailRecord at construction time
+  // to fill these from the Outlook item; until then add-in saves will have
+  // these fields blank in pms_project_emails. PMS-side saves already populate
+  // all of them.
   const row = {
     record_id: emailRecord.id,
     project_id: projectId,
@@ -1854,10 +1861,19 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
     subject: emailRecord.subject || "",
     from_name: emailRecord.from || "",
     from_address: emailRecord.fromAddress || "",
+    to_addresses: emailRecord.to || "",
+    cc_addresses: emailRecord.cc || "",
     email_date: emailRecord.date || null,
     saved_at: emailRecord.savedAt || new Date().toISOString(),
+    saved_by: emailRecord.savedBy || null,
     sp_folder_url: emailRecord.spFolderUrl || "",
     saved_to_sharepoint: !!savedToSharePoint,
+    body_html_compressed: emailRecord.bodyHtmlCompressed || null,
+    body_html_size: emailRecord.bodyHtmlSize || 0,
+    body_text: emailRecord.bodyText || "",
+    preview: emailRecord.preview || "",
+    has_attachments: !!emailRecord.hasAttachments,
+    attachment_names: emailRecord.attachmentNames || [],
   };
   // Throws on failure (caller catches and surfaces a warning). Previously this
   // silently console.warn'd and returned, so users had no idea their email
