@@ -7206,6 +7206,20 @@ async function createMilestoneCalendarEvent(milestone, project) {
   };
   try {
     const token = await getToken();
+    // Carry the source email's body into the event so the calendar entry has
+    // the context it came from. Best-effort: skipped for manual entries,
+    // appointments, or if the body can't be fetched (getEmailBodyHtml → "").
+    try {
+      const bodyHtml = (currentItemKind === "message") ? await getEmailBodyHtml(token) : "";
+      if (bodyHtml) {
+        const srcSubject = (emailItem?.subject || "").trim();
+        const srcFrom    = (emailFrom || emailFromAddress || "").trim();
+        const header = (srcSubject || srcFrom)
+          ? `<p style="margin:0 0 8px"><b>From email:</b> ${escHtml(srcSubject)}${srcFrom ? " — " + escHtml(srcFrom) : ""}</p><hr>`
+          : "";
+        event.body = { contentType: "HTML", content: header + bodyHtml };
+      }
+    } catch { /* body is a nice-to-have; never block the event on it */ }
     const calId = await getNYCCalendarId();
     const path  = calId ? "/me/calendars/" + calId + "/events" : "/me/events";
     const res   = await graphFetch("POST", path, event, token);
