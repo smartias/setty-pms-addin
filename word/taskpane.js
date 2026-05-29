@@ -39,6 +39,9 @@ let currentDocUrl = "";   // full URL of the open document ("" if unsaved); http
 let docFirstPageText = "";
 let saveInFlight = false;
 let docStatus = "draft"; // persisted in Office document settings
+let dirtySinceFiled = false;     // true once the local copy is edited after filing — the filed SP copy is now stale
+let isExporting = false;         // guard: ignore the add-in's own file/settings writes in the change handler
+let changeHandlerRegistered = false;
 let doneEditingList = []; // [{ name, email, ts }] — persisted in document settings
 let draftSaved = false;     // true once a .docx draft has been uploaded to SharePoint
 let draftFolderPath = "";   // drive-relative SP folder the draft was filed to
@@ -262,6 +265,7 @@ function updateFiledCard() {
   const headEl = document.getElementById("filedHead");
   const hintEl = document.getElementById("filedHint");
   const openBtn = document.getElementById("openSpCopyBtn");
+  const inner   = document.getElementById("filedCardInner");
 
   // If the open document is itself cloud-hosted (http/https URL), it's the
   // SharePoint copy — edits AutoSave and there's nothing to reopen. Show a calm
@@ -269,23 +273,33 @@ function updateFiledCard() {
   // SharePoint copy" when they're already in it.
   const inCloudCopy = /^https?:\/\//i.test(currentDocUrl || "");
   if (inCloudCopy) {
+    if (inner) inner.classList.remove("is-dirty");
     if (headEl) headEl.textContent = "✓ Filed — AutoSave is on";
     if (hintEl) hintEl.textContent = "You're editing the SharePoint copy. Changes save automatically.";
     if (openBtn) openBtn.style.display = "none";
     return;
   }
 
-  // Detached local copy — edits here don't sync until the SP copy is opened.
-  if (headEl) headEl.textContent = "✓ Draft filed to SharePoint";
-  if (hintEl) hintEl.textContent = "This open document is a local copy — edits here won't sync. Open the SharePoint copy to keep working with AutoSave.";
-  // The "open the copy" button only works if we know the SharePoint URL — a
-  // copy reopened from SharePoint itself may not carry one.
+  // Detached local copy, two sub-states:
+  //  • dirty — edited since filing, so the SharePoint copy is now stale (amber).
+  //  • clean — just filed; frame it as one step from done and hand them off.
+  if (inner) inner.classList.toggle("is-dirty", dirtySinceFiled);
+  if (dirtySinceFiled) {
+    if (headEl) headEl.textContent = "● Unsynced edits — changes since you filed";
+    if (hintEl) hintEl.textContent = "This open file is a copy on your computer. Click “Update Draft” to push your edits to SharePoint, or switch to the SharePoint copy (it saves on its own).";
+  } else {
+    if (headEl) headEl.textContent = "✓ Filed to SharePoint — one step left";
+    if (hintEl) hintEl.textContent = "You're editing a copy on your computer. Continue in the SharePoint copy so your edits save automatically.";
+  }
+  // Primary hand-off action — labeled to lead people to the synced copy, not
+  // just "open". Only works when we know the SP URL (a copy reopened without one
+  // hides the button; the user relies on Update Draft instead).
   if (openBtn) {
     openBtn.style.display = draftWebUrl ? "block" : "none";
+    openBtn.textContent = "Continue in the SharePoint copy →";
     openBtn.onclick = (e) => { e.preventDefault(); openSharePointCopy(); };
     openBtn.removeAttribute("href");
   }
-  if (openAlt) openAlt.style.display = "none";   // replaced — the primary button now opens reliably
 }
 
 // Opens the filed SharePoint copy so further edits AutoSave. Opens the file's
@@ -467,7 +481,34 @@ async function onSignedIn() {
   }
   renderStatusBar();
   renderDoneEditing();
+  registerChangeWatcher();
   fxWelcome(fxFirstName());   // header-logo wiggle + greeting toast
+}
+
+// Watches for edits to the open document so we can warn when a filed draft has
+// drifted out of sync. The common API has no "content changed" event, so we use
+// DocumentSelectionChanged as a proxy for "the user is working in the doc" —
+// good enough for a STICKY dirty flag that's only ever cleared by a successful
+// "Update Draft" (never auto-cleared on a guess).
+function registerChangeWatcher() {
+  if (changeHandlerRegistered) return;
+  try {
+    Office.context.document.addHandlerAsync(
+      Office.EventType.DocumentSelectionChanged,
+      onDocMaybeChanged,
+      (r) => { if (r.status === Office.AsyncResultStatus.Succeeded) changeHandlerRegistered = true; }
+    );
+  } catch (e) {
+    console.warn("Could not register change watcher:", e.message);
+  }
+}
+
+function onDocMaybeChanged() {
+  if (isExporting) return;                                   // our own file/settings writes — not a user edit
+  if (dirtySinceFiled || !draftSaved) return;                // already flagged, or nothing filed yet to drift from
+  if (/^https?:\/\//i.test(currentDocUrl || "")) return;     // cloud copy AutoSaves — never "unsynced"
+  dirtySinceFiled = true;
+  updateFiledCard();
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -1256,6 +1297,7 @@ async function doSaveToOneNote() {
   const titleInput = document.getElementById("titleInput");
   const pageTitle = (titleInput.value || "").trim() || docFilename.replace(/\.[^.]+$/, "");
   try {
+    isExporting = true;
     setStatus("oneNoteStatus", "info", "⏳ Exporting document as PDF…");
     const pdfBlob = await getDocumentAsPdfBlob();
     setStatus("oneNoteStatus", "info", "⏳ Sending to OneNote…");
@@ -1269,6 +1311,7 @@ async function doSaveToOneNote() {
   } catch (e) {
     setStatus("oneNoteStatus", "error", e.message);
   } finally {
+    isExporting = false;
     saveInFlight = false;
     updateSaveButtons();
   }
@@ -1315,6 +1358,7 @@ async function doSaveDraft() {
   }
 
   try {
+    isExporting = true;   // our own settings/file writes below are not user edits
     setStatus("spStatus", "info", "⏳ Exporting .docx…");
     // Stage the project/status tags into the document before reading it out, so
     // the uploaded copy carries them when someone reopens it.
@@ -1334,6 +1378,7 @@ async function doSaveDraft() {
     draftFileName   = item.name;
     draftFolderPath = spCurrentPath;
     draftWebUrl     = item.webUrl || "";
+    dirtySinceFiled = false;   // the local copy now matches the filed copy again
     persistDocSettings();
     await flushSettings();
 
@@ -1346,6 +1391,7 @@ async function doSaveDraft() {
     // any) still exists, and a first-time save simply stays un-filed.
     setStatus("spStatus", "error", e.message);
   } finally {
+    isExporting = false;
     saveInFlight = false;
     updateSaveButtons();
     updateDestCard();
@@ -1370,6 +1416,7 @@ async function doSavePdf() {
     || "Document";
   const uploadFilename = baseName.replace(/\.[^.]+$/, "") + ".pdf";
   try {
+    isExporting = true;
     setStatus("spStatus", "info", "⏳ Exporting PDF…");
     const pdfBlob = await getDocumentAsPdfBlob();
     setStatus("spStatus", "info", "⏳ Uploading PDF to SharePoint…");
@@ -1389,6 +1436,7 @@ async function doSavePdf() {
   } catch (e) {
     setStatus("spStatus", "error", e.message);
   } finally {
+    isExporting = false;
     saveInFlight = false;
     updateSaveButtons();
   }

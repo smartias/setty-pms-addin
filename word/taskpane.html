@@ -577,6 +577,11 @@
       font-size: 11px; color: var(--muted);
       margin-top: 8px; line-height: 1.5;
     }
+    /* Unsynced-edits state — the filed copy is now stale. Amber overrides the
+       card's default green so "you have work that isn't on SharePoint" reads as
+       an alert, not a confirmation. */
+    .filed-card.is-dirty { border-color: #b45309; background: rgba(245,158,11,0.08); }
+    .filed-card.is-dirty .filed-head { color: #fbbf24; }
   </style>
 </head>
 <body>
@@ -681,7 +686,7 @@
            the document open here is a detached local copy that never syncs on
            its own; the SharePoint-hosted copy AutoSaves natively. -->
       <div id="draftFiledCard" style="display:none; margin-top:10px; margin-bottom:8px;">
-        <div class="filed-card">
+        <div class="filed-card" id="filedCardInner">
           <div class="filed-head" id="filedHead">✓ Draft filed to SharePoint</div>
           <div class="filed-name" id="filedName"></div>
           <a id="openSpCopyBtn" class="filed-open-btn" style="display:none">✏️ Open the SharePoint copy</a>
