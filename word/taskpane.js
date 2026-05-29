@@ -262,18 +262,16 @@ function updateFiledCard() {
   const headEl = document.getElementById("filedHead");
   const hintEl = document.getElementById("filedHint");
   const openBtn = document.getElementById("openSpCopyBtn");
-  const openAlt = document.getElementById("openSpCopyAltLink");
 
   // If the open document is itself cloud-hosted (http/https URL), it's the
   // SharePoint copy — edits AutoSave and there's nothing to reopen. Show a calm
-  // confirmation and hide the open actions, so people aren't told to "open the
+  // confirmation and hide the open action, so people aren't told to "open the
   // SharePoint copy" when they're already in it.
   const inCloudCopy = /^https?:\/\//i.test(currentDocUrl || "");
   if (inCloudCopy) {
     if (headEl) headEl.textContent = "✓ Filed — AutoSave is on";
     if (hintEl) hintEl.textContent = "You're editing the SharePoint copy. Changes save automatically.";
     if (openBtn) openBtn.style.display = "none";
-    if (openAlt) openAlt.style.display = "none";
     return;
   }
 
@@ -283,40 +281,34 @@ function updateFiledCard() {
   // The "open the copy" button only works if we know the SharePoint URL — a
   // copy reopened from SharePoint itself may not carry one.
   if (openBtn) {
-    if (draftWebUrl) {
-      openBtn.style.display = "block";
-      // Drive the open from a click handler, NOT a static href. A clicked
-      // <a href="ms-word:ofe|u|…"> inside the add-in webview can decode the
-      // URL's %20 back into a literal space, which truncates the command and
-      // makes Word throw "Office doesn't recognize the command it was given".
-      openBtn.onclick = (e) => { e.preventDefault(); openSharePointCopy(); };
-      openBtn.removeAttribute("href");
-      // Browser fallback — always works (Word on the web AutoSaves too) and is
-      // the escape hatch if the desktop protocol still chokes on an odd name.
-      if (openAlt) {
-        const isWeb = Office.context.platform === Office.PlatformType.OfficeOnline;
-        openAlt.style.display = isWeb ? "none" : "block";
-        openAlt.onclick = (e) => { e.preventDefault(); window.open(draftWebUrl, "_blank"); };
-      }
-    } else {
-      openBtn.style.display = "none";
-      if (openAlt) openAlt.style.display = "none";
-    }
+    openBtn.style.display = draftWebUrl ? "block" : "none";
+    openBtn.onclick = (e) => { e.preventDefault(); openSharePointCopy(); };
+    openBtn.removeAttribute("href");
   }
+  if (openAlt) openAlt.style.display = "none";   // replaced — the primary button now opens reliably
 }
 
-// Opens the filed SharePoint copy so further edits AutoSave. On the web the file
-// URL opens Word on the web directly; on desktop the ms-word:ofe protocol hands
-// the file to the desktop app. encodeURI guarantees the URL stays percent-encoded
-// (no literal spaces) so the protocol command can't be truncated — the root cause
-// of the "Office doesn't recognize the command it was given" error.
+// Opens the filed SharePoint copy so further edits AutoSave. Opens the file's
+// SharePoint URL directly: in the browser that's Word on the web (which
+// AutoSaves), and if the tenant/library is set to open in the client app,
+// SharePoint hands off to desktop Word automatically.
+//
+// We deliberately do NOT use the ms-word:ofe|u| protocol here. It throws
+// "Office doesn't recognize the command it was given" on real SharePoint paths
+// (the document library and project folders contain spaces and other characters
+// the protocol parser mishandles regardless of encoding) — that error is the
+// exact bug this replaces.
 function openSharePointCopy() {
   if (!draftWebUrl) return;
-  if (Office.context.platform === Office.PlatformType.OfficeOnline) {
-    window.open(draftWebUrl, "_blank");
-    return;
+  try {
+    if (Office?.context?.ui?.openBrowserWindow) {
+      Office.context.ui.openBrowserWindow(draftWebUrl);
+      return;
+    }
+  } catch (e) {
+    console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
-  window.location.href = "ms-word:ofe|u|" + encodeURI(draftWebUrl);
+  window.open(draftWebUrl, "_blank");
 }
 
 function openSelectedProjectInPms() {
