@@ -7197,6 +7197,10 @@ async function createMilestoneCalendarEvent(milestone, project) {
   const event = {
     subject,
     isAllDay: true,
+    // No reminder — these are reference markers on the calendar, not things to
+    // be alerted about. Must be explicit: omitting it lets Graph apply the
+    // mailbox's default reminder, which was spamming everyone.
+    isReminderOn: false,
     start: { dateTime: milestone.dueDate + "T00:00:00", timeZone: "Eastern Standard Time" },
     end:   { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" },
   };
