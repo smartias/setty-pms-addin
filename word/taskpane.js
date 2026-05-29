@@ -1030,12 +1030,25 @@ async function postPdfPrintoutToOneNote(project, pageTitle, pdfBlob) {
   //   • <object data-attachment> attaches the same part as a downloadable file.
   // Both point at the same multipart part ("filePart"). Previously only the
   // <object> was present, so OneNote showed a file icon, not a printout.
+  // If the source .docx has been filed to SharePoint (draftWebUrl is set when
+  // the user has run "Save to SharePoint" in this session), inject a clickable
+  // link to the source document so the OneNote reader can jump back to the
+  // editable Word file — not just the PDF printout.
+  const sourceLinkHtml = draftWebUrl
+    ? `<div style="font-family:sans-serif;font-size:12px;margin-bottom:14px;padding:6px 10px;background:#f0f4fa;border-left:3px solid #003865;border-radius:3px">` +
+        `<a href="${escapeHtml(draftWebUrl)}" target="_blank" style="color:#003865;text-decoration:none;font-weight:600">` +
+          `📄 Open source Word document →` +
+        `</a>` +
+      `</div>`
+    : "";
+
   const presentation =
     `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${created}" /></head><body>` +
     `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">` +
     `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${safeProj}</span>` +
     `<span style="font-size:11px;color:#666">${escapeHtml(fileName)}</span>` +
     `</div>` +
+    sourceLinkHtml +
     `<img data-render-src="name:filePart" alt="${escapeHtml(pageTitle)}" width="800" />` +
     `<p style="font-family:sans-serif;font-size:11px;color:#666;margin-top:12px">📎 Attached file:</p>` +
     `<object data-attachment="${escapeHtml(fileName)}" data="name:filePart" type="application/pdf" />` +
