@@ -212,19 +212,22 @@ function updateQuickLinks() {
 function updateDestCard() {
   const card = document.getElementById("destCard");
   if (!card) return;
-  // The destination picker stays available even after a draft is filed — it
-  // shows where the *next* save (Update Draft / PDF) will go.
-  const hasFolder = !!(selectedProject?.projectFolderUrl);
-  card.style.display = hasFolder ? "block" : "none";
-  if (hasFolder) {
+  // The destination card shows whenever a project is selected — saving is no
+  // longer gated on the project having a pre-linked folder; the user can browse
+  // the whole library and pick any folder (defaulting into the project's own).
+  card.style.display = selectedProject ? "block" : "none";
+  if (selectedProject) {
     const display = document.getElementById("destFolderDisplay");
-    const rel = spCurrentPath && spProjectRootPath && spCurrentPath.startsWith(spProjectRootPath)
-      ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
-      : "";
-    if (display) display.textContent = rel || "project root";
+    if (display) display.textContent = prettySpPath(spCurrentPath);
   }
   updateSavePreview();
   updateFiledCard();
+}
+
+// A drive-relative path ("a/b/c") shown as readable breadcrumbs; "" = library root.
+function prettySpPath(path) {
+  const parts = path ? path.split("/").filter(Boolean) : [];
+  return parts.length ? parts.join(" / ") : "Library root";
 }
 
 // Live "this is what gets saved" line under the File name field — combines the
@@ -236,14 +239,7 @@ function updateSavePreview() {
   const base = (document.getElementById("titleInput")?.value || "").trim().replace(/\.(docx|pdf)$/i, "");
   if (!base || !selectedProject) { el.style.display = "none"; return; }
   el.style.display = "block";
-  if (selectedProject.projectFolderUrl) {
-    const rel = spCurrentPath && spProjectRootPath && spCurrentPath.startsWith(spProjectRootPath)
-      ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
-      : "";
-    el.innerHTML = `Saves as <b>${escapeHtml(base)}.docx</b> in 📂 ${escapeHtml(rel || "project root")}`;
-  } else {
-    el.innerHTML = `Saves as <b>${escapeHtml(base)}.docx</b>`;
-  }
+  el.innerHTML = `Saves as <b>${escapeHtml(base)}.docx</b> in 📂 ${escapeHtml(prettySpPath(spCurrentPath))}`;
 }
 
 // Confirmation card shown once a .docx draft has been filed to SharePoint.
@@ -256,10 +252,7 @@ function updateFiledCard() {
   card.style.display = "block";
   const nameEl = document.getElementById("filedName");
   if (nameEl) {
-    const folder = draftFolderPath && spProjectRootPath && draftFolderPath.startsWith(spProjectRootPath)
-      ? draftFolderPath.slice(spProjectRootPath.length).replace(/^\/+/, "") || "project root"
-      : (draftFolderPath || "project root");
-    nameEl.textContent = (draftFileName || "(filed)") + "  ·  " + folder;
+    nameEl.textContent = (draftFileName || "(filed)") + "  ·  " + prettySpPath(draftFolderPath);
   }
 
   const headEl = document.getElementById("filedHead");
@@ -354,16 +347,13 @@ async function refreshSpPickerForProject() {
     updateDestCard();
     return;
   }
-  if (!selectedProject.projectFolderUrl) {
-    if (crumbs)  crumbs.textContent  = "This project has no SharePoint folder linked.";
-    if (folders) folders.innerHTML   = '<div class="sp-empty">Create one in the PMS first to enable saving here.</div>';
-    updateDestCard();
-    return;
-  }
-  spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl) || "";
+  // Default landing folder: the project's own folder when it has one, else the
+  // library root. This is just the starting point — the breadcrumb root is the
+  // library, so the user can browse to ANY folder from here.
+  spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl || "") || "";
   spCurrentPath     = spProjectRootPath;
-  // Once a draft has been filed, exports default to the folder it went to so
-  // the PDF lands next to the .docx.
+  // Once a draft has been filed, default to the folder it went to so the next
+  // save lands next to it.
   if (draftSaved && draftFolderPath) spCurrentPath = draftFolderPath;
   updateDestCard();
   await renderSpPicker();
@@ -372,34 +362,32 @@ async function refreshSpPickerForProject() {
 async function renderSpPicker() {
   const crumbs = document.getElementById("spBreadcrumbs");
   const folders = document.getElementById("spFolders");
-  // Breadcrumbs: project-root-relative
-  const rel = spCurrentPath.startsWith(spProjectRootPath)
-    ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
-    : spCurrentPath;
-  const parts = rel ? rel.split("/") : [];
-  const crumbHtml = ['<span data-depth="0">📁 (project root)</span>']
+  // Breadcrumbs are anchored at the LIBRARY ROOT so every folder is reachable.
+  const parts = spCurrentPath ? spCurrentPath.split("/").filter(Boolean) : [];
+  const crumbHtml = ['<span data-depth="0">📁 Library root</span>']
     .concat(parts.map((p, i) => ` / <span data-depth="${i + 1}">${escapeHtml(p)}</span>`))
     .join("");
   crumbs.innerHTML = "Save to: " + crumbHtml;
   // Mirror the current folder into the destination card display.
   const destDisplay = document.getElementById("destFolderDisplay");
-  if (destDisplay) destDisplay.textContent = parts.length ? parts.join(" / ") : "project root";
+  if (destDisplay) destDisplay.textContent = parts.length ? parts.join(" / ") : "Library root";
   updateSavePreview();
   crumbs.querySelectorAll("span").forEach(s => {
     s.onclick = async () => {
       const depth = parseInt(s.getAttribute("data-depth"), 10);
-      spCurrentPath = depth === 0
-        ? spProjectRootPath
-        : spProjectRootPath + "/" + parts.slice(0, depth).join("/");
+      spCurrentPath = parts.slice(0, depth).join("/");   // depth 0 -> "" (library root)
       await renderSpPicker();
     };
   });
   folders.innerHTML = '<div class="sp-loading">Loading folders…</div>';
   try {
     const token = await getToken();
-    const url = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID
-      + "/root:/" + encodeDrivePath(spCurrentPath)
-      + ":/children?$select=name,folder&$filter=folder ne null&$top=200";
+    // Root listing uses /root/children; a subfolder uses /root:/<path>:/children.
+    const driveBase = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID;
+    const url = (spCurrentPath
+      ? driveBase + "/root:/" + encodeDrivePath(spCurrentPath) + ":/children"
+      : driveBase + "/root/children")
+      + "?$select=name,folder&$filter=folder ne null&$top=200";
     const res = await fetch(url, { headers: { "Authorization": "Bearer " + token } });
     if (!res.ok) {
       folders.innerHTML = '<div class="sp-empty">Could not list folders (' + res.status + ')</div>';
@@ -408,7 +396,7 @@ async function renderSpPicker() {
     const data = await res.json();
     const subs = (data.value || []).filter(it => it.folder);
     if (!subs.length) {
-      folders.innerHTML = '<div class="sp-empty">No subfolders here. Click Send to save at this location.</div>';
+      folders.innerHTML = '<div class="sp-empty">No subfolders here — saves will land in this folder.</div>';
       return;
     }
     folders.innerHTML = subs.map(f =>
@@ -416,7 +404,8 @@ async function renderSpPicker() {
     ).join("");
     folders.querySelectorAll(".sp-folder-row").forEach(row => {
       row.onclick = async () => {
-        spCurrentPath = spCurrentPath + "/" + row.getAttribute("data-name");
+        const name = row.getAttribute("data-name");
+        spCurrentPath = spCurrentPath ? spCurrentPath + "/" + name : name;
         await renderSpPicker();
       };
     });
@@ -803,7 +792,10 @@ function updateSaveButtons() {
   const draftBtn = document.getElementById("saveSpDraftBtn");
   const pdfBtn   = document.getElementById("savePdfBtn");
   const projTag  = selectedProject ? ` → ${selectedProject.projectNumber || selectedProject.name}` : "";
-  const spReady  = !!(selectedProject && selectedProject.projectFolderUrl);
+  // Saving only needs a selected project now — the destination is the folder
+  // chosen in the picker (defaults to the project folder, or the library root),
+  // so a project without a pre-linked folder can still save.
+  const spReady  = !!selectedProject;
 
   // Relabel via the .brand-label span only — writing textContent on the button
   // itself would wipe the icon tile inside it.
@@ -884,11 +876,11 @@ function spDrivePath(spFolderUrl) {
   return decodeURIComponent(spFolderUrl.slice(base.length));
 }
 async function uploadFileToSharePoint(project, blob, filename, contentType, targetPathOverride, conflictBehavior) {
-  if (!project.projectFolderUrl) {
-    throw new Error("Project has no SharePoint folder linked. Create one in the PMS first.");
-  }
-  const targetPath = targetPathOverride || spDrivePath(project.projectFolderUrl);
-  if (!targetPath) throw new Error("Project SharePoint folder URL is not in the expected library.");
+  // The destination is the user-chosen library-relative folder ("" = library
+  // root). Fall back to the project's own folder only when no path is supplied.
+  const targetPath = (targetPathOverride !== undefined && targetPathOverride !== null)
+    ? targetPathOverride
+    : (spDrivePath(project.projectFolderUrl) || "");
   const token = await getToken();
   const safeName = filename.replace(/[\\/:*?"<>|]/g, "_");
   // conflictBehavior defaults to "rename" (appends " (1)" / " (2)" so a fresh
@@ -1320,10 +1312,6 @@ async function doSaveToOneNote() {
 // Saves the .docx to SharePoint — safe to use at any status, any time.
 async function doSaveDraft() {
   if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
-  if (!selectedProject.projectFolderUrl) {
-    setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
-    return;
-  }
   if (saveInFlight) return;
   saveInFlight = true;
   updateSaveButtons();
@@ -1401,10 +1389,6 @@ async function doSaveDraft() {
 // Exports a PDF and saves it to SharePoint. Auto-sets status to Final on success.
 async function doSavePdf() {
   if (!selectedProject) { setStatus("spStatus", "error", "Pick a project first."); return; }
-  if (!selectedProject.projectFolderUrl) {
-    setStatus("spStatus", "error", "Project has no SharePoint folder linked. Create one in the PMS first.");
-    return;
-  }
   if (saveInFlight) return;
   saveInFlight = true;
   updateSaveButtons();
