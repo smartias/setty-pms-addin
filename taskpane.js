@@ -4574,6 +4574,11 @@ if (existingRecord) {
   const snapDate = snapItem?.dateTimeCreated;
   const snapFromName = snapItem?.from?.displayName || "";
   const snapFromAddr = snapItem?.from?.emailAddress || "";
+  // Capture recipients in the same snapshot so an item-switch mid-save can't
+  // record one email's TO list under a different email's record. Format
+  // matches PMS-side: comma-separated email addresses.
+  const snapTo = (snapItem?.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
+  const snapCc = (snapItem?.cc || []).map(r => r.emailAddress).filter(Boolean).join(", ");
   const snapItemId = snapItem?.itemId || "";
   const saveGen = itemContextGeneration; // capture for stale-write detection
   // Read the "Link to RFI/Sub" dropdown synchronously so it can't drift if
@@ -4635,6 +4640,8 @@ if (existingRecord) {
       subject: snapSubject,
       from: snapFromName,
       fromAddress: snapFromAddr,
+      to: snapTo,
+      cc: snapCc,
       date: snapDate,
       bodyText: "",
       bodyHtmlCompressed: compressedBody,
@@ -4643,6 +4650,7 @@ if (existingRecord) {
       attachmentNames,
       spFolderUrl, links: [],
       savedAt: new Date().toISOString(),
+      savedBy: _getCurrentUserEmail() || "",
     };
     // Re-fetch latest projects, then append email to the FRESH copy of this project.
     // Prevents the add-in from overwriting concurrent PMS edits made during this session.
@@ -4756,6 +4764,8 @@ async function _doSaveToProjectRecordOnly() {
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
+    const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
+    const cc = (emailItem.cc || []).map(r => r.emailAddress).filter(Boolean).join(", ");
     // Lightweight metadata fetch — names only, no byte download. Non-fatal
     // if it fails (empty array, the email still saves correctly).
     const attachmentNames = await getAttachmentNamesOnly(emailItem);
@@ -4764,6 +4774,8 @@ async function _doSaveToProjectRecordOnly() {
       subject: emailItem.subject || "",
       from: from?.displayName || "",
       fromAddress: from?.emailAddress || "",
+      to,
+      cc,
       date: emailItem.dateTimeCreated,
       bodyText: "",
       bodyHtmlCompressed: compressedBody,
@@ -4772,6 +4784,7 @@ async function _doSaveToProjectRecordOnly() {
       attachmentNames,
       spFolderUrl: "", links: [],
       savedAt: new Date().toISOString(),
+      savedBy: _getCurrentUserEmail() || "",
       savedToSharePoint: false,
     };
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
