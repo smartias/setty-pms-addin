@@ -536,6 +536,17 @@ function getCurrentMessageRestId() {
   if (!emailItem?.itemId) return "";
   return Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
 }
+// Graph webLink for the current message — a URL that opens the exact email in
+// Outlook on the web. Stored on a watchlist row so the panel can link back to
+// the original. Returns "" if it can't be resolved (link is best-effort).
+async function getCurrentMessageWebLink() {
+  try {
+    const restId = getCurrentMessageRestId();
+    if (!restId) return "";
+    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=webLink", null);
+    return data?.webLink || "";
+  } catch { return ""; }
+}
 // Fetched-from-headers Message-ID, keyed by itemContextGeneration so it
 // invalidates when the user opens a different item. Set asynchronously by
 // fetchInternetMessageIdFromHeaders() — `emailItem.internetMessageId` is
@@ -2079,6 +2090,31 @@ function _relativeTime(iso) {
   return Math.floor(ms / 86400000) + "d ago";
 }
 
+// Active (Mon–Fri) milliseconds between two instants. All of Saturday and
+// Sunday (local time) are skipped, so a Friday-evening client email doesn't
+// trip the response clock until the equivalent point on Monday. Walks the span
+// one local day at a time, counting only weekday segments — handles partial
+// first/last days correctly.
+function businessMsBetween(from, to) {
+  const end = new Date(to).getTime();
+  let cursor = new Date(from).getTime();
+  if (!(end > cursor)) return 0;
+  let total = 0;
+  while (cursor < end) {
+    const d = new Date(cursor);
+    const nextMidnight = new Date(d);
+    nextMidnight.setHours(24, 0, 0, 0);
+    const segEnd = Math.min(nextMidnight.getTime(), end);
+    const day = d.getDay();                 // 0 Sun … 6 Sat
+    if (day !== 0 && day !== 6) total += segEnd - cursor;
+    cursor = segEnd;
+  }
+  return total;
+}
+// A flagged email stays hidden until this much business time has elapsed since
+// the latest unanswered client message — "24 hours, minus the weekend".
+const RESPONSE_GRACE_MS = 24 * 60 * 60 * 1000;
+
 function getEmailProjectMap() {
   try {
     return JSON.parse(localStorage.getItem(EMAIL_PROJECT_MAP_STORAGE_KEY) || "{}");
@@ -2777,14 +2813,30 @@ async function getMyWatchlistRow(conversationId) {
   } catch { return null; }
 }
 
+// True if ANY Setty user's row for this thread is 'dismissed'. Used to honor a
+// shared dismiss: once someone clears a thread, it stays cleared for everyone —
+// including a colleague who only opens the email afterward.
+async function isConversationDismissed(conversationId) {
+  if (!conversationId) return false;
+  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId) +
+    "&status=eq.dismissed&select=conversation_id&limit=1";
+  try {
+    const res = await fetch(url, { headers: SB_HEADERS });
+    if (!res.ok) return false;
+    return ((await res.json())?.length || 0) > 0;
+  } catch { return false; }
+}
+
 // Inserts a watchlist row only if THIS user isn't already tracking the thread.
 // This is what makes the classify-on-open hook safe to fire on every email
 // view: re-opening a thread you already dismissed (or that's been answered)
-// must NOT resurrect your row. A colleague's row never blocks yours. Returns
-// true only when a new row was created.
+// must NOT resurrect your row, and a thread any colleague has dismissed stays
+// dismissed for everyone. Returns true only when a new row was created.
 async function addWatchlistEntryIfNew(entry) {
   if (!entry?.conversation_id) return false;
   if (await getMyWatchlistRow(entry.conversation_id)) return false;
+  if (await isConversationDismissed(entry.conversation_id)) return false;
   try {
     const res = await fetch(SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE, {
       method: "POST",
@@ -2813,16 +2865,18 @@ async function getWatchlistOpenItems() {
   } catch { return []; }
 }
 
-// Updates only THIS user's row for the thread — dismiss and answered are both
-// per-user (each person owns their own row). When a teammate replies, every
-// participant's row independently flips to 'answered' on their next render via
-// the Graph check, so "answered" still behaves as shared even though the write
-// is per-row.
-async function setWatchlistStatus(conversationId, status) {
+// Updates watchlist rows for a thread. By default only THIS user's row (the
+// 'answered' flip is per-row — but behaves as shared because every participant's
+// row independently flips on their next Graph check). Pass { allUsers: true } to
+// update EVERY Setty row for the thread at once — that's how a dismiss clears the
+// flag for every colleague who had the same email flagged, not just the clicker.
+async function setWatchlistStatus(conversationId, status, opts = {}) {
   if (!conversationId) return;
-  const url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
-    "?conversation_id=eq." + encodeURIComponent(conversationId) +
-    "&added_by=eq." + encodeURIComponent(watchlistUserKey());
+  let url = SUPABASE_URL + "/rest/v1/" + EMAIL_WATCHLIST_TABLE +
+    "?conversation_id=eq." + encodeURIComponent(conversationId);
+  if (!opts.allUsers) {
+    url += "&added_by=eq." + encodeURIComponent(watchlistUserKey());
+  }
   try {
     await fetch(url, {
       method: "PATCH",
@@ -2835,10 +2889,13 @@ async function setWatchlistStatus(conversationId, status) {
 // The "answered?" check. Asks Graph for the single most recent message in the
 // thread: if its sender is outside Setty, we still owe a reply. A reply from
 // ANY @setty.com address — including a colleague's — counts as answered, so a
-// teammate handling it clears the item for everyone. Falls back to true (keep
-// watching) when Graph can't tell, so a flagged email is never silently lost.
+// teammate handling it clears the item for everyone. Returns { awaiting, since }
+// where `since` is the latest message's timestamp (ms) — when awaiting, that's
+// the unanswered client message, i.e. when our response clock starts. Falls back
+// to { awaiting: true, since: null } when Graph can't tell, so a flagged email
+// is never silently lost.
 async function isThreadAwaitingReply(conversationId) {
-  if (!conversationId) return true;
+  if (!conversationId) return { awaiting: true, since: null };
   // Fetch the conversation's messages and pick the newest CLIENT-SIDE. We must
   // NOT add $orderby here: Graph rejects $filter + $orderby on /me/messages when
   // they reference different properties (conversationId vs receivedDateTime),
@@ -2850,14 +2907,17 @@ async function isThreadAwaitingReply(conversationId) {
   try {
     const data = await graphFetch("GET", path);
     const msgs = data?.value || [];
-    if (!msgs.length) return true;
+    if (!msgs.length) return { awaiting: true, since: null };
     const when = m => new Date(m.receivedDateTime || m.sentDateTime || 0).getTime();
     msgs.sort((a, b) => when(b) - when(a));
     const latestSender = (msgs[0].from?.emailAddress?.address || "").toLowerCase();
-    return !latestSender.endsWith("@setty.com");   // latest msg from Setty = answered
+    return {
+      awaiting: !latestSender.endsWith("@setty.com"),   // latest from Setty = answered
+      since: when(msgs[0]) || null,
+    };
   } catch (e) {
     console.warn("[watchlist] thread check failed:", e?.message || e);
-    return true;   // genuinely couldn't tell — keep watching rather than drop it
+    return { awaiting: true, since: null };   // couldn't tell — keep watching
   }
 }
 
@@ -2901,6 +2961,11 @@ async function maybeAddToWatchlist(myGen) {
     const conversationId = await getCurrentConversationId();
     if (!conversationId || myGen !== itemContextGeneration) return;
 
+    // Best-effort deep link back to this email — lets the panel row reopen the
+    // original. Captured here (not at render) because it needs the live item.
+    const webLink = await getCurrentMessageWebLink();
+    if (myGen !== itemContextGeneration) return;
+
     const added = await addWatchlistEntryIfNew({
       conversation_id: conversationId,
       subject: subject || "(No subject)",
@@ -2910,6 +2975,7 @@ async function maybeAddToWatchlist(myGen) {
       due_date: verdict.dueDates[0] || null,
       score: verdict.score,
       reasons: verdict.reasons,
+      web_link: webLink || null,
       added_by: watchlistUserKey(),
     });
     if (added) void renderResponseWatchlist();
@@ -2934,10 +3000,17 @@ async function renderResponseWatchlist() {
     // Verify each thread in parallel — the open list is small in practice.
     // TODO if it grows past ~15 items: switch to a single Graph $batch request.
     const states = await Promise.all(open.map(r => isThreadAwaitingReply(r.conversation_id)));
+    const now = Date.now();
     const stillOpen = [];
     open.forEach((row, i) => {
-      if (states[i]) stillOpen.push(row);
-      else void setWatchlistStatus(row.conversation_id, "answered");
+      const { awaiting, since } = states[i];
+      if (!awaiting) { void setWatchlistStatus(row.conversation_id, "answered"); return; }
+      // Awaiting a reply — but hold it back until a full business day (24h minus
+      // weekends) has passed without a response. Measure from the latest client
+      // message; fall back to when we first flagged it if Graph couldn't date
+      // the thread. Below the threshold, the row stays 'watching' — just hidden.
+      const startedAt = since ?? new Date(row.added_at).getTime();
+      if (businessMsBetween(startedAt, now) >= RESPONSE_GRACE_MS) stillOpen.push(row);
     });
     if (!stillOpen.length) { block.style.display = "none"; list.innerHTML = ""; return; }
     if (count) count.textContent = String(stillOpen.length);
@@ -2947,16 +3020,22 @@ async function renderResponseWatchlist() {
       const due     = r.due_date
         ? `<span class="wl-due">due ${escHtml(new Date(r.due_date + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }))}</span>`
         : "";
+      const subjHtml = r.web_link
+        ? `<button type="button" class="wl-subject wl-open" data-url="${escHtml(r.web_link)}" title="Open the original email">${escHtml(r.subject || "(No subject)")}</button>`
+        : `<div class="wl-subject">${escHtml(r.subject || "(No subject)")}</div>`;
       return `
         <div class="wl-item">
           <div class="wl-main">
-            <div class="wl-subject">${escHtml(r.subject || "(No subject)")}</div>
+            ${subjHtml}
             <div class="wl-meta">${escHtml(r.client_name || r.client_email || "")}${proj ? " · " + escHtml(proj.name) : ""} · flagged ${escHtml(_relativeTime(r.added_at))}</div>
             <div class="wl-reasons">${escHtml(reasons)} ${due}</div>
           </div>
           <button type="button" class="wl-dismiss" data-cid="${escHtml(r.conversation_id)}" title="Not awaiting a reply — dismiss">×</button>
         </div>`;
     }).join("");
+    list.querySelectorAll(".wl-open").forEach(el => {
+      el.onclick = () => openExternalUrl(el.dataset.url);
+    });
     list.querySelectorAll(".wl-dismiss").forEach(el => {
       el.onclick = () => {
         // Optimistic UI: drop the chip immediately so the click feels instant.
@@ -2969,7 +3048,9 @@ async function renderResponseWatchlist() {
         const remaining = list.querySelectorAll(".wl-item").length;
         if (count) count.textContent = String(remaining);
         if (!remaining) block.style.display = "none";
-        void setWatchlistStatus(cid, "dismissed");
+        // Shared dismiss: clear this thread for every Setty colleague who flagged
+        // it, not just me — keeps the panel quiet across the team.
+        void setWatchlistStatus(cid, "dismissed", { allUsers: true });
       };
     });
     block.style.display = "block";

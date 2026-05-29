@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-05-11-rename-fix";</script>
+  <script>window.__appVersion = "2026-05-29-watchlist-grace";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -586,6 +586,20 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    /* Subject rendered as a button when a deep link to the email exists. */
+    .wl-open {
+      display: block;
+      width: 100%;
+      padding: 0;
+      margin: 0;
+      border: none;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+      font-family: inherit;
+      color: var(--link, #2563eb);
+    }
+    .wl-open:hover { text-decoration: underline; }
     .wl-meta { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
     .wl-reasons { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
     .wl-due {
