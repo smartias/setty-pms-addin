@@ -2895,7 +2895,7 @@ async function setWatchlistStatus(conversationId, status, opts = {}) {
 // to { awaiting: true, since: null } when Graph can't tell, so a flagged email
 // is never silently lost.
 async function isThreadAwaitingReply(conversationId) {
-  if (!conversationId) return { awaiting: true, since: null };
+  if (!conversationId) return { awaiting: true, since: null, webLink: null };
   // Fetch the conversation's messages and pick the newest CLIENT-SIDE. We must
   // NOT add $orderby here: Graph rejects $filter + $orderby on /me/messages when
   // they reference different properties (conversationId vs receivedDateTime),
@@ -2903,21 +2903,24 @@ async function isThreadAwaitingReply(conversationId) {
   // look permanently unanswered. Sorting in JS sidesteps the limitation.
   const filter = "conversationId eq '" + conversationId.replace(/'/g, "''") + "'";
   const path = "/me/messages?$filter=" + encodeURIComponent(filter) +
-    "&$top=50&$select=from,receivedDateTime,sentDateTime";
+    "&$top=50&$select=from,receivedDateTime,sentDateTime,webLink";
   try {
     const data = await graphFetch("GET", path);
     const msgs = data?.value || [];
-    if (!msgs.length) return { awaiting: true, since: null };
+    if (!msgs.length) return { awaiting: true, since: null, webLink: null };
     const when = m => new Date(m.receivedDateTime || m.sentDateTime || 0).getTime();
     msgs.sort((a, b) => when(b) - when(a));
     const latestSender = (msgs[0].from?.emailAddress?.address || "").toLowerCase();
     return {
       awaiting: !latestSender.endsWith("@setty.com"),   // latest from Setty = answered
       since: when(msgs[0]) || null,
+      // The latest message's link — used as a fallback "open original" target
+      // for rows flagged before web_link was stored on the row itself.
+      webLink: msgs[0].webLink || null,
     };
   } catch (e) {
     console.warn("[watchlist] thread check failed:", e?.message || e);
-    return { awaiting: true, since: null };   // couldn't tell — keep watching
+    return { awaiting: true, since: null, webLink: null };   // couldn't tell — keep watching
   }
 }
 
@@ -3003,14 +3006,18 @@ async function renderResponseWatchlist() {
     const now = Date.now();
     const stillOpen = [];
     open.forEach((row, i) => {
-      const { awaiting, since } = states[i];
+      const { awaiting, since, webLink } = states[i];
       if (!awaiting) { void setWatchlistStatus(row.conversation_id, "answered"); return; }
       // Awaiting a reply — but hold it back until a full business day (24h minus
       // weekends) has passed without a response. Measure from the latest client
       // message; fall back to when we first flagged it if Graph couldn't date
       // the thread. Below the threshold, the row stays 'watching' — just hidden.
       const startedAt = since ?? new Date(row.added_at).getTime();
-      if (businessMsBetween(startedAt, now) >= RESPONSE_GRACE_MS) stillOpen.push(row);
+      if (businessMsBetween(startedAt, now) < RESPONSE_GRACE_MS) return;
+      // Backfill the "open original" link for rows flagged before web_link was
+      // stored, using the latest message's link from the thread check above.
+      if (!row.web_link && webLink) row.web_link = webLink;
+      stillOpen.push(row);
     });
     if (!stillOpen.length) { block.style.display = "none"; list.innerHTML = ""; return; }
     if (count) count.textContent = String(stillOpen.length);
