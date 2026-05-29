@@ -3830,7 +3830,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
   // uploadedFiles[]: per-file metadata for the audit log. Each successful upload
   // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
   // sha256 + verified once read-back lands.
-  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [] };
+  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [] };
   const bodyHtml = await getEmailBodyHtml(token);
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
@@ -3889,6 +3889,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
     if (officeAtts.length) {
       lastAttachmentUploadStats.attempted = officeAtts.length;
       const uniqueNames = uniquifyNames(officeAtts.map(a => a.name));
+      lastAttachmentUploadStats.attemptedNames = uniqueNames;
       const { succeeded, failures } = await uploadInBatches(
         officeAtts,
         async (att) => {
@@ -3912,6 +3913,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
     const fileAtts = (attData?.value || []).filter(att => att["@odata.type"] === "#microsoft.graph.fileAttachment");
     lastAttachmentUploadStats.attempted = fileAtts.length;
     const uniqueGraphNames = uniquifyNames(fileAtts.map(a => a.name));
+    lastAttachmentUploadStats.attemptedNames = uniqueGraphNames;
 
     const { succeeded, failures } = await uploadInBatches(fileAtts, async (att) => {
       let bytes = null;
@@ -3968,6 +3970,28 @@ function toBytesFromBase64(base64) {
 // user clicks a different email, and a getAttachmentContentAsync call
 // against the new item with an attachment ID from the old item produces
 // either an error or — worse — bytes that *look* valid but are wrong.
+// Returns only the names of file-type attachments — no byte fetch. Cheap.
+// Used by "save to project record only" path where we don't upload anything
+// but still want PMS to display the attachment list. Silent on failure
+// (returns []) since names are metadata, not data — non-fatal if missing.
+async function getAttachmentNamesOnly(item) {
+  item = item || emailItem;
+  if (!item?.getAttachmentsAsync) return [];
+  return new Promise((resolve) => {
+    item.getAttachmentsAsync((res) => {
+      if (res.status === Office.AsyncResultStatus.Succeeded) {
+        const names = (res.value || [])
+          .filter(a => a.attachmentType === Office.MailboxEnums.AttachmentType.File)
+          .map(a => a.name)
+          .filter(Boolean);
+        resolve(names);
+      } else {
+        resolve([]);
+      }
+    });
+  });
+}
+
 async function getOfficeFileAttachments(item) {
   item = item || emailItem;
   if (!item?.getAttachmentsAsync || !item?.getAttachmentContentAsync) return [];
@@ -4602,6 +4626,10 @@ if (existingRecord) {
     const attCount    = await uploadEmailAndAttachments(driveId, token, targetPath, snapItem);
     const spFolderUrl = SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/Emails/" + encodeURIComponent(emailFolderName);
     const msgId = currentMsgId;
+    // Capture attachment names from the upload stats so PMS displays them on
+    // the saved email card. Names are populated by uploadEmailAndAttachments
+    // even if some uploads later failed — the email still HAS the attachments.
+    const attachmentNames = (lastAttachmentUploadStats?.attemptedNames || []).slice();
     const emailRecord = {
       id: uid(), msgId,
       subject: snapSubject,
@@ -4611,6 +4639,8 @@ if (existingRecord) {
       bodyText: "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
+      hasAttachments: attachmentNames.length > 0,
+      attachmentNames,
       spFolderUrl, links: [],
       savedAt: new Date().toISOString(),
     };
@@ -4726,6 +4756,9 @@ async function _doSaveToProjectRecordOnly() {
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
+    // Lightweight metadata fetch — names only, no byte download. Non-fatal
+    // if it fails (empty array, the email still saves correctly).
+    const attachmentNames = await getAttachmentNamesOnly(emailItem);
     const emailRecord = {
       id: uid(), msgId,
       subject: emailItem.subject || "",
@@ -4735,6 +4768,8 @@ async function _doSaveToProjectRecordOnly() {
       bodyText: "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
+      hasAttachments: attachmentNames.length > 0,
+      attachmentNames,
       spFolderUrl: "", links: [],
       savedAt: new Date().toISOString(),
       savedToSharePoint: false,
