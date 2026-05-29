@@ -1191,6 +1191,12 @@
   <button class="btn btn-teal" id="saveContactBtn">💾 Save Contact</button>
 </div>
 
-<script src="taskpane.js"></script>
+<!--
+  Cache-bust: bump the ?v=YYYYMMDD-N value below whenever taskpane.js is
+  deployed so Office's WebView2 fetches the new file instead of serving a
+  cached one. Without this, even a full Outlook restart can keep loading
+  stale JS until the WebView2 cache naturally expires.
+-->
+<script src="taskpane.js?v=20260529-2"></script>
 </body>
 </html>

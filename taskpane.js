@@ -3972,24 +3972,50 @@ function toBytesFromBase64(base64) {
 // either an error or — worse — bytes that *look* valid but are wrong.
 // Returns only the names of file-type attachments — no byte fetch. Cheap.
 // Used by "save to project record only" path where we don't upload anything
-// but still want PMS to display the attachment list. Silent on failure
-// (returns []) since names are metadata, not data — non-fatal if missing.
-async function getAttachmentNamesOnly(item) {
+// but still want PMS to display the attachment list.
+//
+// TWO PATHS, in order:
+//   1. Office.js getAttachmentsAsync — local, no network. Works most of the time.
+//   2. Graph /me/messages/{id}/attachments — fallback when Office.js silently
+//      returns 0 attachments despite the email actually having some. This
+//      happens in some account configurations and Office versions; mirrors
+//      the same fallback uploadEmailAndAttachments uses.
+//
+// Silent on failure (returns []) since names are metadata, not data.
+async function getAttachmentNamesOnly(item, token) {
   item = item || emailItem;
-  if (!item?.getAttachmentsAsync) return [];
-  return new Promise((resolve) => {
-    item.getAttachmentsAsync((res) => {
-      if (res.status === Office.AsyncResultStatus.Succeeded) {
-        const names = (res.value || [])
-          .filter(a => a.attachmentType === Office.MailboxEnums.AttachmentType.File)
-          .map(a => a.name)
-          .filter(Boolean);
-        resolve(names);
-      } else {
-        resolve([]);
-      }
+  // Try Office.js first
+  if (item?.getAttachmentsAsync) {
+    const officeNames = await new Promise((resolve) => {
+      item.getAttachmentsAsync((res) => {
+        if (res.status === Office.AsyncResultStatus.Succeeded) {
+          const names = (res.value || [])
+            .filter(a => a.attachmentType === Office.MailboxEnums.AttachmentType.File)
+            .map(a => a.name)
+            .filter(Boolean);
+          resolve(names);
+        } else {
+          resolve([]);
+        }
+      });
     });
-  });
+    if (officeNames.length > 0) return officeNames;
+  }
+  // Graph fallback — only if Office.js gave us nothing AND caller provided a token
+  if (token && item?.itemId) {
+    try {
+      const restId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
+      const data = await graphFetch("GET", "/me/messages/" + restId + "/attachments?$select=name,contentType,size", null, token);
+      return (data?.value || [])
+        .filter(a => a["@odata.type"] === "#microsoft.graph.fileAttachment")
+        .map(a => a.name)
+        .filter(Boolean);
+    } catch (e) {
+      console.warn("Graph attachment list failed:", e.message);
+      return [];
+    }
+  }
+  return [];
 }
 
 async function getOfficeFileAttachments(item) {
@@ -4766,9 +4792,10 @@ async function _doSaveToProjectRecordOnly() {
     const from = emailItem.from;
     const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
     const cc = (emailItem.cc || []).map(r => r.emailAddress).filter(Boolean).join(", ");
-    // Lightweight metadata fetch — names only, no byte download. Non-fatal
-    // if it fails (empty array, the email still saves correctly).
-    const attachmentNames = await getAttachmentNamesOnly(emailItem);
+    // Lightweight metadata fetch — names only, no byte download. Tries
+    // Office.js first, falls back to Graph if Office.js reports 0 attachments
+    // (which it sometimes silently does even when attachments exist).
+    const attachmentNames = await getAttachmentNamesOnly(emailItem, token);
     const emailRecord = {
       id: uid(), msgId,
       subject: emailItem.subject || "",
