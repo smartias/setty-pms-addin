@@ -2914,9 +2914,11 @@ async function isThreadAwaitingReply(conversationId) {
     return {
       awaiting: !latestSender.endsWith("@setty.com"),   // latest from Setty = answered
       since: when(msgs[0]) || null,
-      // The latest message's link — used as a fallback "open original" target
-      // for rows flagged before web_link was stored on the row itself.
+      // The latest message's link + id — used as fallback "open original"
+      // targets for rows flagged before web_link/item_id were stored. restId is
+      // the Graph id (always returned); the render converts it to an EWS id.
       webLink: msgs[0].webLink || null,
+      restId: msgs[0].id || null,
     };
   } catch (e) {
     console.warn("[watchlist] thread check failed:", e?.message || e);
@@ -2979,6 +2981,7 @@ async function maybeAddToWatchlist(myGen) {
       score: verdict.score,
       reasons: verdict.reasons,
       web_link: webLink || null,
+      item_id: emailItem?.itemId || null,   // EWS id → native open in desktop Outlook
       added_by: watchlistUserKey(),
     });
     if (added) void renderResponseWatchlist();
@@ -3006,7 +3009,7 @@ async function renderResponseWatchlist() {
     const now = Date.now();
     const stillOpen = [];
     open.forEach((row, i) => {
-      const { awaiting, since, webLink } = states[i];
+      const { awaiting, since, webLink, restId } = states[i];
       if (!awaiting) { void setWatchlistStatus(row.conversation_id, "answered"); return; }
       // Awaiting a reply — but hold it back until a full business day (24h minus
       // weekends) has passed without a response. Measure from the latest client
@@ -3014,9 +3017,13 @@ async function renderResponseWatchlist() {
       // the thread. Below the threshold, the row stays 'watching' — just hidden.
       const startedAt = since ?? new Date(row.added_at).getTime();
       if (businessMsBetween(startedAt, now) < RESPONSE_GRACE_MS) return;
-      // Backfill the "open original" link for rows flagged before web_link was
-      // stored, using the latest message's link from the thread check above.
+      // Backfill "open original" targets for rows flagged before web_link/item_id
+      // were stored, using the latest message from the thread check above. The
+      // EWS id (for native desktop open) is converted from the Graph id.
       if (!row.web_link && webLink) row.web_link = webLink;
+      if (!row.item_id && restId) {
+        try { row.item_id = Office.context.mailbox.convertToEwsId(restId, Office.MailboxEnums.RestVersion.v2_0); } catch { /* keep web_link fallback */ }
+      }
       stillOpen.push(row);
     });
     if (!stillOpen.length) { block.style.display = "none"; list.innerHTML = ""; return; }
@@ -3027,8 +3034,8 @@ async function renderResponseWatchlist() {
       const due     = r.due_date
         ? `<span class="wl-due">due ${escHtml(new Date(r.due_date + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }))}</span>`
         : "";
-      const subjHtml = r.web_link
-        ? `<button type="button" class="wl-subject wl-open" data-url="${escHtml(r.web_link)}" title="Open the original email">${escHtml(r.subject || "(No subject)")}</button>`
+      const subjHtml = (r.web_link || r.item_id)
+        ? `<button type="button" class="wl-subject wl-open" data-itemid="${escHtml(r.item_id || "")}" data-url="${escHtml(r.web_link || "")}" title="Open the original email">${escHtml(r.subject || "(No subject)")}</button>`
         : `<div class="wl-subject">${escHtml(r.subject || "(No subject)")}</div>`;
       return `
         <div class="wl-item">
@@ -3041,7 +3048,7 @@ async function renderResponseWatchlist() {
         </div>`;
     }).join("");
     list.querySelectorAll(".wl-open").forEach(el => {
-      el.onclick = () => openExternalUrl(el.dataset.url);
+      el.onclick = () => openWatchlistEmail(el.dataset.itemid, el.dataset.url);
     });
     list.querySelectorAll(".wl-dismiss").forEach(el => {
       el.onclick = () => {
@@ -7624,6 +7631,22 @@ function openExternalUrl(url) {
     console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
   window.open(url, "_blank");
+}
+// Opens the original email behind a watchlist row. Prefers Outlook's native
+// message form so desktop users stay in their client; falls back to the web
+// link (OWA in a browser) when there's no item id or the native call fails.
+function openWatchlistEmail(itemId, webLink) {
+  if (itemId) {
+    try {
+      if (Office?.context?.mailbox?.displayMessageForm) {
+        Office.context.mailbox.displayMessageForm(itemId);
+        return;
+      }
+    } catch (e) {
+      console.warn("displayMessageForm failed, falling back to web link:", e);
+    }
+  }
+  if (webLink) openExternalUrl(webLink);
 }
 function normalizeEmail(v) {
   return (v || "").trim().toLowerCase();
