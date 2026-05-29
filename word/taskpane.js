@@ -35,6 +35,7 @@ let allProjects = [];
 let allClients = []; // global directory — used by the POC picker
 let selectedProject = null;
 let docFilename = "";
+let currentDocUrl = "";   // full URL of the open document ("" if unsaved); http(s) = cloud-hosted (AutoSaves)
 let docFirstPageText = "";
 let saveInFlight = false;
 let docStatus = "draft"; // persisted in Office document settings
@@ -125,6 +126,48 @@ function setupListeners() {
   document.getElementById("openSpFolderBtn").onclick  = openSelectedProjectSpFolder;
   document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
   document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
+  document.getElementById("titleInput").addEventListener("input", updateSavePreview);
+  document.getElementById("conflictReplaceBtn").onclick = () => _conflictResolver && _conflictResolver("replace");
+  document.getElementById("conflictRenameBtn").onclick  = () => _conflictResolver && _conflictResolver("rename");
+  document.getElementById("conflictCancelBtn").onclick  = () => _conflictResolver && _conflictResolver("cancel");
+}
+
+// ─── NAME-CONFLICT GUARD ───────────────────────────────────────────────────────
+// True if a file already lives at targetPath/filename in the SP drive. A 404
+// means the name is free; any error falls back to false so a check failure can
+// never block a save.
+async function spFileExists(targetPath, filename) {
+  try {
+    const token = await getToken();
+    const safeName = filename.replace(/[\\/:*?"<>|]/g, "_");
+    const url = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID
+      + "/root:/" + encodeDrivePath(targetPath + "/" + safeName);
+    const res = await fetch(url, { headers: { "Authorization": "Bearer " + token } });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Inline prompt shown when a first-time save would collide with an existing
+// file. Resolves to "replace" | "rename" | "cancel". Promise-based so doSaveDraft
+// can simply `await` the user's choice.
+let _conflictResolver = null;
+function askNameConflict(filename) {
+  return new Promise((resolve) => {
+    const card = document.getElementById("conflictCard");
+    const msg  = document.getElementById("conflictMsg");
+    const renameBtn = document.getElementById("conflictRenameBtn");
+    if (!card) { resolve("rename"); return; }   // no UI — preserve old behavior
+    msg.innerHTML = `<b>${escapeHtml(filename)}</b> already exists in this folder. What would you like to do?`;
+    if (renameBtn) renameBtn.textContent = `Save as “${filename.replace(/\.docx$/i, "")} (1)”`;
+    card.style.display = "block";
+    _conflictResolver = (choice) => {
+      card.style.display = "none";
+      _conflictResolver = null;
+      resolve(choice);
+    };
+  });
 }
 
 // Collapse the search + list into the compact pill once a project is chosen.
@@ -177,7 +220,27 @@ function updateDestCard() {
       : "";
     if (display) display.textContent = rel || "project root";
   }
+  updateSavePreview();
   updateFiledCard();
+}
+
+// Live "this is what gets saved" line under the File name field — combines the
+// typed name, the .docx extension, and the destination folder so there's no
+// guessing what the save will produce or where it lands.
+function updateSavePreview() {
+  const el = document.getElementById("savePreview");
+  if (!el) return;
+  const base = (document.getElementById("titleInput")?.value || "").trim().replace(/\.(docx|pdf)$/i, "");
+  if (!base || !selectedProject) { el.style.display = "none"; return; }
+  el.style.display = "block";
+  if (selectedProject.projectFolderUrl) {
+    const rel = spCurrentPath && spProjectRootPath && spCurrentPath.startsWith(spProjectRootPath)
+      ? spCurrentPath.slice(spProjectRootPath.length).replace(/^\/+/, "")
+      : "";
+    el.innerHTML = `Saves as <b>${escapeHtml(base)}.docx</b> in 📂 ${escapeHtml(rel || "project root")}`;
+  } else {
+    el.innerHTML = `Saves as <b>${escapeHtml(base)}.docx</b>`;
+  }
 }
 
 // Confirmation card shown once a .docx draft has been filed to SharePoint.
@@ -195,22 +258,65 @@ function updateFiledCard() {
       : (draftFolderPath || "project root");
     nameEl.textContent = (draftFileName || "(filed)") + "  ·  " + folder;
   }
+
+  const headEl = document.getElementById("filedHead");
+  const hintEl = document.getElementById("filedHint");
+  const openBtn = document.getElementById("openSpCopyBtn");
+  const openAlt = document.getElementById("openSpCopyAltLink");
+
+  // If the open document is itself cloud-hosted (http/https URL), it's the
+  // SharePoint copy — edits AutoSave and there's nothing to reopen. Show a calm
+  // confirmation and hide the open actions, so people aren't told to "open the
+  // SharePoint copy" when they're already in it.
+  const inCloudCopy = /^https?:\/\//i.test(currentDocUrl || "");
+  if (inCloudCopy) {
+    if (headEl) headEl.textContent = "✓ Filed — AutoSave is on";
+    if (hintEl) hintEl.textContent = "You're editing the SharePoint copy. Changes save automatically.";
+    if (openBtn) openBtn.style.display = "none";
+    if (openAlt) openAlt.style.display = "none";
+    return;
+  }
+
+  // Detached local copy — edits here don't sync until the SP copy is opened.
+  if (headEl) headEl.textContent = "✓ Draft filed to SharePoint";
+  if (hintEl) hintEl.textContent = "This open document is a local copy — edits here won't sync. Open the SharePoint copy to keep working with AutoSave.";
   // The "open the copy" button only works if we know the SharePoint URL — a
   // copy reopened from SharePoint itself may not carry one.
-  const openBtn = document.getElementById("openSpCopyBtn");
   if (openBtn) {
     if (draftWebUrl) {
       openBtn.style.display = "block";
-      // Desktop Word opens the SharePoint copy via the ms-word: protocol so it
-      // lands in the desktop app; Word on the web just opens the file URL (the
-      // browser editor AutoSaves to SharePoint too).
-      const isWeb = Office.context.platform === Office.PlatformType.OfficeOnline;
-      openBtn.href   = isWeb ? draftWebUrl : ("ms-word:ofe|u|" + draftWebUrl);
-      openBtn.target = isWeb ? "_blank" : "_self";
+      // Drive the open from a click handler, NOT a static href. A clicked
+      // <a href="ms-word:ofe|u|…"> inside the add-in webview can decode the
+      // URL's %20 back into a literal space, which truncates the command and
+      // makes Word throw "Office doesn't recognize the command it was given".
+      openBtn.onclick = (e) => { e.preventDefault(); openSharePointCopy(); };
+      openBtn.removeAttribute("href");
+      // Browser fallback — always works (Word on the web AutoSaves too) and is
+      // the escape hatch if the desktop protocol still chokes on an odd name.
+      if (openAlt) {
+        const isWeb = Office.context.platform === Office.PlatformType.OfficeOnline;
+        openAlt.style.display = isWeb ? "none" : "block";
+        openAlt.onclick = (e) => { e.preventDefault(); window.open(draftWebUrl, "_blank"); };
+      }
     } else {
       openBtn.style.display = "none";
+      if (openAlt) openAlt.style.display = "none";
     }
   }
+}
+
+// Opens the filed SharePoint copy so further edits AutoSave. On the web the file
+// URL opens Word on the web directly; on desktop the ms-word:ofe protocol hands
+// the file to the desktop app. encodeURI guarantees the URL stays percent-encoded
+// (no literal spaces) so the protocol command can't be truncated — the root cause
+// of the "Office doesn't recognize the command it was given" error.
+function openSharePointCopy() {
+  if (!draftWebUrl) return;
+  if (Office.context.platform === Office.PlatformType.OfficeOnline) {
+    window.open(draftWebUrl, "_blank");
+    return;
+  }
+  window.location.href = "ms-word:ofe|u|" + encodeURI(draftWebUrl);
 }
 
 function openSelectedProjectInPms() {
@@ -272,6 +378,7 @@ async function renderSpPicker() {
   // Mirror the current folder into the destination card display.
   const destDisplay = document.getElementById("destFolderDisplay");
   if (destDisplay) destDisplay.textContent = parts.length ? parts.join(" / ") : "project root";
+  updateSavePreview();
   crumbs.querySelectorAll("span").forEach(s => {
     s.onclick = async () => {
       const depth = parseInt(s.getAttribute("data-depth"), 10);
@@ -526,6 +633,7 @@ function prettyDocLocation(url) {
 async function loadDocumentContext() {
   // Filename — resolved via the async Office API (see getDocumentUrl above).
   const docUrl = await getDocumentUrl();
+  currentDocUrl = docUrl;
   docFilename = docUrl.split(/[\\/]/).pop() || "";
   document.getElementById("docFilename").textContent = docFilename || "(unsaved document)";
   // Show where the document currently lives so a reopened file's location is
@@ -848,17 +956,24 @@ async function postPdfPrintoutToOneNote(project, pageTitle, pdfBlob) {
   const safeTitle = pageTitle.replace(/[<&>]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[c]));
   const safeProj  = (project.projectNumber || "").replace(/[<&>]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[c]));
   const created   = new Date().toISOString();
-  const fileName  = docFilename || "document.pdf";
+  // The blob is a PDF, so name the attachment .pdf regardless of the source
+  // .docx name — otherwise OneNote stored PDF bytes under a .docx name.
+  const fileName  = (docFilename ? docFilename.replace(/\.[^.]+$/, "") : "document") + ".pdf";
 
   // OneNote multipart: HTML "Presentation" part + named PDF binary part.
-  // The <object> with type="application/pdf" tells OneNote to render the PDF
-  // as a printout (one image per page) inside the note.
+  //   • <img data-render-src> renders the PDF's pages as images — the actual
+  //     "printout" (one image per page) the user sees inline.
+  //   • <object data-attachment> attaches the same part as a downloadable file.
+  // Both point at the same multipart part ("filePart"). Previously only the
+  // <object> was present, so OneNote showed a file icon, not a printout.
   const presentation =
     `<!DOCTYPE html><html><head><title>${safeTitle}</title><meta name="created" content="${created}" /></head><body>` +
     `<div style="border-bottom:2px solid #003865;padding-bottom:8px;margin-bottom:16px;font-family:sans-serif">` +
     `<span style="background:#003865;color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;margin-right:6px">${safeProj}</span>` +
     `<span style="font-size:11px;color:#666">${escapeHtml(fileName)}</span>` +
     `</div>` +
+    `<img data-render-src="name:filePart" alt="${escapeHtml(pageTitle)}" width="800" />` +
+    `<p style="font-family:sans-serif;font-size:11px;color:#666;margin-top:12px">📎 Attached file:</p>` +
     `<object data-attachment="${escapeHtml(fileName)}" data="name:filePart" type="application/pdf" />` +
     `</body></html>`;
 
@@ -1193,6 +1308,20 @@ async function doSaveDraft() {
     && uploadFilename === draftBaseName
     && spCurrentPath  === draftFolderPath;
 
+  // First-time (or renamed/moved) save: if the target name is already taken,
+  // ask how to resolve it instead of silently appending " (1)".
+  let conflictBehavior = "rename";
+  if (!sameDraft && await spFileExists(spCurrentPath, uploadFilename)) {
+    const choice = await askNameConflict(uploadFilename);
+    if (choice === "cancel") {
+      setStatus("spStatus", "info", "Save cancelled.");
+      saveInFlight = false;
+      updateSaveButtons();
+      return;
+    }
+    conflictBehavior = choice;   // "replace" overwrites in place; "rename" keeps both
+  }
+
   try {
     setStatus("spStatus", "info", "⏳ Exporting .docx…");
     // Stage the project/status tags into the document before reading it out, so
@@ -1205,7 +1334,7 @@ async function doSaveDraft() {
     // can differ from the intended name if the first save hit a name clash.
     const item = sameDraft
       ? await uploadDocxToSharePoint(selectedProject, docxBlob, draftFileName, draftFolderPath, "replace")
-      : await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath, "rename");
+      : await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath, conflictBehavior);
 
     // Commit the filed-draft state — only now that the upload has succeeded.
     draftSaved      = true;

@@ -338,6 +338,31 @@
     /* Title field — visible labeled input, not hidden behind an opt-line */
     .title-field { margin-bottom: 8px; }
     .title-field label { margin-bottom: 3px; }
+    .save-preview {
+      margin-top: 5px;
+      font-size: 11px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .save-preview b { color: var(--text); font-weight: 600; }
+    /* Name-conflict prompt */
+    .conflict-card {
+      border: 1px solid #b45309;
+      background: rgba(245,158,11,0.08);
+      border-radius: 4px;
+      padding: 10px 12px;
+      margin-top: 10px;
+    }
+    .conflict-msg { font-size: 12px; color: var(--text); margin-bottom: 8px; word-break: break-all; }
+    .conflict-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .conflict-btn {
+      flex: 1; min-width: 88px; width: auto;
+      background: var(--panel); border: 1px solid var(--border); color: var(--text);
+      font-size: 11px; font-weight: 600; padding: 7px 8px; border-radius: 4px;
+    }
+    .conflict-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .conflict-replace { border-color: #b45309; color: #fbbf24; }
+    .conflict-cancel { color: var(--muted); }
 
     /* ── Document status bar ───────────────────────────────────────────── */
     .status-bar {
@@ -575,60 +600,7 @@
         <div class="doc-location" id="docLocation" style="display:none"></div>
       </div>
 
-      <!-- Document name — used for all save operations -->
-      <div id="titleFieldWrap" class="title-field">
-        <label for="titleInput">Document Name</label>
-        <input type="text" id="titleInput" placeholder="Document name" />
-      </div>
-
-      <!-- Destination — save location; updates as folder is browsed -->
-      <div id="destCard" style="display:none; margin-bottom:8px;">
-        <div class="dest-display">
-          <span>📂</span>
-          <span class="dest-path" id="destFolderDisplay">project root</span>
-          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
-        </div>
-        <div class="opt-edit" id="spFolderEdit">
-          <div class="sp-picker" style="margin-top:0">
-            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
-            <div class="sp-folders" id="spFolders"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Draft-filed confirmation — appears once a .docx draft is filed to
-           SharePoint. "Open the SharePoint copy" is the real fix for AutoSave:
-           the document open here is a detached local copy that never syncs on
-           its own; the SharePoint-hosted copy AutoSaves natively. -->
-      <div id="draftFiledCard" style="display:none; margin-bottom:8px;">
-        <div class="filed-card">
-          <div class="filed-head">✓ Draft filed to SharePoint</div>
-          <div class="filed-name" id="filedName"></div>
-          <a id="openSpCopyBtn" class="filed-open-btn" style="display:none">✏️ Open the SharePoint copy in Word</a>
-          <div class="filed-hint">
-            This open document is a local copy — edits here won't sync. Open the
-            SharePoint copy to keep working with AutoSave.
-          </div>
-        </div>
-      </div>
-
-      <!-- Document status — set automatically when PDF is exported -->
-      <div class="status-bar" id="statusBar">
-        <span class="status-dot" id="statusDot"></span>
-        <span class="status-label-text" id="statusLabelText">Draft</span>
-        <span class="status-hint" id="statusHint"></span>
-      </div>
-
-      <!-- Done-editing checklist — kept as a sign-off record after Final -->
-      <div id="doneEditingSection" class="done-section" style="display:none">
-        <div class="done-section-header">
-          <span class="done-section-label">Done editing</span>
-          <button id="toggleDoneBtn" class="done-toggle-btn">Mark me done</button>
-        </div>
-        <div id="doneEditingList"><div class="done-empty">No one has marked done yet.</div></div>
-      </div>
-
-      <!-- Project: search + list (visible until selection), then collapses to a compact pill -->
+      <!-- ① Project: search + list (visible until selection), then collapses to a compact pill -->
       <div id="projectPickerWrap">
         <div id="projectSearchWrap" class="field">
           <label for="searchInput">Project</label>
@@ -647,7 +619,29 @@
         </div>
       </div>
 
-      <!-- Save row — two buttons side by side, prominent and at the top.
+      <!-- ② File name — drives every save (filename + OneNote title) -->
+      <div id="titleFieldWrap" class="title-field">
+        <label for="titleInput">File name</label>
+        <input type="text" id="titleInput" placeholder="Document name" />
+        <div id="savePreview" class="save-preview" style="display:none"></div>
+      </div>
+
+      <!-- ③ Destination — save location; updates as folder is browsed -->
+      <div id="destCard" style="display:none; margin-bottom:8px;">
+        <div class="dest-display">
+          <span>📂</span>
+          <span class="dest-path" id="destFolderDisplay">project root</span>
+          <button id="destChangeBtn" class="dest-change-btn">✏ change</button>
+        </div>
+        <div class="opt-edit" id="spFolderEdit">
+          <div class="sp-picker" style="margin-top:0">
+            <div class="sp-breadcrumbs" id="spBreadcrumbs">Pick a project first.</div>
+            <div class="sp-folders" id="spFolders"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ④ Save actions — the primary buttons, right after the destination.
            Each button is tinted to its destination app (Word / OneNote /
            Bluebeam) with a matching white letter-tile icon. JS updates only
            the .brand-label span, so the icon survives every relabel. -->
@@ -666,10 +660,54 @@
         <span class="brand-label" id="savePdfLabel">Export PDF to SharePoint</span>
       </button>
 
+      <!-- Name-conflict prompt — shown when a first-time save would hit an
+           existing filename. Replaces the old silent " (1)" auto-rename. -->
+      <div id="conflictCard" class="conflict-card" style="display:none">
+        <div class="conflict-msg" id="conflictMsg"></div>
+        <div class="conflict-actions">
+          <button id="conflictReplaceBtn" class="conflict-btn conflict-replace">Replace</button>
+          <button id="conflictRenameBtn" class="conflict-btn">Save as copy</button>
+          <button id="conflictCancelBtn" class="conflict-btn conflict-cancel">Cancel</button>
+        </div>
+      </div>
+
       <div id="oneNoteStatus" class="status"></div>
       <div id="oneNoteLink" class="footer-link"></div>
       <div id="spStatus" class="status"></div>
       <div id="spLink" class="footer-link"></div>
+
+      <!-- ⑤ Draft-filed confirmation — appears once a .docx draft is filed to
+           SharePoint. "Open the SharePoint copy" is the real fix for AutoSave:
+           the document open here is a detached local copy that never syncs on
+           its own; the SharePoint-hosted copy AutoSaves natively. -->
+      <div id="draftFiledCard" style="display:none; margin-top:10px; margin-bottom:8px;">
+        <div class="filed-card">
+          <div class="filed-head" id="filedHead">✓ Draft filed to SharePoint</div>
+          <div class="filed-name" id="filedName"></div>
+          <a id="openSpCopyBtn" class="filed-open-btn" style="display:none">✏️ Open the SharePoint copy in Word</a>
+          <a id="openSpCopyAltLink" href="#" style="display:none;font-size:11px;color:var(--accent);text-align:center;margin-top:6px;text-decoration:underline;cursor:pointer">Didn't open? Open in browser instead →</a>
+          <div class="filed-hint" id="filedHint">
+            This open document is a local copy — edits here won't sync. Open the
+            SharePoint copy to keep working with AutoSave.
+          </div>
+        </div>
+      </div>
+
+      <!-- ⑥ Document status — set automatically when PDF is exported -->
+      <div class="status-bar" id="statusBar">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-label-text" id="statusLabelText">Draft</span>
+        <span class="status-hint" id="statusHint"></span>
+      </div>
+
+      <!-- Done-editing checklist — kept as a sign-off record after Final -->
+      <div id="doneEditingSection" class="done-section" style="display:none">
+        <div class="done-section-header">
+          <span class="done-section-label">Done editing</span>
+          <button id="toggleDoneBtn" class="done-toggle-btn">Mark me done</button>
+        </div>
+        <div id="doneEditingList"><div class="done-empty">No one has marked done yet.</div></div>
+      </div>
 
       <!-- Insert: smaller, lower in the pane since saves are the primary action -->
       <div class="section-tight">
