@@ -7308,6 +7308,7 @@ async function createMilestoneCalendarEvent(milestone, project) {
     isReminderOn: false,
     start: { dateTime: milestone.dueDate + "T00:00:00", timeZone: "Eastern Standard Time" },
     end:   { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" },
+    categories: ["PMS Milestone"],
   };
   try {
     const token = await getToken();
