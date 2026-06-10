@@ -968,19 +968,23 @@
       <a id="scSharePointLink" href="#" style="display:none;">📂 Open SharePoint folder →</a>
     </div>
   </div>
-  <button class="btn btn-onenote" id="logNoteBtn">📓 Log as Note</button>
-  <button class="btn btn-teams" id="sendToTeamsBtn">💬 Send to Teams Channel</button>
-  <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
+  <!-- Featured when this email has people worth capturing (badge + tint via
+       updatePeopleButtonBadge); hidden entirely when there's nothing to add,
+       so it never takes space as a dead button. -->
+  <button class="btn btn-secondary" id="addParticipantBtn" style="display:none;">👥 Add Participant to Contacts</button>
 
   <!-- More — collapsed by default; persists open state in localStorage -->
   <details class="more-expander" id="moreActions">
     <summary>More actions</summary>
     <div class="more-body">
+      <button class="btn btn-onenote" id="logNoteBtn">📓 Log as Note</button>
+      <button class="btn btn-teams" id="sendToTeamsBtn">💬 Send to Teams Channel</button>
+      <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
+      <hr class="divider"/>
       <button class="btn btn-secondary" id="logRfiBtn">🔵 Log as RFI</button>
       <button class="btn btn-secondary" id="logSubBtn">📋 Log as Submittal</button>
       <hr class="divider"/>
       <button class="btn btn-secondary" id="manualMilestoneBtn">📅 New Milestone</button>
-      <button class="btn btn-secondary" id="addParticipantBtn">👥 Add Participant to Contacts</button>
       <hr class="divider"/>
       <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
       <button class="btn btn-ghost" id="signOutBtn">Sign out</button>

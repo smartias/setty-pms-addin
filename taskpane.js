@@ -148,6 +148,10 @@ function applyComposeModeUiGuard() {
     "logNoteBtn", "sendToTeamsBtn", "newActionItemBtn",
     "moreActions", "oneNoteLinkBanner",
     "dateSuggestionBlock",
+    // Top-level now (no longer inside moreActions) — keep the old compose-
+    // hidden behavior. NOTE: in read mode this guard resets display to "";
+    // updatePeopleButtonBadge runs after and applies the real visibility.
+    "addParticipantBtn",
   ];
   // Hide in Read: templates only make sense while composing a reply.
   const hiddenInRead = ["quickTemplatesSection"];
@@ -2534,7 +2538,7 @@ function refreshCalendarStatus() {
     if (logNoteBtn) logNoteBtn.disabled = true;
   } else {
     setStatus("actionStatus", "info",
-      "Calendar event detected: use 'Log as Note' for meetings/site visits and 'Add Participant to Contacts' for attendees.");
+      "Calendar event detected: use 'Log as Note' (under More actions) for meetings/site visits and 'Add Participant to Contacts' for attendees.");
     if (logNoteBtn) logNoteBtn.disabled = false;
   }
 }
@@ -3361,7 +3365,10 @@ function updatePeopleButtonBadge() {
   const statuses = (emailParticipants || []).map(getParticipantDirectoryStatus);
   const newCount = statuses.filter(s => s.isNew).length;
   const addableToProject = statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length;
-  btn.style.display = (newCount > 0 || addableToProject > 0) ? "" : "none";
+  // Hidden in compose (nothing filed yet — mirrors applyComposeModeUiGuard)
+  // and whenever there's no one actionable.
+  const compose = (typeof isComposeMode === "function") && isComposeMode();
+  btn.style.display = (!compose && (newCount > 0 || addableToProject > 0)) ? "" : "none";
   btn.textContent = newCount > 0
     ? "👥 Add Participant to Contacts (" + newCount + " new)"
     : "👥 Add Participant to Contacts";
