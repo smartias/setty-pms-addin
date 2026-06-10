@@ -7900,6 +7900,15 @@ function showPeopleView() {
         quickAddToProjectDirectory(+btn.dataset.idx, btn);
       };
     });
+    // Nudge: the sender is already filed but their record is missing title or
+    // phone — this email's signature can likely fill it in one tap. Skipped
+    // when another action just posted a status (e.g. quick-add success).
+    const senderRec = findGlobalContact(emailFromAddress || "")?.contact;
+    const statusEl = document.getElementById("peopleStatus");
+    if (senderRec && (!senderRec.title || !senderRec.phone) && statusEl && !statusEl.textContent) {
+      const missing = !senderRec.title && !senderRec.phone ? "title and phone" : (!senderRec.title ? "title" : "phone");
+      setStatus("peopleStatus", "info", "💡 " + (senderRec.name || emailFrom || "The sender") + "'s saved contact has no " + missing + " — tap their row to fill it from this email's signature.");
+    }
   }
   updatePeopleButtonBadge();
   showView("peopleView");
@@ -7945,11 +7954,14 @@ async function quickAddToProjectDirectory(idx, btnEl) {
 }
 function prefillContactFromParticipant(p) {
   const matchedClient = getClientByEmail(p.emailAddress || "");
-  document.getElementById("contactName").value    = p.displayName || "";
-  document.getElementById("contactTitle").value   = "";
+  // Known contact → show what's already on file, so opening the form doubles
+  // as a record check. Signature parsing then fills only what's still blank.
+  const existing = findGlobalContact(p.emailAddress || "")?.contact || null;
+  document.getElementById("contactName").value    = existing?.name  || p.displayName || "";
+  document.getElementById("contactTitle").value   = existing?.title || "";
   document.getElementById("contactCompany").value = matchedClient?.name || "";
   document.getElementById("contactEmail").value   = p.emailAddress || "";
-  document.getElementById("contactPhone").value   = "";
+  document.getElementById("contactPhone").value   = existing?.phone || "";
   setStatus("contactStatus", "", "");
   maybePrefillFromSignature(p);
   showView("contactView");
@@ -8180,9 +8192,17 @@ async function doSaveContact() {
           return !targetE && targetN && n === targetN;
         });
         if (dupIdx >= 0) {
-          // Don't duplicate — just bump lastContacted on the existing record so
-          // recency stays accurate even when the same person emails repeatedly.
-          ec.contacts = ec.contacts.map((c, i) => i === dupIdx ? { ...c, lastContacted: today } : c);
+          // Don't duplicate — bump lastContacted, and backfill any fields the
+          // existing record is missing (older contacts predate signature
+          // extraction, so title/phone are often blank). Existing values
+          // always win: this enriches, never overwrites.
+          ec.contacts = ec.contacts.map((c, i) => i === dupIdx ? {
+            ...c,
+            name:  c.name  || name,
+            title: c.title || title,
+            phone: c.phone || phone,
+            lastContacted: today,
+          } : c);
         } else {
           ec.contacts = [...ec.contacts, contact];
         }
