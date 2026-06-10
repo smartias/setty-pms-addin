@@ -7951,7 +7951,103 @@ function prefillContactFromParticipant(p) {
   document.getElementById("contactEmail").value   = p.emailAddress || "";
   document.getElementById("contactPhone").value   = "";
   setStatus("contactStatus", "", "");
+  maybePrefillFromSignature(p);
   showView("contactView");
+}
+
+// ── SIGNATURE PARSING (title + phone prefill) ────────────────────────────────
+// When the person being added is the SENDER, their signature block is at the
+// bottom of this email — scrape title and phone from it so the contact form
+// is a confirm, not a typing exercise. To/CC participants are skipped: their
+// signatures only appear in quoted history (if at all), and pulling a title
+// from the wrong person's signature is worse than leaving the field blank.
+function maybePrefillFromSignature(p) {
+  const pAddr = (p?.emailAddress || "").trim().toLowerCase();
+  const senderAddr = (emailFromAddress || "").trim().toLowerCase();
+  if (!pAddr || pAddr !== senderAddr) return;
+  const item = emailItem;
+  if (!item?.body?.getAsync) return;
+  item.body.getAsync(Office.CoercionType.Text, r => {
+    if (r.status !== Office.AsyncResultStatus.Succeeded) return;
+    if (emailItem !== item) return; // pinned pane switched emails mid-fetch
+    // Bail if the form has moved on to a different person meanwhile.
+    const emailField = document.getElementById("contactEmail");
+    if (!emailField || (emailField.value || "").trim().toLowerCase() !== pAddr) return;
+    const company = document.getElementById("contactCompany")?.value || "";
+    const sig = parseSenderSignature(r.value || "", p.displayName || emailFrom || "", company);
+    const titleEl = document.getElementById("contactTitle");
+    const phoneEl = document.getElementById("contactPhone");
+    if (sig.title && titleEl && !titleEl.value.trim()) titleEl.value = sig.title;
+    if (sig.phone && phoneEl && !phoneEl.value.trim()) phoneEl.value = sig.phone;
+  });
+}
+
+// Job-title vocabulary for the fallback scan. AEC-heavy on purpose — extend
+// this list if a common title at your consultants/GCs slips through.
+const SIGNATURE_TITLE_WORDS = /\b(engineer|architect|manager|director|principal|president|vice president|associate|designer|coordinator|administrator|estimator|superintendent|partner|owner|founder|specialist|consultant|surveyor|planner|drafter|technician|officer|executive|chief|lead|vp|ceo|coo|cfo|pm|leed)\b/i;
+const SIGNATURE_PHONE_RE = /(\+?\d{1,2}[\s.\-])?(\(\d{3}\)|\d{3})[\s.\-]?\d{3}[\s.\-]?\d{4}(\s?(x|ext\.?)\s?\d{1,5})?/;
+
+function parseSenderSignature(bodyText, senderName, companyName) {
+  const out = { title: "", phone: "" };
+  let text = (bodyText || "").replace(/\r\n/g, "\n");
+  // Only the current message — signatures in quoted history belong to other
+  // people (or older versions of this one).
+  const cut = text.search(/\n\s*(From:|-{3,}\s*Original Message|On .{10,80} wrote:)/i);
+  if (cut > 0) text = text.slice(0, cut);
+  // Signature = the tail of the message.
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean).slice(-15);
+  if (!lines.length) return out;
+
+  const companyLc = (companyName || "").trim().toLowerCase();
+  const nameTokens = (senderName || "").toLowerCase().split(/[\s,]+/).filter(t => t.length > 1 && !/^(jr|sr|ii|iii|iv|pe|aia|leed)\.?$/.test(t));
+  const isNameLine  = l => { const lc = l.toLowerCase(); return nameTokens.length >= 1 && nameTokens.filter(t => lc.includes(t)).length >= Math.min(2, nameTokens.length); };
+  const isNoiseLine = l => /@/.test(l) || /\b(www\.|https?:)/i.test(l) || SIGNATURE_PHONE_RE.test(l);
+  const isCompanyLine = l => !!companyLc && l.toLowerCase().includes(companyLc);
+  const titleOk = l => l.length >= 3 && l.length <= 70 && /[a-z]/i.test(l) && !isNoiseLine(l) && !isCompanyLine(l) && !isNameLine(l);
+  // Multi-part lines ("Senior PM | RPH Architects") — judge each segment.
+  const titleFromLine = l => {
+    for (const seg of l.split(/\s*[|•·]\s*/)) {
+      if (titleOk(seg)) return seg.trim();
+    }
+    return "";
+  };
+
+  // Primary: the line right after the sender's name in the signature block
+  // (Name / Title / Company is the overwhelmingly common layout). Search from
+  // the bottom up so a "Hi Bob," greeting line can't be mistaken for the sig.
+  for (let i = lines.length - 1; i >= 0 && !out.title; i--) {
+    if (!isNameLine(lines[i])) continue;
+    for (const next of [lines[i + 1], lines[i + 2]]) {
+      if (!next) break;
+      const t = titleFromLine(next);
+      if (t) { out.title = t; break; }
+    }
+    break; // bottom-most name line is the signature; don't keep walking up
+  }
+  // Fallback: any tail line that uses job-title vocabulary.
+  if (!out.title) {
+    for (const l of lines) {
+      const t = titleFromLine(l);
+      if (t && SIGNATURE_TITLE_WORDS.test(t)) { out.title = t; break; }
+    }
+  }
+
+  // Phone: prefer cell/mobile, then direct, then anything. Label is whatever
+  // short tag precedes the number ("C:", "Cell", "M.", "Direct") — a line can
+  // carry several numbers ("T 212… | C 917…"), so every match is scored.
+  let best = null;
+  for (const l of lines) {
+    const re = new RegExp(SIGNATURE_PHONE_RE.source, "g");
+    let m;
+    while ((m = re.exec(l)) !== null) {
+      const prefix = l.slice(0, m.index).toLowerCase();
+      const score = /\b(c|cell|m|mob|mobile)[.: )]*$/.test(prefix) ? 3
+                  : /\b(d|direct|dd)[.: )]*$/.test(prefix) ? 2 : 1;
+      if (!best || score > best.score) best = { value: m[0].trim(), score };
+    }
+  }
+  if (best) out.phone = best.value;
+  return out;
 }
 function projectPmsUrl(project) {
   if (!project) return "";
