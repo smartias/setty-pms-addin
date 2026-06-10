@@ -1277,42 +1277,44 @@ function applyEmailFlowEmphasis() {
     capSp.textContent = ""; // reset
 
     if (_renamingSpFolder) {
-      // Inline editor: input + Save/Cancel. Date prefix is appended automatically
-      // at save-time, so we only ask for the trailing portion.
-      const label = document.createElement("span");
-      label.textContent = "YYYY_MM_DD ";
-      label.style.cssText = "color:var(--muted);font-size:11px;";
-      capSp.appendChild(label);
-
+      // Inline editor: full-width input stacked over Save/Cancel — comfortable
+      // to read and tap, instead of a cramped one-line strip. The YYYY_MM_DD
+      // prefix is appended automatically at save-time and everyone knows the
+      // convention, so it's not repeated in the UI (tooltip mentions it).
       const input = document.createElement("input");
       input.type = "text";
       input.id = "saveSpRenameInput";
       input.value = _customSpFolderName || _getDefaultSpFolderSubject();
       input.maxLength = 70;
-      input.style.cssText = "width:55%;font-size:11px;padding:2px 4px;border:1px solid var(--primary);border-radius:3px;";
+      input.title = "Folder name (the date prefix is added automatically)";
+      input.style.cssText = "display:block;width:100%;box-sizing:border-box;font-size:12px;padding:5px 8px;margin:2px 0 6px;border:1px solid var(--primary);border-radius:4px;";
       capSp.appendChild(input);
+
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;gap:6px;align-items:center;";
+      capSp.appendChild(btnRow);
 
       const saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.textContent = "Save";
-      saveBtn.style.cssText = "margin-left:6px;font-size:11px;padding:2px 6px;border:none;background:var(--primary);color:#fff;border-radius:3px;cursor:pointer;";
+      saveBtn.style.cssText = "font-size:11px;padding:4px 14px;border:none;background:var(--primary);color:#fff;border-radius:4px;cursor:pointer;";
       saveBtn.addEventListener("click", e => {
         e.preventDefault();
         e.stopPropagation();
         commitSpFolderRename(input.value);
       });
-      capSp.appendChild(saveBtn);
+      btnRow.appendChild(saveBtn);
 
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
       cancelBtn.textContent = "Cancel";
-      cancelBtn.style.cssText = "margin-left:4px;font-size:11px;padding:2px 6px;border:1px solid #ccc;background:#fff;color:#555;border-radius:3px;cursor:pointer;";
+      cancelBtn.style.cssText = "font-size:11px;padding:4px 12px;border:1px solid #ccc;background:#fff;color:#555;border-radius:4px;cursor:pointer;";
       cancelBtn.addEventListener("click", e => {
         e.preventDefault();
         e.stopPropagation();
         cancelSpFolderRename();
       });
-      capSp.appendChild(cancelBtn);
+      btnRow.appendChild(cancelBtn);
 
       input.addEventListener("keydown", e => {
         if (e.key === "Enter") {
@@ -1329,31 +1331,33 @@ function applyEmailFlowEmphasis() {
         clearBtn.type = "button";
         clearBtn.textContent = "Clear";
         clearBtn.title = "Revert to email subject as the folder name";
-        clearBtn.style.cssText = "margin-left:4px;font-size:11px;padding:2px 6px;border:1px solid #ccc;background:#fff;color:#a00;border-radius:3px;cursor:pointer;";
+        clearBtn.style.cssText = "font-size:11px;padding:4px 12px;border:1px solid #ccc;background:#fff;color:#a00;border-radius:4px;cursor:pointer;margin-left:auto;";
         clearBtn.addEventListener("click", e => {
           e.preventDefault();
           e.stopPropagation();
           commitSpFolderRename("");
         });
-        capSp.appendChild(clearBtn);
+        btnRow.appendChild(clearBtn);
       }
     } else {
       if (_customSpFolderName) {
         const prefix = document.createTextNode("Folder: ");
         const strong = document.createElement("strong");
         strong.style.color = "var(--text)";
-        strong.textContent = "YYYY_MM_DD " + _customSpFolderName;
+        strong.textContent = _customSpFolderName;
         capSp.appendChild(prefix);
         capSp.appendChild(strong);
       } else {
         capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
       }
+      // Quiet text link — discoverable next to the caption but not competing
+      // with the save buttons for attention.
       const renameBtn = document.createElement("button");
       renameBtn.type = "button";
       renameBtn.id = "saveSpRenameLink";
-      renameBtn.textContent = _customSpFolderName ? "✏ change" : "✏ rename";
+      renameBtn.textContent = _customSpFolderName ? "change" : "rename folder";
       renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
-      renameBtn.style.cssText = "margin-left:8px;color:var(--primary);background:transparent;border:none;padding:0;font:inherit;font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline;";
+      renameBtn.style.cssText = "margin-left:8px;color:var(--muted);background:transparent;border:none;padding:2px 0;font:inherit;font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:2px;";
       renameBtn.addEventListener("click", e => {
         e.preventDefault();
         e.stopPropagation();
@@ -7728,13 +7732,23 @@ async function doSaveMilestone() {
 
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
     const pep = pickQuip(NEW_MILESTONE_QUIPS);
-    if (calResult.success) {
-      const calLabel = calResult.onShared ? "NYC Shared Calendar" : "your personal calendar";
-      setStatus("milestoneStatus", "success", pep + " Saved to " + projLabel + " · synced to " + calLabel);
-    } else {
-      setStatus("milestoneStatus", "success", pep + " Saved to " + projLabel + " (calendar sync failed: " + calResult.error + ")");
-    }
-    document.getElementById("milestoneForm").style.display = "none";
+    const calLabel = calResult.onShared ? "NYC Shared Calendar" : "your personal calendar";
+    const successMsg = calResult.success
+      ? pep + " Saved to " + projLabel + " · synced to " + calLabel
+      : pep + " Saved to " + projLabel + " (calendar sync failed: " + calResult.error + ")";
+    setStatus("milestoneStatus", "success", successMsg);
+    // Auto-return to the main pane after a beat — staying on a bare status +
+    // back button cost an extra click on every milestone save. The success
+    // message carries over to the main status slot so it isn't lost.
+    setTimeout(() => {
+      // Skip if the user already navigated somewhere else in the meantime.
+      if (!document.getElementById("datesView")?.classList.contains("active")) return;
+      const form = document.getElementById("milestoneForm");
+      if (form) form.style.display = "none";
+      setStatus("milestoneStatus", "", "");
+      showView("mainView");
+      setStatus("actionStatus", "success", successMsg);
+    }, 1200);
   } catch(e) {
     setStatus("milestoneStatus", "error", "✗ " + humanizeError(e));
   } finally {
