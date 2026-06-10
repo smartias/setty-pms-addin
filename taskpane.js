@@ -3481,6 +3481,50 @@ async function getEmailBodyHtml(token) {
   } catch { return ""; }
 }
 
+// ── RELIABLE PLAIN-TEXT BODY ─────────────────────────────────────────────────
+// Office's item.body.getAsync fails transiently right after an item opens
+// (status Failed, especially in new Outlook / OWA) — the cause of "signature
+// extraction only works the second or third time I open the email". Retry
+// with short backoff, then fall back to the Graph body (already cached per
+// item for the filing flow) stripped to plain text. Returns null when every
+// route failed; "" is a genuinely empty body.
+async function getBodyTextReliable(item, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    const text = await new Promise(resolve => {
+      try {
+        if (!item?.body?.getAsync) return resolve(null);
+        item.body.getAsync(Office.CoercionType.Text, r =>
+          resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : null));
+      } catch { resolve(null); }
+    });
+    if (text !== null) return text;
+    if (i < attempts - 1) await new Promise(res => setTimeout(res, 300 * (i + 1)));
+  }
+  // Graph fallback — getEmailBodyHtml reads the CURRENT mailbox item, so only
+  // use it if the pane hasn't switched to a different email meanwhile.
+  try {
+    if (Office.context.mailbox.item?.itemId !== item?.itemId) return null;
+    const token = await getToken();
+    const html = await getEmailBodyHtml(token);
+    if (html) return htmlToPlainText(html);
+  } catch (e) {
+    console.info("[body] Graph fallback failed:", e.message);
+  }
+  return null;
+}
+
+function htmlToPlainText(html) {
+  const t = String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|h[1-6]|table)>/gi, "\n")
+    .replace(/<[^>]+>/g, "");
+  const decoder = document.createElement("textarea");
+  decoder.innerHTML = t; // entity decode — tags already stripped above
+  return decoder.value.replace(/ /g, " ");
+}
+
 // In-memory idempotency cache for OneNote page creation (5-minute TTL).
 // Prevents duplicate pages when a 5xx response masks a server-side success
 // and the retry loop reposts. Keyed by url + html-prefix hash.
@@ -6502,18 +6546,18 @@ function nextAutoRfiNumber() {
 // wants the new ask, not the whole thread.
 function seedDescriptionFromEmailBody(fieldId, maxChars = 600) {
   const item = emailItem;
-  if (!item?.body?.getAsync) return;
-  item.body.getAsync(Office.CoercionType.Text, r => {
-    if (r.status !== Office.AsyncResultStatus.Succeeded) return;
+  void (async () => {
+    const raw = await getBodyTextReliable(item);
+    if (!raw) return;
     if (emailItem !== item) return;
     const el = document.getElementById(fieldId);
     if (!el || el.value.trim()) return;
-    let text = (r.value || "").replace(/\r\n/g, "\n").trim();
+    let text = raw.replace(/\r\n/g, "\n").trim();
     const cut = text.search(/\n\s*(From:|-{3,}\s*Original Message|On .{10,80} wrote:)/i);
     if (cut > 0) text = text.slice(0, cut).trim();
     if (text.length > maxChars) text = text.slice(0, maxChars).trimEnd() + "…";
     if (text) el.value = text;
-  });
+  })();
 }
 
 // Default an assignee <select> to the project's Setty PM when they're on the
@@ -8001,20 +8045,20 @@ function maybePrefillFromSignature(p) {
   const senderAddr = (emailFromAddress || "").trim().toLowerCase();
   if (!pAddr || pAddr !== senderAddr) return;
   const item = emailItem;
-  if (!item?.body?.getAsync) return;
-  item.body.getAsync(Office.CoercionType.Text, r => {
-    if (r.status !== Office.AsyncResultStatus.Succeeded) return;
+  void (async () => {
+    const bodyText = await getBodyTextReliable(item);
+    if (bodyText === null) { console.info("[signature] body unavailable after retries — prefill skipped"); return; }
     if (emailItem !== item) return; // pinned pane switched emails mid-fetch
     // Bail if the form has moved on to a different person meanwhile.
     const emailField = document.getElementById("contactEmail");
     if (!emailField || (emailField.value || "").trim().toLowerCase() !== pAddr) return;
     const company = document.getElementById("contactCompany")?.value || "";
-    const sig = parseSenderSignature(r.value || "", p.displayName || emailFrom || "", company);
+    const sig = parseSenderSignature(bodyText, p.displayName || emailFrom || "", company);
     const titleEl = document.getElementById("contactTitle");
     const phoneEl = document.getElementById("contactPhone");
     if (sig.title && titleEl && !titleEl.value.trim()) titleEl.value = sig.title;
     if (sig.phone && phoneEl && !phoneEl.value.trim()) phoneEl.value = sig.phone;
-  });
+  })();
 }
 
 // Job-title vocabulary for the fallback scan. AEC-heavy on purpose — extend
