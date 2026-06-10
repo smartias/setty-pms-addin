@@ -735,6 +735,16 @@
       border: 1px solid transparent;
     }
     .pill.added { background: var(--success-bg); color: var(--success); border-color: #b6e3b6; }
+    /* Company pill in the participant list — long firm names must truncate,
+       never wrap or crowd out the person's name (full name in tooltip). */
+    .pill.company {
+      max-width: 84px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* The person's name always wins the space fight with the pills. */
+    .participant-row .participant-id { flex: 1; min-width: 90px; }
     .date-card {
       padding: 10px 12px;
       background: var(--surface);

@@ -7834,35 +7834,32 @@ async function doSaveMilestone() {
 const _sessionSavedContactEmails = new Set();
 function showPeopleView() {
   const list = document.getElementById("participantList");
-  if (!emailParticipants.length) {
-    list.innerHTML = '<p style="font-size:12px;color:var(--text-soft);">No participants found.</p>';
+  // Setty staff are managed via the project's Teams tab in PMS — leave them
+  // out of the list entirely instead of rendering inert rows.
+  const externalRows = (emailParticipants || [])
+    .map((p, i) => ({ p, i, st: getParticipantDirectoryStatus(p) }))
+    .filter(r => !r.st.internal);
+  if (!externalRows.length) {
+    list.innerHTML = '<p style="font-size:12px;color:var(--text-soft);">No external participants on this email.</p>';
   } else {
     const labelColor = { From: "#c50f1f", To: "#0f6cbd", CC: "#0e6d5c", Required: "#0f6cbd", Optional: "#616161", Organizer: "#c50f1f" };
     const labelBg    = { From: "#fde7e9", To: "#eaf3fb", CC: "#e0f5f0", Required: "#eaf3fb", Optional: "#f3f2f1", Organizer: "#fde7e9" };
-    // Decorate each participant with directory status, then sort the people
-    // worth capturing to the top: unknown first, then known-globally-but-new-
-    // to-this-project, then fully filed. Stable within groups (From/To/CC
-    // order preserved via original index).
-    const rows = emailParticipants.map((p, i) => ({ p, i, st: getParticipantDirectoryStatus(p) }));
-    // Setty staff (managed via the Teams tab in PMS, not the directories)
-    // sort below everyone, after the fully-filed external contacts.
-    const rank = r => r.st.internal ? 3 : (r.st.isNew ? 0 : (r.st.globalHit && !r.st.inProject && !r.st.sessionSaved ? 1 : 2));
+    // Sort the people worth capturing to the top: unknown first, then known-
+    // globally-but-new-to-this-project, then fully filed. Stable within
+    // groups (From/To/CC order preserved via original index).
+    const rows = externalRows;
+    const rank = r => r.st.isNew ? 0 : (r.st.globalHit && !r.st.inProject && !r.st.sessionSaved ? 1 : 2);
     rows.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
     list.innerHTML = rows.map(({ p, i, st }) => {
-      // Green "added" treatment is for filed external contacts; Setty staff
-      // just get dimmed (nothing was or should be filed for them).
       const fullyFiled = st.sessionSaved || st.inProject;
-      const dimmed = fullyFiled || st.internal;
       let statusHtml = "";
-      if (st.internal) {
-        statusHtml = '<span class="pill" style="background:var(--surface-2);color:var(--text-soft);" title="Setty staff are managed via the project\'s Teams tab in PMS, not the contact directories">Setty</span>';
-      } else if (st.sessionSaved) {
+      if (st.sessionSaved) {
         statusHtml = '<span class="pill added">✓ Added</span>';
       } else if (st.inProject) {
         statusHtml = '<span class="pill added" title="Already in this project\'s directory">✓ On project</span>';
       } else if (st.globalHit) {
         const company = escHtml(st.globalHit.client?.name || "directory");
-        statusHtml = `<span class="pill added" title="Already in the global directory under ${company}">✓ ${company}</span>`
+        statusHtml = `<span class="pill added company" title="Already in the global directory under ${company}">✓ ${company}</span>`
           + (selectedProject
             ? `<button type="button" class="quick-add-proj" data-idx="${i}" title="Add to ${escHtml(selectedProject.name || "this project")}'s directory — no retyping">+ project</button>`
             : "");
@@ -7870,14 +7867,14 @@ function showPeopleView() {
         statusHtml = '<span class="pill" style="background:var(--primary);color:#fff;" title="Not in any directory yet — click the row to add">+ Add</span>';
       }
       return `
-      <div class="participant-row${fullyFiled ? ' added' : ''}" data-idx="${i}"${dimmed ? ' style="opacity:0.8;"' : ''}>
-        <div style="flex:1;min-width:0;">
+      <div class="participant-row${fullyFiled ? ' added' : ''}" data-idx="${i}"${fullyFiled ? ' style="opacity:0.8;"' : ''}>
+        <div class="participant-id">
           <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
             ${escHtml(p.displayName || p.emailAddress)}
           </div>
-          <div style="font-size:11px;color:var(--text-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          ${p.displayName && p.displayName !== p.emailAddress ? `<div style="font-size:11px;color:var(--text-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
             ${escHtml(p.emailAddress || "")}
-          </div>
+          </div>` : ""}
         </div>
         ${statusHtml}
         <span class="pill" style="background:${labelBg[p.label]||'var(--surface-2)'};color:${labelColor[p.label]||'var(--text-soft)'};">
@@ -7886,15 +7883,9 @@ function showPeopleView() {
       </div>`;
     }).join("");
     list.querySelectorAll(".participant-row").forEach(el => {
-      el.onclick = () => {
-        const participant = emailParticipants[+el.dataset.idx];
-        if (isSettyInternalEmail(participant?.emailAddress)) {
-          // Don't open the contact form for colleagues — explain instead.
-          setStatus("peopleStatus", "info", "Setty staff are added to projects via the Teams tab in PMS, not the contact directories.");
-          return;
-        }
-        prefillContactFromParticipant(participant);
-      };
+      // data-idx is the participant's index in emailParticipants (assigned
+      // before the internal-staff filter), so lookups stay correct.
+      el.onclick = () => prefillContactFromParticipant(emailParticipants[+el.dataset.idx]);
     });
     list.querySelectorAll(".quick-add-proj").forEach(btn => {
       btn.onclick = (e) => {
