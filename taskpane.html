@@ -750,6 +750,15 @@
     .participant-row:hover { border-color: var(--primary); background: var(--surface); }
     .participant-row.added { background: var(--success-bg); border-color: #b6e3b6; }
     .participant-row.added:hover { background: #c8eec8; }
+    .quick-add-proj {
+      font-size: 11px; font-weight: 600;
+      padding: 4px 10px; margin-left: 4px;
+      border: 1px solid var(--primary); border-radius: 12px;
+      background: var(--bg); color: var(--primary);
+      cursor: pointer; white-space: nowrap; flex-shrink: 0;
+    }
+    .quick-add-proj:hover:not(:disabled) { background: var(--primary); color: #fff; }
+    .quick-add-proj:disabled { opacity: 0.6; cursor: default; }
 
     /* Native <details> styling for the "More" expander */
     details.more-expander { margin-top: 6px; }
@@ -1215,6 +1224,7 @@
   <p style="font-size:11px;color:#64748b;margin-bottom:12px;line-height:1.5;">
     Select a participant to add them to Clients or a Project POC. Duplicate contacts are skipped automatically.
   </p>
+  <div id="peopleStatus" class="status-msg"></div>
   <div id="participantList"></div>
 </div>
 

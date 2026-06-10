@@ -412,6 +412,8 @@ function loadItemContext() {
   emailParticipants = [];
   // Per-item ✓ "added this session" marks reset when item changes
   _sessionSavedContactEmails.clear();
+  // Stale people-picker status from the previous email shouldn't carry over.
+  try { setStatus("peopleStatus", "", ""); } catch {}
   // Drop the per-item Graph caches (email body, etc.) so a different item
   // can't accidentally serve cached body HTML from the previous one. Cheap.
   if (typeof clearEmailBodyCache === "function") clearEmailBodyCache();
@@ -510,6 +512,7 @@ function loadItemContext() {
             ...emailParticipants,
             ...(r.value || []).map(a => ({ label, displayName: a.displayName || "", emailAddress: a.emailAddress || "" })),
           ]);
+          try { updatePeopleButtonBadge(); } catch {}
         }
       });
       if (emailItem.requiredAttendees?.getAsync) loadAtts(emailItem.requiredAttendees, "Required");
@@ -522,6 +525,7 @@ function loadItemContext() {
         ...(emailItem.optionalAttendees || []).map(r => ({ label: "Optional", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
       ]);
     }
+    try { updatePeopleButtonBadge(); } catch {}
 
     document.getElementById("noteCategory").value = "Client Meeting";
     document.getElementById("noteBody").value = buildMeetingNoteBody(emailItem);
@@ -561,6 +565,7 @@ function loadItemContext() {
       ...toList.map(r => ({ label: "To", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
       ...ccList.map(r => ({ label: "CC", displayName: r.displayName || "", emailAddress: r.emailAddress || "" })),
     ]);
+    try { updatePeopleButtonBadge(); } catch {}
     // Pre-fill note body
     document.getElementById("noteBody").value = emailItem.subject || "";
     // Pre-fill RFI from
@@ -1429,6 +1434,8 @@ async function onSignedIn() {
         await restoreProjectSelectionForCurrentEmail();
         updateProjectQuickLinks();
       }
+      // Fresh allClients may change who counts as "new".
+      try { updatePeopleButtonBadge(); } catch {}
     }).catch(() => {});
   } else {
     // Cold start (no cache yet) — nothing to restore from, wait for the fetch.
@@ -1490,7 +1497,7 @@ const SB_HEADERS = {
 //      drops it to ~15 KB and pushes the quota ceiling out of reach.
 // Cache key bumped to v3 so any stale uncompressed v2 entries are ignored
 // (and overwritten on first save).
-const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV4";
+const PROJECTS_CACHE_KEY = "settyPms:addinProjectsCacheV5"; // V5: adds slim directory/POC emails for people-picker badges
 const PROJECTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h hard limit; revalidate every open
 
 // Cache-strip strategy v2 (aggressive): keep ONLY the fields the add-in reads
@@ -1529,6 +1536,11 @@ function _stripProjectForCache(p) {
     // Small directory arrays — needed for assignee dropdowns
     teamMembers: p.teamMembers || [],
     subconsultants: p.subconsultants || [],
+    // Slim people lists — only the emails, used by the people picker's
+    // "already on this project?" badge during the cache window before the
+    // fresh fetch lands. Save flows always re-fetch the full project.
+    directory: (p.directory || []).map(d => ({ email: d.email || "" })),
+    projectContacts: { pm: ((p.projectContacts?.pm) || []).map(c => ({ email: c.email || "" })) },
     // Nested record arrays — slim each record to ONLY the fields the add-in
     // reads from the cached project. findSavedEmailRecord needs msgId.
     // refreshOneNoteLinkBanner needs note.{sourceItemId, sourceMessageId,
@@ -1596,7 +1608,7 @@ function _stripProjectForCache(p) {
 // pane open; cheap.
 function _pruneStaleProjectsCaches() {
   try {
-    const stale = ["settyPms:addinProjectsCache", "settyPms:addinProjectsCacheV2", "settyPms:addinProjectsCacheV3"];
+    const stale = ["settyPms:addinProjectsCache", "settyPms:addinProjectsCacheV2", "settyPms:addinProjectsCacheV3", "settyPms:addinProjectsCacheV4"];
     for (const k of stale) {
       if (k !== PROJECTS_CACHE_KEY && localStorage.getItem(k) != null) {
         try { localStorage.removeItem(k); } catch {}
@@ -2453,6 +2465,8 @@ function setSelectedProject(project, persistForEmail = false) {
   try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[chips] refresh failed:", e.message); }
   // Re-populate the "Link to" dropdown — open RFIs/Subs differ per project.
   try { refreshLinkToTargetDropdown(); } catch (e) { console.warn("[link-to] refresh failed:", e.message); }
+  // "N new" count depends on the selected project's directory.
+  try { updatePeopleButtonBadge(); } catch {}
   const badge = document.getElementById("selectedProjectBadge");
   const badgeText = document.getElementById("selectedProjectBadgeText");
   const clearBtn = document.getElementById("clearProjectTagBtn");
@@ -3296,6 +3310,50 @@ function getClientByEmail(email) {
     if (contacts.some(ct => (ct.email || "").toLowerCase() === emailLc)) return true;
     return !!domain && contacts.some(ct => (ct.email || "").toLowerCase().endsWith("@" + domain));
   }) || null;
+}
+
+// ── DIRECTORY-STATUS LOOKUPS (people picker) ─────────────────────────────────
+// Exact email matches only — getClientByEmail's domain fallback above is for
+// guessing the company on the contact form, not for claiming a person is
+// already saved. All checks run against in-memory data (allClients +
+// selectedProject), so they cost nothing per render.
+function findGlobalContact(email) {
+  const emailLc = (email || "").trim().toLowerCase();
+  if (!emailLc) return null;
+  for (const c of (allClients || [])) {
+    const hit = (c.contacts || []).find(ct => (ct.email || "").trim().toLowerCase() === emailLc);
+    if (hit) return { client: c, contact: hit };
+  }
+  return null;
+}
+// "Already on this job" = in project.directory (contact-save path) OR in the
+// project POC list (save-to-project path) — the two places the add-in writes.
+function isInProjectDirectory(email) {
+  const emailLc = (email || "").trim().toLowerCase();
+  if (!emailLc || !selectedProject) return false;
+  if ((selectedProject.directory || []).some(d => (d.email || "").trim().toLowerCase() === emailLc)) return true;
+  return ((selectedProject.projectContacts?.pm) || []).some(c => (c.email || "").trim().toLowerCase() === emailLc);
+}
+function getParticipantDirectoryStatus(p) {
+  const emailLc = (p?.emailAddress || "").trim().toLowerCase();
+  const sessionSaved = !!emailLc && _sessionSavedContactEmails.has(emailLc);
+  const globalHit = findGlobalContact(emailLc);
+  const inProject = isInProjectDirectory(emailLc);
+  // "New" = nowhere in the firm's directories and not just saved this session.
+  return { globalHit, inProject, sessionSaved, isNew: !globalHit && !inProject && !sessionSaved };
+}
+function countNewParticipants() {
+  return (emailParticipants || []).filter(p => getParticipantDirectoryStatus(p).isNew).length;
+}
+// Nudge on the main-view button: surface how many of this email's
+// participants aren't in any directory yet, BEFORE the user opens the list.
+function updatePeopleButtonBadge() {
+  const btn = document.getElementById("addParticipantBtn");
+  if (!btn) return;
+  const n = countNewParticipants();
+  btn.textContent = n > 0
+    ? "👥 Add Participant to Contacts (" + n + " new)"
+    : "👥 Add Participant to Contacts";
 }
 // ─── TRANSIENT-FAILURE RETRY HELPER ──────────────────────────────────────────
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
@@ -7768,11 +7826,31 @@ function showPeopleView() {
   } else {
     const labelColor = { From: "#c50f1f", To: "#0f6cbd", CC: "#0e6d5c", Required: "#0f6cbd", Optional: "#616161", Organizer: "#c50f1f" };
     const labelBg    = { From: "#fde7e9", To: "#eaf3fb", CC: "#e0f5f0", Required: "#eaf3fb", Optional: "#f3f2f1", Organizer: "#fde7e9" };
-    list.innerHTML = emailParticipants.map((p, i) => {
-      const emailKey = (p.emailAddress || "").toLowerCase();
-      const alreadyAdded = emailKey && _sessionSavedContactEmails.has(emailKey);
+    // Decorate each participant with directory status, then sort the people
+    // worth capturing to the top: unknown first, then known-globally-but-new-
+    // to-this-project, then fully filed. Stable within groups (From/To/CC
+    // order preserved via original index).
+    const rows = emailParticipants.map((p, i) => ({ p, i, st: getParticipantDirectoryStatus(p) }));
+    const rank = r => r.st.isNew ? 0 : (r.st.globalHit && !r.st.inProject && !r.st.sessionSaved ? 1 : 2);
+    rows.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
+    list.innerHTML = rows.map(({ p, i, st }) => {
+      const fullyFiled = st.sessionSaved || st.inProject;
+      let statusHtml = "";
+      if (st.sessionSaved) {
+        statusHtml = '<span class="pill added">✓ Added</span>';
+      } else if (st.inProject) {
+        statusHtml = '<span class="pill added" title="Already in this project\'s directory">✓ On project</span>';
+      } else if (st.globalHit) {
+        const company = escHtml(st.globalHit.client?.name || "directory");
+        statusHtml = `<span class="pill added" title="Already in the global directory under ${company}">✓ ${company}</span>`
+          + (selectedProject
+            ? `<button type="button" class="quick-add-proj" data-idx="${i}" title="Add to ${escHtml(selectedProject.name || "this project")}'s directory — no retyping">+ project</button>`
+            : "");
+      } else {
+        statusHtml = '<span class="pill" style="background:var(--primary);color:#fff;" title="Not in any directory yet — click the row to add">+ Add</span>';
+      }
       return `
-      <div class="participant-row${alreadyAdded ? ' added' : ''}" data-idx="${i}">
+      <div class="participant-row${fullyFiled ? ' added' : ''}" data-idx="${i}"${fullyFiled ? ' style="opacity:0.8;"' : ''}>
         <div style="flex:1;min-width:0;">
           <div style="font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
             ${escHtml(p.displayName || p.emailAddress)}
@@ -7781,7 +7859,7 @@ function showPeopleView() {
             ${escHtml(p.emailAddress || "")}
           </div>
         </div>
-        ${alreadyAdded ? '<span class="pill added">✓ Added</span>' : ''}
+        ${statusHtml}
         <span class="pill" style="background:${labelBg[p.label]||'var(--surface-2)'};color:${labelColor[p.label]||'var(--text-soft)'};">
           ${escHtml(p.label || "")}
         </span>
@@ -7790,8 +7868,54 @@ function showPeopleView() {
     list.querySelectorAll(".participant-row").forEach(el => {
       el.onclick = () => prefillContactFromParticipant(emailParticipants[+el.dataset.idx]);
     });
+    list.querySelectorAll(".quick-add-proj").forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        quickAddToProjectDirectory(+btn.dataset.idx, btn);
+      };
+    });
   }
+  updatePeopleButtonBadge();
   showView("peopleView");
+}
+
+// One-click "+ project": the person is already in the global directory, so
+// copy their existing record into the selected project's directory without
+// making the user re-type anything on the contact form.
+async function quickAddToProjectDirectory(idx, btnEl) {
+  const p = emailParticipants[idx];
+  const hit = findGlobalContact(p?.emailAddress || "");
+  if (!hit || !selectedProject) return;
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = "adding…"; }
+  const ct = hit.contact;
+  const dirEntry = {
+    id: uid(),
+    name: ct.name || p.displayName || "",
+    title: ct.title || "",
+    email: ct.email || p.emailAddress || "",
+    phone: ct.phone || "",
+    company: hit.client?.name || "",
+    type: "Other",
+    addedAt: new Date().toISOString(),
+    addedBy: msalAccount?.username || "",
+    addedFromEmail: emailItem?.itemId || "",
+    notes: "",
+  };
+  const emailLc = (dirEntry.email || "").toLowerCase();
+  try {
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      const dir = fresh.directory || [];
+      if (emailLc && dir.some(d => (d.email || "").toLowerCase() === emailLc)) return fresh;
+      return { ...fresh, directory: [...dir, dirEntry] };
+    });
+    setStatus("peopleStatus", "success", "✓ Added " + (dirEntry.name || dirEntry.email) + " to " + (selectedProject.name || "project") + " directory.");
+    // Re-render: applyLocalChangeAndSave updated selectedProject locally, so
+    // the row flips to "✓ On project" and re-sorts on its own.
+    showPeopleView();
+  } catch (e) {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = "+ project"; }
+    setStatus("peopleStatus", "error", "✗ " + humanizeError(e));
+  }
 }
 function prefillContactFromParticipant(p) {
   const matchedClient = getClientByEmail(p.emailAddress || "");
