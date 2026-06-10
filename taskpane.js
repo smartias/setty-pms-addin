@@ -1437,6 +1437,20 @@ async function onSignedIn() {
       if (!selectedProject) {
         await restoreProjectSelectionForCurrentEmail();
         updateProjectQuickLinks();
+      } else {
+        // The selection restored from the cached snapshot — re-point it at
+        // the fresh object, otherwise directory/RFI/status checks keep
+        // reading pre-fetch data for the rest of the session (e.g. contacts
+        // added last session showing as "not on project").
+        const freshProj = getProjectById(selectedProject.id);
+        if (freshProj && freshProj !== selectedProject) {
+          setSelectedProject(freshProj, false);
+          // If the participants list is on screen, re-render it with the
+          // fresh directory.
+          if (document.getElementById("peopleView")?.classList.contains("active")) {
+            try { showPeopleView(); } catch {}
+          }
+        }
       }
       // Fresh allClients may change who counts as "new".
       try { updatePeopleButtonBadge(); } catch {}
@@ -1896,6 +1910,15 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
     }
     allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
     if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
+    // Keep the localStorage snapshot in step with this save — otherwise the
+    // next pane open hydrates pre-save data and shows it until the fresh
+    // fetch lands (and, before the re-point fix in onSignedIn, for the whole
+    // session). Best-effort: cache failure never fails the save.
+    try {
+      const versionMap = {};
+      for (const [id, ver] of _projectVersionCache.entries()) versionMap[id] = ver;
+      saveProjectsCache(allProjects, allClients, versionMap);
+    } catch {}
     return mutated;
   }
 
