@@ -94,7 +94,9 @@ Office.onReady(async (info) => {
     // from a Read-mode message to an Edit-mode draft.
     Office.context.mailbox.addHandlerAsync(
       Office.EventType.ItemChanged,
-      () => { showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
+      // ItemChanged only ever fires while the pane is pinned, so the first one
+      // we receive doubles as proof the user found the pin — hide the hint.
+      () => { markPanePinned(); showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
     );
     loadItemContext();
   } catch (e) {
@@ -163,6 +165,31 @@ function applyComposeModeUiGuard() {
   if (saveRow)        saveRow.style.display        = compose ? "none" : "";
   if (saveRowCaption) saveRowCaption.style.display = compose ? "none" : "";
 }
+// ── Pin hint banner ──────────────────────────────────────────────────────────
+// The pane is far more useful pinned (it follows the user from email to email),
+// but the pin icon Outlook renders in the pane chrome is tiny and most users
+// never notice it. The banner stays up until either (a) the user dismisses it,
+// or (b) an ItemChanged event proves they pinned — whichever comes first.
+function markPanePinned() {
+  try { localStorage.setItem("setty_addin_pin_seen", "1"); } catch (e) {}
+  const b = document.getElementById("pinHintBanner");
+  if (b) b.style.display = "none";
+}
+function initPinHintBanner() {
+  const b = document.getElementById("pinHintBanner");
+  if (!b) return;
+  let hidden = false;
+  try {
+    hidden = !!(localStorage.getItem("setty_addin_pin_seen") || localStorage.getItem("setty_addin_pin_dismissed"));
+  } catch (e) {}
+  if (hidden) return;
+  b.style.display = "flex";
+  const x = document.getElementById("pinHintDismiss");
+  if (x) x.onclick = () => {
+    try { localStorage.setItem("setty_addin_pin_dismissed", "1"); } catch (e) {}
+    b.style.display = "none";
+  };
+}
 function setupEventListeners() {
   document.getElementById("signInBtn").onclick     = doSignIn;
   document.getElementById("signOutBtn").onclick    = doSignOut;
@@ -170,16 +197,20 @@ function setupEventListeners() {
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
-  // 5-click easter egg on the SETTY PMS logo — reveals the cornerstone card.
-  // Counter resets after 3 seconds idle so a curious user has time to discover
-  // the pattern but doesn't accidentally trigger it across casual clicks.
-  // NOTE: there are TWO `.header-logo` elements (one in signInView, one in
-  // mainView), so bind to both via querySelectorAll. Counter is shared across
-  // the two so a user who clicks 3x while signed-out and 2x after signing in
-  // still gets the reveal.
+  // Pin hint banner — show unless previously dismissed or pinning was detected.
+  initPinHintBanner();
+  // Version footer — took over the old main-view logo's jobs (hover tooltip +
+  // easter egg) when the red header was removed to save vertical space.
+  const versionFooter = document.getElementById("versionFooter");
+  if (versionFooter) versionFooter.textContent = "v" + (window.__appVersion || "");
+  // 5-click easter egg — reveals the cornerstone card. Counter resets after
+  // 3 seconds idle so a curious user has time to discover the pattern but
+  // doesn't accidentally trigger it across casual clicks.
+  // Bound to the signInView logo AND the mainView version footer (the
+  // mainView header-logo no longer exists). Counter is shared across both.
   let _logoClickCount = 0;
   let _logoClickTimer = null;
-  document.querySelectorAll(".header-logo").forEach(logoEl => {
+  document.querySelectorAll(".header-logo, #versionFooter").forEach(logoEl => {
     logoEl.title = "v" + (window.__appVersion || "");
     logoEl.onclick = () => {
       _logoClickCount++;
