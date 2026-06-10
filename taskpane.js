@@ -3349,20 +3349,24 @@ function getParticipantDirectoryStatus(p) {
   // this session.
   return { internal, globalHit, inProject, sessionSaved, isNew: !internal && !globalHit && !inProject && !sessionSaved };
 }
-function countNewParticipants() {
-  return (emailParticipants || []).filter(p => getParticipantDirectoryStatus(p).isNew).length;
-}
 // Nudge on the main-view button: surface how many of this email's
 // participants aren't in any directory yet, BEFORE the user opens the list.
+// When there's nothing actionable at all — every participant is Setty staff
+// or already filed everywhere relevant — the button disappears entirely.
+// "Actionable" includes the global-but-not-on-this-project case, since the
+// people view is where the one-click "+ project" add lives.
 function updatePeopleButtonBadge() {
   const btn = document.getElementById("addParticipantBtn");
   if (!btn) return;
-  const n = countNewParticipants();
-  btn.textContent = n > 0
-    ? "👥 Add Participant to Contacts (" + n + " new)"
+  const statuses = (emailParticipants || []).map(getParticipantDirectoryStatus);
+  const newCount = statuses.filter(s => s.isNew).length;
+  const addableToProject = statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length;
+  btn.style.display = (newCount > 0 || addableToProject > 0) ? "" : "none";
+  btn.textContent = newCount > 0
+    ? "👥 Add Participant to Contacts (" + newCount + " new)"
     : "👥 Add Participant to Contacts";
   // Visually promote the button when there's actually someone to capture.
-  btn.classList.toggle("btn-has-new", n > 0);
+  btn.classList.toggle("btn-has-new", newCount > 0);
 }
 // ─── TRANSIENT-FAILURE RETRY HELPER ──────────────────────────────────────────
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
