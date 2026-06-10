@@ -203,6 +203,16 @@
       border-color: transparent;
     }
     .btn-ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+    /* Attention state — applied to "Add Participant to Contacts" when the
+       current email has people not yet in any directory. Tinted rather than
+       solid so it pops against the secondary buttons without competing with
+       the primary save actions. */
+    .btn-has-new {
+      background: #eaf3fb;
+      color: var(--primary);
+      border-color: var(--primary);
+    }
+    .btn-has-new:hover:not(:disabled) { background: #d7e9f8; }
     /* Legacy color classes mapped to subdued accents (used in subviews — note/RFI/etc.) */
     .btn-blue    { background: var(--primary-soft); color: var(--primary-hov); border-color: #b7daf2; }
     .btn-blue:hover:not(:disabled)    { background: #d6e9f7; }
