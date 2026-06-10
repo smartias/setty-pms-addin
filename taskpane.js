@@ -290,35 +290,55 @@ function setupEventListeners() {
   document.getElementById("subModeNew").onclick      = () => setSubMode("new");
   document.getElementById("subModeExisting").onclick = () => setSubMode("existing");
   document.getElementById("fileSubBtn").onclick      = doFileToExistingSub;
-  // Project search
+  // Project search — debounced so fast typing doesn't rebuild the dropdown
+  // DOM on every keystroke; one delegated click handler instead of re-binding
+  // per option on each render.
   const searchInput = document.getElementById("projectSearch");
   const dropdown    = document.getElementById("projectDropdown");
+  dropdown.addEventListener("click", (ev) => {
+    const opt = ev.target.closest(".proj-option");
+    if (!opt) return;
+    setSelectedProject(getProjectById(opt.dataset.id), true);
+    searchInput.value = "";
+    dropdown.style.display = "none";
+  });
+  let searchDebounce = null;
   searchInput.addEventListener("input", () => {
-    const q = searchInput.value.trim().toLowerCase();
-    if (!q) { dropdown.style.display = "none"; return; }
-    const matches = allProjects.filter(p =>
-      (p.name || "").toLowerCase().includes(q) ||
-      (p.projectNumber || "").toLowerCase().includes(q)
-    ).slice(0, 10);
-    if (!matches.length) { dropdown.style.display = "none"; return; }
-    dropdown.innerHTML = matches.map(p => `
-      <div class="proj-option" data-id="${p.id}">
-        <div class="proj-num">${p.projectNumber || ""}</div>
-        <div class="proj-name">${p.name || ""}</div>
-      </div>
-    `).join("");
-    dropdown.style.display = "block";
-    dropdown.querySelectorAll(".proj-option").forEach(el => {
-      el.onclick = () => {
-        setSelectedProject(allProjects.find(p => p.id === el.dataset.id), true);
-        searchInput.value = "";
-        dropdown.style.display = "none";
-      };
-    });
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      const q = searchInput.value.trim().toLowerCase();
+      if (!q) { dropdown.style.display = "none"; return; }
+      const matches = allProjects.filter(p =>
+        (p.name || "").toLowerCase().includes(q) ||
+        (p.projectNumber || "").toLowerCase().includes(q)
+      ).slice(0, 10);
+      if (!matches.length) { dropdown.style.display = "none"; return; }
+      dropdown.innerHTML = matches.map(p => `
+        <div class="proj-option" data-id="${p.id}">
+          <div class="proj-num">${p.projectNumber || ""}</div>
+          <div class="proj-name">${p.name || ""}</div>
+        </div>
+      `).join("");
+      dropdown.style.display = "block";
+    }, 150);
   });
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".project-search-wrapper")) dropdown.style.display = "none";
   });
+}
+
+// O(1) project lookup. The Map is rebuilt lazily whenever the allProjects
+// ARRAY REFERENCE changes (cache hydration and fresh loads always assign a
+// new array, they never mutate in place — so reference identity is a valid
+// staleness check). Replaces linear .find() scans in render loops.
+let _projectMapSource = null;
+let _projectMap = null;
+function getProjectById(id) {
+  if (_projectMapSource !== allProjects) {
+    _projectMap = new Map((allProjects || []).map(p => [p.id, p]));
+    _projectMapSource = allProjects;
+  }
+  return _projectMap.get(id);
 }
 // ─── OUTLOOK ITEM CONTEXT (MAIL + CALENDAR) ─────────────────────────────────
 function dedupeParticipants(participants) {
@@ -1373,7 +1393,7 @@ async function doSignIn() {
     localStorage.setItem(LAST_ACCOUNT_STORAGE_KEY, msalAccount?.homeAccountId || "");
     await onSignedIn();
   } catch (e) {
-    setStatus("signInStatus", "error", "✗ Sign-in failed: " + e.message);
+    setStatus("signInStatus", "error", "✗ Sign-in failed: " + humanizeError(e));
   }
 }
 async function doSignOut() {
@@ -1389,9 +1409,29 @@ async function doSignOut() {
 }
 async function onSignedIn() {
   showView("mainView");
-  await loadProjects();
-  await restoreProjectSelectionForCurrentEmail();
-  updateProjectQuickLinks();
+  // loadProjects() hydrates allProjects from the localStorage cache
+  // synchronously (before its first await), so when the cache has data the
+  // project selection can be restored immediately — the fresh Supabase fetch
+  // keeps running in the background instead of gating the pane for the whole
+  // network round trip.
+  const freshLoad = loadProjects();
+  if (allProjects.length) {
+    await restoreProjectSelectionForCurrentEmail();
+    updateProjectQuickLinks();
+    freshLoad.then(async () => {
+      // Re-restore only if nothing got selected from cache — never stomp a
+      // selection the user made while the fetch was in flight.
+      if (!selectedProject) {
+        await restoreProjectSelectionForCurrentEmail();
+        updateProjectQuickLinks();
+      }
+    }).catch(() => {});
+  } else {
+    // Cold start (no cache yet) — nothing to restore from, wait for the fetch.
+    await freshLoad;
+    await restoreProjectSelectionForCurrentEmail();
+    updateProjectQuickLinks();
+  }
   // Surface any saves that didn't complete on a previous session.
   try { showPendingFilingBanner(); } catch (e) { console.warn("[filing-queue] banner render failed:", e.message); }
 }
@@ -2564,7 +2604,7 @@ async function restoreProjectSelectionForCurrentEmail() {
     renderProjectSuggestions();
     return;
   }
-  const project = allProjects.find(p => p.id === projectId);
+  const project = getProjectById(projectId);
   if (project) {
     console.info("[restore] Restored project via", restoredVia, ":", project.projectNumber || project.name);
     setSelectedProject(project, false);
@@ -2697,7 +2737,7 @@ function renderProjectSuggestions() {
   `).join("");
   chips.querySelectorAll(".suggestion-chip").forEach(el => {
     el.onclick = () => {
-      const proj = allProjects.find(p => p.id === el.dataset.id);
+      const proj = getProjectById(el.dataset.id);
       if (proj) setSelectedProject(proj, true);
     };
   });
@@ -3076,7 +3116,7 @@ async function renderResponseWatchlist() {
     if (!stillOpen.length) { block.style.display = "none"; list.innerHTML = ""; return; }
     if (count) count.textContent = String(stillOpen.length);
     list.innerHTML = stillOpen.map(r => {
-      const proj    = (allProjects || []).find(p => p.id === r.project_id);
+      const proj    = getProjectById(r.project_id);
       const reasons = Array.isArray(r.reasons) ? r.reasons.join(" · ") : "";
       const due     = r.due_date
         ? `<span class="wl-due">due ${escHtml(new Date(r.due_date + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }))}</span>`
@@ -3881,6 +3921,12 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
     let succeeded = 0;
     for (let i = 0; i < items.length; i += ATTACHMENT_CONCURRENCY) {
       const batch = items.slice(i, i + ATTACHMENT_CONCURRENCY);
+      // Multi-attachment saves can run 30s+ on big files; surface progress in
+      // whatever busy-status slot the calling flow already opened so users can
+      // tell "working" from "stuck" (and don't re-click Save).
+      if (items.length > 1 && _busyStatusElId) {
+        setStatus(_busyStatusElId, "info", "⏳ Uploading attachments… " + Math.min(i + batch.length, items.length) + "/" + items.length);
+      }
       const results = await Promise.allSettled(batch.map(doUpload));
       results.forEach((r, idx) => {
         const it = batch[idx];
@@ -4559,7 +4605,7 @@ async function withFilingScaffold(opts, runUpload) {
     dequeueFilingIntent(queueId);
     return result;
   } catch (e) {
-    setStatus(statusElement, "error", "✗ " + e.message);
+    setStatus(statusElement, "error", "✗ " + humanizeError(e));
     void logFilingOp({
       project_id:    selectedProject.id,
       msg_id:        snapItem?.itemId || null,
@@ -4609,7 +4655,7 @@ if (existingRecord) {
         setStatus("actionStatus", "error", "✗ Link failed" + (linkResult.label || ""));
       }
     } catch (e) {
-      setStatus("actionStatus", "error", "✗ Link failed: " + e.message);
+      setStatus("actionStatus", "error", "✗ Link failed: " + humanizeError(e));
     }
     // Reset link dropdown so subsequent saves don't re-link
     const linkToEl = document.getElementById("linkToTarget");
@@ -4651,7 +4697,7 @@ if (existingRecord) {
     operation:     "email-sp",
     email_subject: snapSubject,
   });
-  setStatus("actionStatus", "info", pickSavingMessage());
+  setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
   try {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
@@ -4745,7 +4791,7 @@ if (existingRecord) {
     const linkSuffix = linkResult.label || "";
     if (attempted > 0 && attCount === 0) {
       const sample = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
-      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample || "Open browser console for details.") + (warnings.length ? " " + warnings.join(" ") : "") + linkSuffix);
+      setStatus("actionStatus", "error", "Email saved, but 0/" + attempted + " attachments uploaded. " + (sample ? "Failed: " + sample + ". " : "") + "Try saving again — if it keeps failing, check your connection (VPN?)." + (warnings.length ? " " + warnings.join(" ") : "") + linkSuffix);
     } else if (warnings.length > 0) {
       setStatus("actionStatus", "info", "✓ Saved to SharePoint" + attMsg + " and project record. " + warnings.join(" ") + linkSuffix);
     } else if (attempted === 0) {
@@ -4787,7 +4833,7 @@ if (existingRecord) {
     // a "partial" audit log row; the queue is only for crash recovery.)
     dequeueFilingIntent(queueId);
   } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + e.message);
+    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     void logFilingOp({
       project_id:    selectedProject.id,
       msg_id:        currentMsgId,
@@ -4813,7 +4859,7 @@ async function _doSaveToProjectRecordOnly() {
     refreshEmailSavedIndicator();
     return;
   }
-  setStatus("actionStatus", "info", pickSavingMessage());
+  setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
@@ -4867,7 +4913,7 @@ async function _doSaveToProjectRecordOnly() {
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
   } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + e.message);
+    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
@@ -5099,7 +5145,7 @@ async function sendToTeamsChannel() {
     setStatus("actionStatus", "success",
       "✓ Posted to Teams channel" + (attCount > 0 ? ` (${attCount} attachment${attCount === 1 ? "" : "s"} not transferred)` : ""));
   } catch (e) {
-    setStatus("actionStatus", "error", "Send-to-Teams failed: " + e.message);
+    setStatus("actionStatus", "error", "Send-to-Teams failed: " + humanizeError(e));
   }
 }
 
@@ -5363,7 +5409,7 @@ async function doSaveNote() {
       setTimeout(() => showView("mainView"), 700);
     }
   } catch (e) {
-    setStatus("noteStatus", "error", "✗ " + e.message);
+    setStatus("noteStatus", "error", "✗ " + humanizeError(e));
     // Re-enable the button so the user can retry after fixing the error.
     if (saveNoteBtn) saveNoteBtn.disabled = false;
   } finally {
@@ -5439,7 +5485,7 @@ async function doSaveActionItem() {
     document.getElementById("actionItemOwner").value = "";
     document.getElementById("actionItemDueDate").value = "";
   } catch (e) {
-    setStatus("actionItemStatus", "error", "✗ " + e.message);
+    setStatus("actionItemStatus", "error", "✗ " + humanizeError(e));
     if (saveBtn) saveBtn.disabled = false;
   } finally {
     saveInFlight = false;
@@ -6342,6 +6388,44 @@ function nextAutoRfiNumber() {
   return "RFI-" + String(count).padStart(3, "0");
 }
 
+// Seed a description textarea with the email's plain-text body. Async —
+// Office hands the body back on a callback — so the fill is guarded: only
+// applied if the field is still empty when the text arrives (never overwrite
+// something the user started typing) and only if the pinned pane hasn't
+// switched to a different email mid-fetch. Quoted reply history is cut at the
+// first "From:" / "On … wrote:" marker since an RFI/submittal description
+// wants the new ask, not the whole thread.
+function seedDescriptionFromEmailBody(fieldId, maxChars = 600) {
+  const item = emailItem;
+  if (!item?.body?.getAsync) return;
+  item.body.getAsync(Office.CoercionType.Text, r => {
+    if (r.status !== Office.AsyncResultStatus.Succeeded) return;
+    if (emailItem !== item) return;
+    const el = document.getElementById(fieldId);
+    if (!el || el.value.trim()) return;
+    let text = (r.value || "").replace(/\r\n/g, "\n").trim();
+    const cut = text.search(/\n\s*(From:|-{3,}\s*Original Message|On .{10,80} wrote:)/i);
+    if (cut > 0) text = text.slice(0, cut).trim();
+    if (text.length > maxChars) text = text.slice(0, maxChars).trimEnd() + "…";
+    if (text) el.value = text;
+  });
+}
+
+// Default an assignee <select> to the project's Setty PM when they're on the
+// team roster — the most common routing for incoming RFIs/submittals. The
+// dropdown options are "staff:<member.id>", so match the PM by name.
+function defaultAssigneeToPm(selectId) {
+  const pmName = (selectedProject?.settyPm || "").trim().toLowerCase();
+  if (!pmName) return;
+  const pm = (selectedProject?.teamMembers || []).find(m =>
+    m?.id && (m.name || "").trim().toLowerCase() === pmName
+  );
+  const sel = document.getElementById(selectId);
+  if (pm && sel && sel.querySelector(`option[value="staff:${pm.id}"]`)) {
+    sel.value = "staff:" + pm.id;
+  }
+}
+
 function prefillRfi() {
   document.getElementById("rfiTitle").value = emailItem?.subject || "";
   document.getElementById("rfiNumber").value = nextAutoRfiNumber();
@@ -6353,6 +6437,8 @@ function prefillRfi() {
   // Procore/ACC/etc.
   document.getElementById("rfiReceivedVia").value = "Email";
   populateRfiAssigneeDropdown();
+  defaultAssigneeToPm("rfiAssignedTo");
+  seedDescriptionFromEmailBody("rfiDescription");
   setRfiMode("new");
   renderRfiPicker();
 }
@@ -6675,7 +6761,7 @@ async function submitRfiResponse() {
       showView("mainView");
     }, 1500);
   } catch (e) {
-    setStatus("rfiResponseStatusMsg", "error", "✗ " + e.message);
+    setStatus("rfiResponseStatusMsg", "error", "✗ " + humanizeError(e));
     console.error("[rfi-response]", e);
   } finally {
     if (submitBtn) submitBtn.disabled = false;
@@ -6897,6 +6983,8 @@ function prefillSub() {
   document.getElementById("subAssignedTo").value = "";
   document.getElementById("subReceivedVia").value = "Email";
   populateSubAssigneeDropdown();
+  defaultAssigneeToPm("subAssignedTo");
+  seedDescriptionFromEmailBody("subFullDescription");
   setSubMode("new");
   renderSubPicker();
 }
@@ -7146,7 +7234,7 @@ async function submitSubReview() {
       showView("mainView");
     }, 1500);
   } catch (e) {
-    setStatus("subReviewStatusMsg", "error", "✗ " + e.message);
+    setStatus("subReviewStatusMsg", "error", "✗ " + humanizeError(e));
     console.error("[sub-review]", e);
   } finally {
     if (submitBtn) submitBtn.disabled = false;
@@ -7648,7 +7736,7 @@ async function doSaveMilestone() {
     }
     document.getElementById("milestoneForm").style.display = "none";
   } catch(e) {
-    setStatus("milestoneStatus", "error", "✗ " + e.message);
+    setStatus("milestoneStatus", "error", "✗ " + humanizeError(e));
   } finally {
     saveInFlight = false;
   }
@@ -7808,8 +7896,14 @@ async function doSaveContact() {
       // the field no longer needs manual entry in PMS.
       const today = new Date().toISOString().slice(0, 10);
       const contact = { id: uid(), name, title, email, phone, lastContacted: today };
-      // Find existing client by exact (case-insensitive) name match
-      const queryUrl = SUPABASE_URL + "/rest/v1/pms_clients?select=id,client,version";
+      // Find existing client by exact (case-insensitive) name match.
+      // Narrow server-side with ilike so we don't download the whole clients
+      // table on every contact save — escape LIKE metacharacters so names
+      // containing % _ * match literally, and wrap in wildcards so DB names
+      // with stray whitespace padding still come back. The .find() below
+      // remains the authority (same trim/lowercase equality as before).
+      const likeSafe = targetCompany.replace(/\\/g, "\\\\").replace(/[%_*]/g, m => "\\" + m);
+      const queryUrl = SUPABASE_URL + "/rest/v1/pms_clients?select=id,client,version&client->>name=ilike." + encodeURIComponent("*" + likeSafe + "*");
       const all = await fetch(queryUrl, { headers: SB_HEADERS });
       if (!all.ok) throw new Error("pms_clients GET HTTP " + all.status);
       const rows = await all.json();
@@ -7939,7 +8033,7 @@ async function doSaveContact() {
       showPeopleView();
       return;
     }
-    setStatus("contactStatus", "error", "✗ " + e.message);
+    setStatus("contactStatus", "error", "✗ " + humanizeError(e));
   } finally {
     saveInFlight = false;
   }
@@ -8000,11 +8094,54 @@ setTimeout(() => {
     loading.innerHTML = '<p style="color:#94a3b8;font-size:12px;text-align:center;padding:0 16px;">Open this add-in from Outlook.<br/>To sideload, use the manifest.xml file.</p>';
   }
 }, 5000);
+// While a "⏳ …" busy message is showing, this holds its element id so the
+// attachment upload loop can push progress updates ("2/5") into the same slot.
+let _busyStatusElId = null;
+
 function setStatus(elId, type, msg) {
   const el = document.getElementById(elId);
   if (!el) return;
   el.className = "status-msg" + (msg ? " show " + type : "");
-  el.textContent = msg;
+  // "⏳" prefix = busy message. Swap the static emoji for the animated
+  // spinner so users can tell a working save from a stuck one — every
+  // existing call site opts in just by keeping the emoji convention.
+  if (msg && msg.startsWith("⏳")) {
+    el.textContent = msg.slice(1).trim();
+    const spin = document.createElement("span");
+    spin.className = "spinner";
+    spin.style.cssText = "vertical-align:-2px;margin-right:6px;";
+    el.prepend(spin);
+    _busyStatusElId = elId;
+  } else {
+    el.textContent = msg;
+    if (_busyStatusElId === elId) _busyStatusElId = null;
+  }
+}
+
+// Map raw API/SDK failures to plain-language guidance. The raw message still
+// goes to the console for debugging — the line the user sees should say what
+// happened and what to DO, never an HTTP status or a JSON dump.
+function humanizeError(err) {
+  const raw = (err?.message || String(err || "")).trim();
+  console.warn("[error shown to user]", raw);
+  const m = raw.toLowerCase();
+  if (m.includes("graph 401") || m.includes("interaction_required") || m.includes("login_required") || m.includes("not signed in"))
+    return "Your session expired — sign out (⋯ menu) and back in, then retry.";
+  if (m.includes("graph 403"))
+    return "You don't have permission for that SharePoint location — check your access with IT.";
+  if (m.includes("graph 404"))
+    return "Outlook hasn't synced this message to the cloud yet — wait a few seconds and retry.";
+  if (m.includes("graph 429") || m.includes("graph 503") || m.includes("graph 504"))
+    return "Microsoft is throttling requests right now — wait a moment and retry.";
+  if (m.includes("save conflict") || m.includes("modified by someone else"))
+    return "Someone else updated this project at the same moment. Retry — the add-in re-reads the latest version before saving.";
+  if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))
+    return "Network hiccup — check your connection (VPN?) and retry.";
+  if (m.includes("quota"))
+    return "Browser storage is full — the save went through, but offline caching is paused.";
+  // Unknown failure: show the message but capped so a stray API body can't
+  // flood the status line.
+  return raw.length > 160 ? raw.slice(0, 160) + "…" : raw;
 }
 
 // ─── QUICK TEXT + EMAIL TEMPLATES ─────────────────────────────────────────────
