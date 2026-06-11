@@ -8222,13 +8222,24 @@ async function doSaveContact() {
   if (saveInFlight) { setStatus("contactStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   saveInFlight = true;
   setStatus("contactStatus", "info", "⏳ Saving…");
+  let resolvedCompany = ""; // which company the contact actually landed under (for the success message)
   try {
     if (saveTo === "client") {
       // V2: write to pms_clients (per-client rows). Previously this PATCHed
       // pms_data.clients (legacy singleton blob), which post-migration is
       // never re-read by PMS — so the contact silently disappeared. Now we
       // upsert the client row directly.
-      const targetCompany = (company || name).trim();
+      //
+      // Company resolution order:
+      //   1. what the user typed in the Company field
+      //   2. an existing directory company whose contacts share this email's
+      //      domain — prevents auto-creating a company named after the PERSON
+      //      when the field is blank (June 2026: "Kunwar Rana" became a
+      //      Global Directory company even though Code Green already held
+      //      @codegreen.com contacts)
+      //   3. the person's name (legacy last resort)
+      const domainClient = !company ? getClientByEmail(email) : null;
+      const targetCompany = (company || domainClient?.name || name).trim();
       // Per-contact role removed from the schema (was redundant once company
       // discipline + per-project relationship were split). `lastContacted` is
       // stamped here so every Outlook-driven capture auto-updates recency —
@@ -8246,7 +8257,25 @@ async function doSaveContact() {
       const all = await fetch(queryUrl, { headers: SB_HEADERS });
       if (!all.ok) throw new Error("pms_clients GET HTTP " + all.status);
       const rows = await all.json();
-      const existing = (rows || []).find(r => r.client?.name && r.client.name.trim().toLowerCase() === targetCompany.toLowerCase());
+      let existing = (rows || []).find(r => r.client?.name && r.client.name.trim().toLowerCase() === targetCompany.toLowerCase());
+      // Exact match failed → normalized fallbacks before concluding "new
+      // company". Squash punctuation/spacing/legal suffixes (LLP, PC, …),
+      // then allow prefix containment: "OGS" ≈ "OGS - New York State",
+      // "Code Green" ≈ "Code Green Solutions". Exact-only matching is what
+      // created the second OGS row in the Global Directory (June 2026).
+      // Mirrors companySquash()/findDuplicateCompanies() in SettyPMS.html.
+      if (!existing) {
+        const squashName = s => (s || "").toLowerCase()
+          .replace(/\b(llp|llc|inc|pc|pllc|dpc|corp|co|ltd|pa)\b\.?/g, "")
+          .replace(/[^a-z0-9]/g, "");
+        const targetSquash = squashName(targetCompany);
+        existing = (rows || []).find(r => targetSquash && squashName(r.client?.name) === targetSquash)
+          || (rows || []).find(r => {
+               const n = squashName(r.client?.name);
+               return targetSquash.length >= 3 && n.length >= 3 && (n.startsWith(targetSquash) || targetSquash.startsWith(n));
+             });
+      }
+      resolvedCompany = existing?.client?.name || targetCompany;
       if (existing) {
         const ec = existing.client;
         ec.contacts = ec.contacts || [];
@@ -8357,8 +8386,11 @@ async function doSaveContact() {
     // is almost always working through several participants in sequence.
     const savedEmailKey = (email || "").toLowerCase();
     if (savedEmailKey) _sessionSavedContactEmails.add(savedEmailKey);
+    // resolvedCompany may differ from what was typed (domain match or
+    // normalized-name match) — show where the contact ACTUALLY landed so a
+    // silent redirect is never invisible to the user.
     const destLabel = saveTo === "client"
-      ? (company || name)
+      ? (resolvedCompany || company || name)
       : ((selectedProject?.projectNumber ? selectedProject.projectNumber + " — " : "") + (selectedProject?.name || "project POC"));
     // When saved to a client AND a project is tagged, the contact also lands
     // in the project's directory — surface that in the success message so users
