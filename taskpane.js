@@ -7567,9 +7567,13 @@ async function createMilestoneCalendarEvent(milestone, project) {
   const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
   const prefix  = project.projectNumber ? "[" + project.projectNumber + "] " : "";
   const subject = prefix + project.name + " — " + milestone.name;
+  const pmName  = (project.settyPm || "").trim();
   const event = {
     subject,
     isAllDay: true,
+    // Surface the PM on the calendar's Location line so a glance at the day
+    // view shows who owns the milestone. Graph's `location` is an object.
+    ...(pmName ? { location: { displayName: "PM: " + pmName } } : {}),
     // No reminder — these are reference markers on the calendar, not things to
     // be alerted about. Must be explicit: omitting it lets Graph apply the
     // mailbox's default reminder, which was spamming everyone.
