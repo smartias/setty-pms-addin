@@ -3404,20 +3404,35 @@ function updatePeopleButtonBadge() {
   if (!btn) return;
   const statuses = (emailParticipants || []).map(getParticipantDirectoryStatus);
   const newCount = statuses.filter(s => s.isNew).length;
-  const addableToProject = statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length;
+  // "+ project" only makes sense once the email is tagged to a project — without
+  // one there's nowhere to add them, so a global-directory hit alone must NOT
+  // keep the button on screen. (Previously this counted regardless of project,
+  // which is why the button always showed on untagged emails.)
+  const addableToProject = selectedProject
+    ? statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length
+    : 0;
   // Even when everyone's already filed, surface the button if the sender's
   // record can be enriched from this email's signature — otherwise the
   // enrichment nudge inside the people view would be unreachable.
-  const enrichable = !!senderNeedsEnrichment();
+  const enrichRec = senderNeedsEnrichment();
   // Hidden in compose (nothing filed yet — mirrors applyComposeModeUiGuard)
   // and whenever there's no one actionable.
   const compose = (typeof isComposeMode === "function") && isComposeMode();
-  btn.style.display = (!compose && (newCount > 0 || addableToProject > 0 || enrichable)) ? "" : "none";
-  btn.textContent = newCount > 0
-    ? "👥 Add Participant to Contacts (" + newCount + " new)"
-    : "👥 Add Participant to Contacts";
-  // Visually promote the button when there's actually someone to capture.
-  btn.classList.toggle("btn-has-new", newCount > 0);
+  btn.style.display = (!compose && (newCount > 0 || addableToProject > 0 || !!enrichRec)) ? "" : "none";
+  // Label: new contacts take priority. When the ONLY reason to show is the
+  // signature-enrichment opportunity, say so on the button itself.
+  if (newCount > 0) {
+    btn.textContent = "👥 Add Participant to Contacts (" + newCount + " new)";
+  } else if (enrichRec && addableToProject === 0) {
+    const who = (enrichRec.name || "").trim().split(/\s+/)[0];
+    btn.textContent = who
+      ? "✍️ Complete " + who + "'s contact from signature"
+      : "✍️ Complete a contact from its signature";
+  } else {
+    btn.textContent = "👥 Add Participant to Contacts";
+  }
+  // Visually promote the button when there's actually someone to capture or enrich.
+  btn.classList.toggle("btn-has-new", newCount > 0 || (!!enrichRec && addableToProject === 0));
 }
 // ─── TRANSIENT-FAILURE RETRY HELPER ──────────────────────────────────────────
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
