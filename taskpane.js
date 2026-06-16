@@ -3366,6 +3366,23 @@ function isInProjectDirectory(email) {
 function isSettyInternalEmail(email) {
   return (email || "").trim().toLowerCase().endsWith("@setty.com");
 }
+// Enrichment opportunity: the SENDER is already filed (global directory or this
+// project's directory) but their saved record has NEITHER a title NOR a phone —
+// both of which this email's signature can fill in one tap. We require both to
+// be blank on purpose: titles scrape unreliably (the parser often grabs the firm
+// name), so a title-only gap isn't worth nagging about. Returns the saved record
+// when it's enrichable, otherwise null.
+function senderNeedsEnrichment() {
+  const addr = (emailFromAddress || "").trim().toLowerCase();
+  if (!addr) return null;
+  const rec = findGlobalContact(addr)?.contact
+    || (selectedProject?.directory || []).find(d => (d.email || "").trim().toLowerCase() === addr)
+    || null;
+  if (!rec) return null;
+  const noTitle = !(rec.title || "").trim();
+  const noPhone = !(rec.phone || "").trim();
+  return (noTitle && noPhone) ? rec : null;
+}
 function getParticipantDirectoryStatus(p) {
   const emailLc = (p?.emailAddress || "").trim().toLowerCase();
   const internal = isSettyInternalEmail(emailLc);
@@ -3388,10 +3405,14 @@ function updatePeopleButtonBadge() {
   const statuses = (emailParticipants || []).map(getParticipantDirectoryStatus);
   const newCount = statuses.filter(s => s.isNew).length;
   const addableToProject = statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length;
+  // Even when everyone's already filed, surface the button if the sender's
+  // record can be enriched from this email's signature — otherwise the
+  // enrichment nudge inside the people view would be unreachable.
+  const enrichable = !!senderNeedsEnrichment();
   // Hidden in compose (nothing filed yet — mirrors applyComposeModeUiGuard)
   // and whenever there's no one actionable.
   const compose = (typeof isComposeMode === "function") && isComposeMode();
-  btn.style.display = (!compose && (newCount > 0 || addableToProject > 0)) ? "" : "none";
+  btn.style.display = (!compose && (newCount > 0 || addableToProject > 0 || enrichable)) ? "" : "none";
   btn.textContent = newCount > 0
     ? "👥 Add Participant to Contacts (" + newCount + " new)"
     : "👥 Add Participant to Contacts";
@@ -7971,14 +7992,13 @@ function showPeopleView() {
         quickAddToProjectDirectory(+btn.dataset.idx, btn);
       };
     });
-    // Nudge: the sender is already filed but their record is missing title or
-    // phone — this email's signature can likely fill it in one tap. Skipped
-    // when another action just posted a status (e.g. quick-add success).
-    const senderRec = findGlobalContact(emailFromAddress || "")?.contact;
+    // Nudge: the sender is already filed but their record has neither title nor
+    // phone — this email's signature can fill both in one tap. Skipped when
+    // another action just posted a status (e.g. quick-add success).
+    const senderRec = senderNeedsEnrichment();
     const statusEl = document.getElementById("peopleStatus");
-    if (senderRec && (!senderRec.title || !senderRec.phone) && statusEl && !statusEl.textContent) {
-      const missing = !senderRec.title && !senderRec.phone ? "title and phone" : (!senderRec.title ? "title" : "phone");
-      setStatus("peopleStatus", "info", "💡 " + (senderRec.name || emailFrom || "The sender") + "'s saved contact has no " + missing + " — tap their row to fill it from this email's signature.");
+    if (senderRec && statusEl && !statusEl.textContent) {
+      setStatus("peopleStatus", "info", "💡 " + (senderRec.name || emailFrom || "The sender") + "'s saved contact has no title or phone — tap their row to fill it from this email's signature.");
     }
   }
   updatePeopleButtonBadge();
