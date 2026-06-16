@@ -4157,7 +4157,12 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
     // Fallback to Graph attachment APIs when Office APIs are unavailable.
     const restId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
     const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
-    const fileAtts = (attData?.value || []).filter(att => att["@odata.type"] === "#microsoft.graph.fileAttachment");
+    const fileAtts = (attData?.value || []).filter(att =>
+      att["@odata.type"] === "#microsoft.graph.fileAttachment" &&
+      // Skip small inline images (signature logos, social icons, banners).
+      // att.size here is MIME-encoded (~+33%), so 40KB encoded ≈ 30KB raw —
+      // comfortably above logo size, below real pasted screenshots/photos.
+      !(att.isInline && att.contentType && att.contentType.startsWith("image/") && att.size < 40000));
     lastAttachmentUploadStats.attempted = fileAtts.length;
     const uniqueGraphNames = uniquifyNames(fileAtts.map(a => a.name));
     lastAttachmentUploadStats.attemptedNames = uniqueGraphNames;
@@ -4289,6 +4294,11 @@ async function getOfficeFileAttachments(item) {
     });
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
     const bytes = toBytesFromBase64(content.content);
+    // Skip small inline images (signature logos, social icons, banners) — same
+    // rule as the Graph fallback path. bytes.length is the true raw size here,
+    // so the 40KB cutoff is a hair stricter than the Graph path's encoded size,
+    // but both reliably catch logos and keep real pasted screenshots/photos.
+    if (att.isInline && (att.contentType || "").startsWith("image/") && bytes.length < 40000) continue;
     // NOTE: Office.js's att.size is NOT the raw byte count — it's the
     // MIME-encoded size including base64 transport overhead (~+33%) and headers.
     // So we can't validate decoded bytes against att.size here. The Graph
