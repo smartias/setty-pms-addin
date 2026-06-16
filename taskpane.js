@@ -8412,6 +8412,23 @@ async function doSaveContact() {
         if (!res.ok) throw new Error("pms_clients PATCH HTTP " + res.status);
         const result = await res.json();
         if (!result || result.length === 0) throw new Error("Client modified by someone else. Retry from Outlook.");
+        // Sync the in-memory directory with what we just persisted. allClients is
+        // loaded once per session (and cached), NOT refetched per email — without
+        // this, findGlobalContact keeps returning the stale, pre-enrichment record,
+        // so the signature nudge re-fires every time the email is reopened even
+        // though the title/phone are now saved.
+        const _cid = ec.id || existing.id;
+        const _savedLc = (email || "").trim().toLowerCase();
+        let _synced = false;
+        allClients = (allClients || []).map(c => {
+          if (_synced) return c;
+          const idHit = _cid && c?.id === _cid;
+          const emailHit = _savedLc && (c?.contacts || []).some(x => (x.email || "").trim().toLowerCase() === _savedLc);
+          if (idHit || emailHit) { _synced = true; return ec; }
+          return c;
+        });
+        if (!_synced) allClients = [...(allClients || []), ec];
+        renderCompanySuggestions();
       } else {
         // New client — INSERT. Discipline `types` left empty; the user
         // categorizes in PMS Global Directory (multi-choice picker).
