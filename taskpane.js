@@ -8468,12 +8468,26 @@ async function doSaveContact() {
         try {
           await applyLocalChangeAndSave(selectedProject.id, fresh => {
             const dir = fresh.directory || [];
-            // Dedup by email when present; if no email, allow add (user can
-            // clean up later — the alternative is silently dropping entries
-            // that are otherwise valid).
-            if (emailLc && dir.some(d => (d.email || "").toLowerCase() === emailLc)) {
-              return fresh;
+            // Already on this project? Backfill only the blank fields (enrich,
+            // never overwrite) so a captured title/phone reaches the project's
+            // directory too — not just the global one. Without this, the
+            // project "people on this job" entry stays blank and the enrichment
+            // nudge keeps re-firing for project-filed senders.
+            const existingIdx = emailLc ? dir.findIndex(d => (d.email || "").toLowerCase() === emailLc) : -1;
+            if (existingIdx >= 0) {
+              const cur = dir[existingIdx];
+              if ((cur.title || "").trim() && (cur.phone || "").trim()) return fresh; // nothing to fill
+              const nextDir = dir.slice();
+              nextDir[existingIdx] = {
+                ...cur,
+                name:  cur.name  || name,
+                title: cur.title || title,
+                phone: cur.phone || phone,
+              };
+              return { ...fresh, directory: nextDir };
             }
+            // No email to dedup on → allow the add (user can clean up later; the
+            // alternative is silently dropping otherwise-valid entries).
             return { ...fresh, directory: [...dir, dirEntry] };
           });
         } catch (dirErr) {
