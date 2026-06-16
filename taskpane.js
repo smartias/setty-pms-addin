@@ -257,8 +257,9 @@ function setupEventListeners() {
   const submitSubRev = document.getElementById("submitSubReviewBtn");
   if (submitSubRev) submitSubRev.onclick = submitSubReview;
   document.getElementById("peopleBack").onclick  = () => showView("mainView");
-  // Contact form back returns to peopleView (the only entry point); peopleBack handles return-to-main
-  document.getElementById("contactBack").onclick = () => showView("peopleView");
+  // Contact form back returns wherever it was opened from — the participant list
+  // normally, or the main screen when reached via the enrich-from-signature shortcut.
+  document.getElementById("contactBack").onclick = () => showView(_contactReturnView || "peopleView");
   document.getElementById("datesBack").onclick   = () => showView("mainView");
   // "More" expander — persist open/closed state across emails so power users
   // who expand it once don't have to keep doing so.
@@ -270,7 +271,7 @@ function setupEventListeners() {
     });
   }
   document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
-  document.getElementById("addParticipantBtn").onclick = showPeopleView;
+  document.getElementById("addParticipantBtn").onclick = onAddParticipantClick;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveActionItemBtn").onclick = doSaveActionItem;
@@ -3375,6 +3376,9 @@ function isSettyInternalEmail(email) {
 function senderNeedsEnrichment() {
   const addr = (emailFromAddress || "").trim().toLowerCase();
   if (!addr) return null;
+  // Saved/enriched this session — stop nudging immediately, even before the
+  // in-memory directory cache reflects the backfilled title/phone.
+  if (_sessionSavedContactEmails.has(addr)) return null;
   const rec = findGlobalContact(addr)?.contact
     || (selectedProject?.directory || []).find(d => (d.email || "").trim().toLowerCase() === addr)
     || null;
@@ -3399,9 +3403,10 @@ function getParticipantDirectoryStatus(p) {
 // or already filed everywhere relevant — the button disappears entirely.
 // "Actionable" includes the global-but-not-on-this-project case, since the
 // people view is where the one-click "+ project" add lives.
-function updatePeopleButtonBadge() {
-  const btn = document.getElementById("addParticipantBtn");
-  if (!btn) return;
+// Single source of truth for why the main-view button is showing, shared by the
+// badge renderer and the click handler so they never disagree about whether
+// this is an "enrich the sender from signature" click vs. the participant list.
+function peopleButtonMode() {
   const statuses = (emailParticipants || []).map(getParticipantDirectoryStatus);
   const newCount = statuses.filter(s => s.isNew).length;
   // "+ project" only makes sense once the email is tagged to a project — without
@@ -3412,9 +3417,18 @@ function updatePeopleButtonBadge() {
     ? statuses.filter(s => s.globalHit && !s.inProject && !s.sessionSaved).length
     : 0;
   // Even when everyone's already filed, surface the button if the sender's
-  // record can be enriched from this email's signature — otherwise the
-  // enrichment nudge inside the people view would be unreachable.
+  // record can be enriched from this email's signature.
   const enrichRec = senderNeedsEnrichment();
+  // "Enrich-only" = the signature opportunity is the SOLE reason to show — no new
+  // contacts to capture, nothing to add to a project. That's when the button
+  // jumps straight to the form and relabels itself.
+  const enrichOnly = newCount === 0 && addableToProject === 0 && !!enrichRec;
+  return { newCount, addableToProject, enrichRec, enrichOnly };
+}
+function updatePeopleButtonBadge() {
+  const btn = document.getElementById("addParticipantBtn");
+  if (!btn) return;
+  const { newCount, addableToProject, enrichRec, enrichOnly } = peopleButtonMode();
   // Hidden in compose (nothing filed yet — mirrors applyComposeModeUiGuard)
   // and whenever there's no one actionable.
   const compose = (typeof isComposeMode === "function") && isComposeMode();
@@ -3423,7 +3437,7 @@ function updatePeopleButtonBadge() {
   // signature-enrichment opportunity, say so on the button itself.
   if (newCount > 0) {
     btn.textContent = "👥 Add Participant to Contacts (" + newCount + " new)";
-  } else if (enrichRec && addableToProject === 0) {
+  } else if (enrichOnly) {
     const who = (enrichRec.name || "").trim().split(/\s+/)[0];
     btn.textContent = who
       ? "✍️ Complete " + who + "'s contact from signature"
@@ -3432,7 +3446,7 @@ function updatePeopleButtonBadge() {
     btn.textContent = "👥 Add Participant to Contacts";
   }
   // Visually promote the button when there's actually someone to capture or enrich.
-  btn.classList.toggle("btn-has-new", newCount > 0 || (!!enrichRec && addableToProject === 0));
+  btn.classList.toggle("btn-has-new", newCount > 0 || enrichOnly);
 }
 // ─── TRANSIENT-FAILURE RETRY HELPER ──────────────────────────────────────────
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
@@ -7956,7 +7970,43 @@ async function doSaveMilestone() {
 // saving, so they can immediately move on to the next person without losing
 // their place. Cleared per-email in loadItemContext.
 const _sessionSavedContactEmails = new Set();
+// Where the contact form should return to on Back / after save. Defaults to the
+// participant list; the enrich-from-main shortcut sets it to "mainView" so the
+// user lands back where they started with the (now-cleared) nudge.
+let _contactReturnView = "peopleView";
+// Main-view button click: when the button exists only to enrich the sender from
+// their signature, skip the participant list and open their form directly.
+// Otherwise behave as before and show the list.
+function onAddParticipantClick() {
+  const { enrichOnly } = peopleButtonMode();
+  if (enrichOnly) {
+    const senderAddr = (emailFromAddress || "").trim().toLowerCase();
+    const sender = (emailParticipants || []).find(p => (p.emailAddress || "").trim().toLowerCase() === senderAddr);
+    if (sender) {
+      _contactReturnView = "mainView";
+      prefillContactFromParticipant(sender);
+      return;
+    }
+  }
+  _contactReturnView = "peopleView";
+  showPeopleView();
+}
+// After a contact save, return where the user came from. From the enrich-from-
+// main shortcut that's the main screen; the badge refresh clears the nudge
+// (the sender is now in _sessionSavedContactEmails). From the list it's the list,
+// preserving the "work through several participants" flow.
+function returnAfterContactSave() {
+  if (_contactReturnView === "mainView") {
+    showView("mainView");
+    updatePeopleButtonBadge();
+  } else {
+    showPeopleView();
+  }
+}
 function showPeopleView() {
+  // Rows opened from here return to the list (not main) — the enrich-from-main
+  // shortcut overrides this before opening the form.
+  _contactReturnView = "peopleView";
   const list = document.getElementById("participantList");
   // Setty staff are managed via the project's Teams tab in PMS — leave them
   // out of the list entirely instead of rendering inert rows.
@@ -8448,7 +8498,7 @@ async function doSaveContact() {
     const dirSuffix = alsoInDirectory ? " · added to " + (selectedProject.name || "project") + " directory." : "";
     setStatus("actionStatus", "success", "✓ Saved " + (name || email) + " to " + destLabel + "." + dirSuffix);
     setStatus("contactStatus", "", "");
-    showPeopleView();
+    returnAfterContactSave();
     return;
   } catch (e) {
     if (e.message === "__DUP__") {
@@ -8458,7 +8508,7 @@ async function doSaveContact() {
       if (savedEmailKey) _sessionSavedContactEmails.add(savedEmailKey);
       setStatus("actionStatus", "info", "Already in this project's POC list — no duplicate added.");
       setStatus("contactStatus", "", "");
-      showPeopleView();
+      returnAfterContactSave();
       return;
     }
     setStatus("contactStatus", "error", "✗ " + humanizeError(e));
