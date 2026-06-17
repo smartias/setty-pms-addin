@@ -3067,10 +3067,16 @@ async function maybeAddToWatchlist(myGen) {
     if (currentItemKind !== "message" || !emailItem) return;
     const from = (emailFromAddress || "").toLowerCase();
     if (!from) return;
+    // Hard gate: never watch internal mail. A reply we owe is ALWAYS to an
+    // outside party, so anything from a @setty.com address is out — including a
+    // colleague's message inside a thread. This guard comes first because the
+    // getClientByEmail domain fallback below could otherwise match a @setty.com
+    // sender if a colleague was ever saved under a client's contact record.
+    if (isSettyInternalEmail(from)) return;
     // Gate: the sender must be a company on the global client list. This is
     // what keeps automated mail (Microsoft 365 notifications, newsletters,
-    // vendors) and internal @setty.com mail off the watchlist — getClientByEmail
-    // matches a known client by contact address or shared email domain.
+    // vendors) off the watchlist — getClientByEmail matches a known client by
+    // contact address or shared email domain.
     const client = getClientByEmail(emailFromAddress);
     if (!client) return;
 
@@ -3098,6 +3104,15 @@ async function maybeAddToWatchlist(myGen) {
 
     const conversationId = await getCurrentConversationId();
     if (!conversationId || myGen !== itemContextGeneration) return;
+
+    // Don't flag a thread Setty has already handled: if the most recent message
+    // in the conversation is from a @setty.com address, someone has replied and
+    // we owe nothing — so it never goes on the watchlist in the first place. The
+    // render-time check still enforces the 24-business-hour grace before a
+    // genuinely unanswered thread actually surfaces in the panel.
+    const threadState = await isThreadAwaitingReply(conversationId);
+    if (myGen !== itemContextGeneration) return;
+    if (!threadState.awaiting) return;
 
     // Best-effort deep link back to this email — lets the panel row reopen the
     // original. Captured here (not at render) because it needs the live item.
