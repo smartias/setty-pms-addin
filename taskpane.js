@@ -2752,6 +2752,12 @@ const SUGGESTION_WEIGHTS = {
 };
 const SUGGESTION_MIN_SCORE = 2;
 const SUGGESTION_MAX_RESULTS = 3;
+// Learned sender→project signal (the same filed-log RPC the sweep uses) cached for
+// the SYNCHRONOUS chips (suggestProjects). Loaded once per session by
+// ensureSenderSignalCache(); empty until it lands, then read synchronously so each
+// email you file makes the chips — not just the sweep — smarter about who files where.
+let _senderSignalCache = new Map();
+let _senderSignalPromise = null;
 // Words to ignore when tokenizing project names and subjects — too generic to
 // signal anything ("Project Renovation" matching "Renovation Project" should
 // not count as a hit).
@@ -2901,6 +2907,13 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
       scored.push({ project: p, score, reasons });
     }
   }
+
+  // Fold in the LEARNED sender→project signal (same filed-log data the sweep uses,
+  // cached on email open). Beyond boosting an existing subject match, mergeSenderSignal
+  // ADDS a candidate for a project this sender reliably files to — so a known sender
+  // surfaces the right job even when the subject names no project at all.
+  const learned = _senderSignalCache.get((senderEmail || "").trim().toLowerCase());
+  if (learned && learned.length) mergeSenderSignal(scored, learned);
 
   scored.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
   return scored.slice(0, SUGGESTION_MAX_RESULTS);
@@ -3078,6 +3091,21 @@ function mergeSenderSignal(candidates, senderProjects) {
   }
   candidates.sort((a, b) => b.score - a.score);
   return candidates;
+}
+
+// Load the learned sender→project map ONCE per session and cache it for the
+// synchronous chips (suggestProjects). Reuses the sweep's loader. onReady fires
+// only on the initial load so the chips can re-rank the moment the signal arrives;
+// after that every email reads _senderSignalCache synchronously. Refreshes on
+// taskpane reload (so a session's new filings show up next time the pane opens).
+function ensureSenderSignalCache(onReady) {
+  if (_senderSignalPromise) return _senderSignalPromise;
+  _senderSignalPromise = (async () => {
+    try { _senderSignalCache = await sweepLoadSenderMap(); }
+    catch { _senderSignalCache = new Map(); }
+  })();
+  if (typeof onReady === "function") _senderSignalPromise.then(onReady);
+  return _senderSignalPromise;
 }
 
 async function sweepRecentMail() {
@@ -3467,6 +3495,11 @@ function renderProjectSuggestions() {
   const labelText = document.getElementById("suggestionLabelText");
   if (!block || !chips) return;
   if (selectedProject) { block.style.display = "none"; chips.innerHTML = ""; return; }
+
+  // First email of the session: load the learned sender signal, then re-rank the
+  // chips once it lands (a known sender can surface a job with no subject match).
+  // No-op on later calls — the cache is warm and read synchronously by suggestProjects.
+  ensureSenderSignalCache(renderProjectSuggestions);
 
   const subject = (typeof emailItem?.subject === "string") ? emailItem.subject : "";
   const results = suggestProjects(subject, emailFromAddress);
@@ -5870,6 +5903,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // Always show an in-progress indicator (even on quiet auto-save) so users don't
   // click off the email mid-capture. Quiet only suppresses the celebration.
   setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
+  let ok = false;
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
@@ -5922,9 +5956,22 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     }
     if (!quiet) recordSaveAndCelebrate();
     refreshEmailSavedIndicator(!quiet);
+    ok = true;
   } catch (e) {
     if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     else console.warn("auto-save record failed:", e);
+  } finally {
+    // Never strand the "⏳ Logging email to project…" transient as a perpetual
+    // spinner. If it's STILL the active status after we finish — a quiet auto-save
+    // that failed on a transient conflict (common while a sweep is churning project
+    // versions), or a post-save refresh that didn't find the record — resolve it:
+    // clear on success, or point at the manual Save button on failure. Guarded on
+    // the in-progress text, so real "Saved"/"Logged"/"Auto-tagged" messages survive.
+    const el = document.getElementById("actionStatus");
+    if (el && (el.textContent || "").includes("Logging email to project")) {
+      if (ok) setStatus("actionStatus", "", "");
+      else setStatus("actionStatus", "info", "Couldn't auto-log this email — reopen it or use 🗂️ Save to Project.");
+    }
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
