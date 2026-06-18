@@ -2663,7 +2663,10 @@ async function restoreProjectSelectionForCurrentEmail() {
 
 // ─── PROJECT SUGGESTION ──────────────────────────────────────────────────────
 // Ranks projects by likelihood of being "the project this email is about" using
-// signals from subject, sender domain, and project number. We *suggest* (never
+// signals from the subject, the sender, the project number, and — now that each
+// job carries its own directory — how many of that job's contacts are on the
+// To/CC line and whether the email came from the job's designated PM contact.
+// We *suggest* (never
 // auto-apply) — accuracy matters more than saved clicks given multiple active
 // projects per client. Tier-1 (existing thread tag) is handled separately by
 // restoreProjectSelectionForCurrentEmail.
@@ -2677,6 +2680,15 @@ const SUGGESTION_WEIGHTS = {
   perNameTokenInSubject:   2,
   acronymInSubject:        3,
   senderDomainMatchClient: 4,
+  // Directory signals — the project directory lists who's on each job, so the
+  // people on an email can point straight at a project. Scored in
+  // directorySignalScore(). TUNE these against real mail; see the SCORING
+  // POLICY note there for the "how many is 'lots'?" decision.
+  // Set to 1 (not higher) because Setty's contacts often sit on several active
+  // jobs at once — so one shared name on CC stays below SUGGESTION_MIN_SCORE
+  // and can't surface a job alone; it takes 2+ contacts lining up.
+  perDirectoryContactOnThread: 1, // each project contact found on the To/CC line
+  senderIsDesignatedPm:        6, // FROM the job's designated PM (moderate: one PM often runs several jobs)
 };
 const SUGGESTION_MIN_SCORE = 2;
 const SUGGESTION_MAX_RESULTS = 3;
@@ -2709,6 +2721,70 @@ function suggestionAcronyms(name) {
     }
   }
   return out;
+}
+// Directory-based signal for one project. Two facts about an email point hard
+// at a job: how many of the job's OWN contacts are on the To/CC line, and
+// whether the email is FROM the job's designated PM contact. Both are computed
+// from data already in the cached project (directory[].email + the PM contact).
+//
+// We deliberately ignore our own firm's addresses — a Setty teammate is on
+// every internal thread, so their presence tells us nothing about WHICH job.
+//
+// KNOWN LIMITATION: a contact who sits on many active jobs (e.g. a county
+// facilities director) is less discriminating than one unique to a single job.
+// A later refinement could down-weight a contact by how many projects they
+// appear on (an inverse-frequency weight); for now every project contact on
+// the thread counts equally. Returns the { points, reasons } shape the caller
+// already accumulates.
+const FIRM_EMAIL_DOMAIN = "@setty.com";
+function directorySignalScore(project, participants, senderEmail) {
+  const norm = e => (e || "").trim().toLowerCase();
+  const isExternal = e => e && !e.endsWith(FIRM_EMAIL_DOMAIN);
+
+  // This job's discriminating contacts: external directory people + the
+  // designated PM, with our own firm's addresses filtered out.
+  const contactEmails = new Set(
+    [
+      ...((project.directory || []).map(d => norm(d.email))),
+      ...((project.projectContacts?.pm || []).map(c => norm(c.email))),
+    ].filter(isExternal)
+  );
+  if (!contactEmails.size) return { points: 0, reasons: [] };
+
+  // How many of them are on the To/CC line? (The sender is scored separately.)
+  const onThread = new Set(
+    (participants || [])
+      .filter(p => p.label === "To" || p.label === "CC")
+      .map(p => norm(p.emailAddress))
+      .filter(Boolean)
+  );
+  let overlap = 0;
+  for (const e of contactEmails) if (onThread.has(e)) overlap++;
+
+  // Is the email FROM this job's designated PM contact?
+  const pmEmails = new Set((project.projectContacts?.pm || []).map(c => norm(c.email)).filter(Boolean));
+  const fromPm = pmEmails.has(norm(senderEmail));
+
+  // ── SCORING POLICY ─────────────────────────────────────────────────────────
+  // LINEAR: every project contact on the thread is worth
+  // perDirectoryContactOnThread, so "lots of them" stack up. Tuned to Setty's
+  // reality (contacts often span several active jobs): one lone contact scores
+  // 1 — below SUGGESTION_MIN_SCORE, so it can't surface a job alone — while 2+
+  // lining up clears the bar. "From the designated PM" is a moderate nudge (6)
+  // that surfaces all of that PM's jobs for you to pick from, since one PM
+  // often runs several. Re-tune the weights above if real mail says otherwise.
+  let points = 0;
+  const reasons = [];
+  if (overlap > 0) {
+    points += overlap * SUGGESTION_WEIGHTS.perDirectoryContactOnThread;
+    reasons.push(overlap === 1 ? "1 project contact on thread"
+                               : overlap + " project contacts on thread");
+  }
+  if (fromPm) {
+    points += SUGGESTION_WEIGHTS.senderIsDesignatedPm;
+    reasons.push("from project's PM contact");
+  }
+  return { points, reasons };
 }
 function suggestProjects(subject, senderEmail) {
   const subj = (subject || "").toLowerCase();
@@ -2752,6 +2828,13 @@ function suggestProjects(subject, senderEmail) {
         score += SUGGESTION_WEIGHTS.senderDomainMatchClient;
         reasons.push("sender's company");
       }
+    }
+
+    // Directory signals: project contacts on the To/CC line + sender = PM contact.
+    const dirSignal = directorySignalScore(p, emailParticipants, senderEmail);
+    if (dirSignal.points) {
+      score += dirSignal.points;
+      reasons.push(...dirSignal.reasons);
     }
 
     if (score >= SUGGESTION_MIN_SCORE) {
