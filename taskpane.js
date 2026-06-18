@@ -2861,9 +2861,41 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 // PREVIEW WRITES NOTHING. It exists to calibrate the thresholds against real mail
 // before auto-filing is enabled. Filing + the review queue come next once the
 // numbers look right.
-const SWEEP_FETCH_COUNT     = 100; // how many recent messages to scan
-const SWEEP_AUTOFILE_MIN    = 10;  // min top-score to auto-file without review…
-const SWEEP_AUTOFILE_MARGIN = 4;   // …and it must beat the 2nd candidate by this
+const SWEEP_FETCH_COUNT     = 150; // recent messages to scan (some filtered to Focused)
+const SWEEP_AUTOFILE_MARGIN = 2;   // a subject match must beat the runner-up by this to auto-file
+
+// Subject-only project matcher for the sweep. Deliberately ignores sender-domain
+// and shared-contact signals (too noisy across internal threads) — a batch sweep
+// should only act when the SUBJECT names or numbers a project. Reuses the shared
+// tokenizer/acronym/weights. Returns up to 3 ranked { project, score, reasons }.
+function sweepSuggest(subject) {
+  const subj = (subject || "").toLowerCase();
+  if (!subj) return [];
+  const subjTokens = new Set(suggestionTokenize(subj));
+  const numMatches = [...subj.matchAll(/\b(\d{4,6})\b/g)].map((m) => m[1]);
+  const scored = [];
+  for (const p of (allProjects || [])) {
+    if (!p || p.archived || (!p.name && !p.projectNumber)) continue;
+    let score = 0;
+    const reasons = [];
+    if (p.projectNumber && numMatches.includes(String(p.projectNumber))) {
+      score += SUGGESTION_WEIGHTS.projectNumberInSubject;
+      reasons.push("project # in subject");
+    }
+    const hits = suggestionTokenize(p.name || "").filter((t) => subjTokens.has(t));
+    if (hits.length) {
+      score += hits.length * SUGGESTION_WEIGHTS.perNameTokenInSubject;
+      reasons.push(hits.length + " name word" + (hits.length > 1 ? "s" : "") + " match");
+    }
+    if ([...suggestionAcronyms(p.name || "")].some((a) => subjTokens.has(a))) {
+      score += SUGGESTION_WEIGHTS.acronymInSubject;
+      reasons.push("acronym match");
+    }
+    if (score >= SUGGESTION_WEIGHTS.perNameTokenInSubject) scored.push({ project: p, score, reasons });
+  }
+  scored.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
+  return scored.slice(0, 3);
+}
 
 // To/CC list in the shape suggestProjects expects, from a Graph message.
 function sweepParticipants(msg) {
@@ -2877,21 +2909,19 @@ function sweepParticipants(msg) {
   return out;
 }
 
-// What would the sweep do with one message's ranked candidates?
-// SARA — this is the confidence policy. After a dry run shows real score
-// spreads, tune SWEEP_AUTOFILE_MIN / SWEEP_AUTOFILE_MARGIN above.
+// What would the sweep do with one message's ranked subject matches?
+// SARA — confidence policy: auto-file a clear single winner (project # in the
+// subject, OR a subject match that beats the runner-up by SWEEP_AUTOFILE_MARGIN);
+// otherwise queue for review. Tune the margin above after a Preview.
 function classifySweep(candidates) {
   if (!candidates.length) return { action: "skip" };
   const top = candidates[0];
   const margin = top.score - (candidates[1]?.score ?? 0);
-  const hasProjNum = (top.reasons || []).includes("project # in subject");
-  if (hasProjNum || (top.score >= SWEEP_AUTOFILE_MIN && margin >= SWEEP_AUTOFILE_MARGIN)) {
+  const hasProjNum = (top.reasons || []).some((r) => r.includes("project #"));
+  if (hasProjNum || margin >= SWEEP_AUTOFILE_MARGIN) {
     return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
   }
-  if (top.score >= SUGGESTION_MIN_SCORE) {
-    return { action: "review", candidates: candidates.slice(0, 3) };
-  }
-  return { action: "skip" };
+  return { action: "review", candidates: candidates.slice(0, 3) };
 }
 
 // msg_ids already in the email log, so the preview ignores already-filed mail.
@@ -2915,40 +2945,38 @@ async function sweepRecentMail() {
     return;
   }
   if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = "⏳ Scanning your recent mail…";
+  if (statusEl) statusEl.textContent = "⏳ Scanning your Focused inbox…";
   if (resultsEl) resultsEl.innerHTML = "";
   try {
-    const token = await getToken();
-    // Focused Inbox only — skip the "Other" tab (newsletters/bulk). Graph forbids
-    // $filter + $orderby together on /me/messages; default order is newest-first.
-    const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
-      "&$select=internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-      "&$filter=inferenceClassification%20eq%20'focused'";
-    const data = await graphFetch("GET", path, null, token);
-    const messages = data?.value || [];
-    const filed = await sweepLoadFiledIds();
-
-    const buckets = { file: [], review: [], skip: 0, alreadyFiled: 0 };
-    for (const m of messages) {
-      const mid = m.internetMessageId || "";
-      if (mid && filed.has(mid)) { buckets.alreadyFiled++; continue; }
-      const sender = m.from?.emailAddress?.address || "";
-      const candidates = suggestProjects(m.subject || "", sender, sweepParticipants(m));
-      const verdict = classifySweep(candidates);
-      if (verdict.action === "skip") { buckets.skip++; continue; }
-      const base = {
-        msgId: mid,
-        subject: m.subject || "(no subject)",
-        from: m.from?.emailAddress?.name || sender,
-        date: (m.receivedDateTime || "").slice(0, 10),
-      };
-      if (verdict.action === "file") {
-        buckets.file.push({ ...base, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
-      } else {
-        buckets.review.push({ ...base, candidates: verdict.candidates });
+    const r = await sweepScan(); // shared scanner: newest-first, Focused-only, subject-matched
+    if (statusEl) {
+      statusEl.textContent =
+        "Scanned " + r.scanned + " focused · would auto-file " + r.file.length +
+        " · review " + r.review.length + " · skip " + r.skip +
+        " · already filed " + r.alreadyFiled + "  — preview only, nothing saved.";
+    }
+    const grp = (t) => '<div style="font-weight:600;margin:8px 0 4px;">' + t + "</div>";
+    const meta = (t) => '<span style="color:#888;">' + t + "</span>";
+    const rowCss = 'style="padding:4px 0;border-top:1px solid #eee;font-size:12px;"';
+    const lines = [];
+    if (r.file.length) {
+      lines.push(grp("✅ Would auto-file (" + r.file.length + ")"));
+      for (const e of r.file) {
+        lines.push("<div " + rowCss + "><b>" + sweepEsc(e.project.projectNumber || e.project.name) +
+          "</b> — " + sweepEsc(e.subject) + "<br>" +
+          meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " · score " + e.score) + "</div>");
       }
     }
-    renderSweepResults(messages.length, buckets);
+    if (r.review.length) {
+      lines.push(grp("🟡 Needs review (" + r.review.length + ")"));
+      for (const e of r.review) {
+        const opts = (e.candidates || [])
+          .map((c) => sweepEsc(c.project.projectNumber || c.project.name) + " (" + c.score + ")").join(" · ");
+        lines.push("<div " + rowCss + ">" + sweepEsc(e.subject) + "<br>" +
+          meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " → " + opts) + "</div>");
+      }
+    }
+    if (resultsEl) resultsEl.innerHTML = lines.join("") || meta("No new emails matched a project.");
   } catch (e) {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
@@ -3006,20 +3034,21 @@ const sweepEsc = (s) => String(s == null ? "" : s)
 // conversationId needed to file later. Writes nothing.
 async function sweepScan() {
   const token = await getToken();
-  // Focused Inbox only — skip "Other". Graph forbids $filter + $orderby together;
-  // default message order is newest-first.
+  // Newest first, then keep only Focused (Graph can't combine $filter + $orderby).
   const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
-    "&$select=id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-    "&$filter=inferenceClassification%20eq%20'focused'";
+    "&$select=id,internetMessageId,inferenceClassification,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
+    "&$orderby=receivedDateTime%20desc";
   const data = await graphFetch("GET", path, null, token);
   const messages = data?.value || [];
   const filed = await sweepLoadFiledIds();
-  const out = { scanned: messages.length, file: [], review: [], skip: 0, alreadyFiled: 0 };
+  const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0 };
   for (const m of messages) {
+    if (m.inferenceClassification && m.inferenceClassification !== "focused") continue; // Focused only
+    out.scanned++;
     const mid = m.internetMessageId || "";
     if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
     const sender = m.from?.emailAddress?.address || "";
-    const verdict = classifySweep(suggestProjects(m.subject || "", sender, sweepParticipants(m)));
+    const verdict = classifySweep(sweepSuggest(m.subject || ""));
     if (verdict.action === "skip") { out.skip++; continue; }
     const item = {
       gid: m.id, convId: m.conversationId || "", msgId: mid,
