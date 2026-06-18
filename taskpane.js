@@ -2540,6 +2540,7 @@ function setSelectedProject(project, persistForEmail = false) {
       saveConversationProjectMap(convoMap);
       await saveSharedConversationProjectTag(sharedKey, selectedProject.id);
     })();
+    void autoSaveEmailToRecord(); // capture this email to the log on tag (no button needed)
   }
   updateProjectQuickLinks();
   refreshActionItemOwnerOptions();
@@ -2549,6 +2550,21 @@ function setSelectedProject(project, persistForEmail = false) {
   applyPipelineUiRules();
   renderProjectSuggestions();
   void renderDateSuggestions();
+}
+
+// Auto-save the open email to the project log the moment a project is tagged —
+// no "save to record" click needed (capture everything; the SharePoint button is
+// still used to file attachments down). Read-mode + dedup guarded.
+async function autoSaveEmailToRecord() {
+  try {
+    if (!selectedProject) return;
+    if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
+    const msgId = getCurrentMessageRecordId();
+    if (!msgId || findSavedEmailRecord(selectedProject, msgId)) return; // already filed
+    await doSaveToProjectRecordOnly(); // same path as the button; dedups again internally
+  } catch (e) {
+    console.warn("auto-save on tag failed:", e);
+  }
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
 // Must be called AFTER selectedProject and currentItemICalUId are both resolved.
@@ -2861,8 +2877,8 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 // PREVIEW WRITES NOTHING. It exists to calibrate the thresholds against real mail
 // before auto-filing is enabled. Filing + the review queue come next once the
 // numbers look right.
-const SWEEP_FETCH_COUNT     = 150; // recent messages to scan (some filtered to Focused)
-const SWEEP_AUTOFILE_MARGIN = 2;   // a subject match must beat the runner-up by this to auto-file
+const SWEEP_FETCH_COUNT = 150; // recent messages to scan (some filtered to Focused)
+const SWEEP_REVIEW_MIN  = 4;   // min name/acronym score to ENTER review (≥2 distinctive signals)
 
 // Common AEC / institutional words that appear across many project names — too
 // generic to identify a project alone (data-driven from the filed-email subjects).
@@ -2877,16 +2893,20 @@ const SWEEP_EXTRA_STOPWORDS = new Set([
   "department", "dept", "office", "task", "order",
 ]);
 function sweepTokenize(s) {
-  return suggestionTokenize(s).filter((t) => !SWEEP_EXTRA_STOPWORDS.has(t));
+  // Drop generic words AND short bare numbers ("23", "06") that coincidentally
+  // match dates/counts; keep 3+ digit identifiers (280, 292, 578) and alphanumerics (9r).
+  return suggestionTokenize(s)
+    .filter((t) => !SWEEP_EXTRA_STOPWORDS.has(t))
+    .filter((t) => !(/^\d+$/.test(t) && t.length < 3));
 }
 
-// Conservative bulk/marketing sender check — clear no-reply / ESP senders only.
+// Bulk/marketing/automated sender check — no-reply, alerts, ESP & bid/event domains.
 function looksPromotional(addr) {
   const a = (addr || "").toLowerCase();
   const local = a.split("@")[0] || "";
   const domain = a.split("@")[1] || "";
-  if (/(^|[._-])(no-?reply|do-?not-?reply|donotreply|newsletter|marketing|mailer)([._-]|$)/.test(local)) return true;
-  if (/(mailchimp|constantcontact|sendgrid|eventbrite|substack|hubspot|marketo|pardot|sparkpostmail|rsgsv|mcsv|cmail\d)/.test(domain)) return true;
+  if (/(^|[._-])(no-?reply|do-?not-?reply|donotreply|noreply|newsletter|marketing|mailer|notifications?|alerts?|bounce|invitations?|projecttracker|tracker)([._-]|$)/.test(local)) return true;
+  if (/(mailchimp|constantcontact|sendgrid|eventbrite|substack|hubspot|marketo|pardot|sparkpostmail|rsgsv|mcsv|cmail\d|bidnet|nyscr|proest|crewnetwork)/.test(domain)) return true;
   return false;
 }
 
@@ -2894,12 +2914,15 @@ function looksPromotional(addr) {
 // suffix) OR the client's prime number — both appear in ~7-9% of filed subjects
 // and are the strongest possible signal. Guards against junk/short prime values.
 function subjectHasProjectId(subjLower, p) {
+  // Normalize separators so "2022.37-01" (prime) matches "2022.37.01" in a subject.
+  const norm = (s) => s.replace(/[_\-\s]+/g, ".");
+  const subjN = norm(subjLower);
   const ids = [];
   const sapx = String(p.projectNumber || "").trim().toLowerCase();
   if (sapx.length >= 5) { ids.push(sapx); ids.push(sapx.split(".")[0]); }
   const prime = String(p.primeProjectNumber || "").trim().toLowerCase();
   if (prime.length >= 5 && /\d/.test(prime)) ids.push(prime);
-  return ids.some((id) => id && subjLower.includes(id));
+  return ids.some((id) => id && (subjLower.includes(id) || subjN.includes(norm(id))));
 }
 
 // Subject-only project matcher for the sweep. Ignores sender-domain / shared-
@@ -2945,19 +2968,17 @@ function sweepParticipants(msg) {
   return out;
 }
 
-// What would the sweep do with one message's ranked subject matches?
-// SARA — confidence policy: auto-file a clear single winner (project # in the
-// subject, OR a subject match that beats the runner-up by SWEEP_AUTOFILE_MARGIN);
-// otherwise queue for review. Tune the margin above after a Preview.
+// Confidence policy (tightened after live testing — auto-file must be near-certain):
+//   auto-file ONLY when a project ID (SAPX or client prime #) is in the subject;
+//   review only when the name/acronym score clears SWEEP_REVIEW_MIN (≥2 distinctive
+//   signals); otherwise skip. A single coincidental word no longer files anything.
 function classifySweep(candidates) {
   if (!candidates.length) return { action: "skip" };
   const top = candidates[0];
-  const margin = top.score - (candidates[1]?.score ?? 0);
-  const hasProjNum = (top.reasons || []).some((r) => r.includes("project #"));
-  if (hasProjNum || margin >= SWEEP_AUTOFILE_MARGIN) {
-    return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
-  }
-  return { action: "review", candidates: candidates.slice(0, 3) };
+  const hasId = (top.reasons || []).some((r) => r.includes("project #"));
+  if (hasId) return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
+  if (top.score >= SWEEP_REVIEW_MIN) return { action: "review", candidates: candidates.slice(0, 3) };
+  return { action: "skip" };
 }
 
 // msg_ids already in the email log, so the preview ignores already-filed mail.
@@ -2970,6 +2991,53 @@ async function sweepLoadFiledIds() {
     const rows = await res.json();
     return new Set((rows || []).map(r => r.msg_id).filter(Boolean));
   } catch { return new Set(); }
+}
+
+// Learned sender→project signal from the filed log (RPC sender_project_signals).
+// Self-improving: as more emails get filed, more senders become project-specific.
+// Fetched once per sweep. Returns Map(lower-address -> [{projectId, n, projects}]).
+async function sweepLoadSenderMap() {
+  try {
+    const res = await fetchWithRetry(
+      SUPABASE_URL + "/rest/v1/rpc/sender_project_signals",
+      { method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json" }, body: "{}" },
+      { label: "sb sender signals" });
+    if (!res.ok) return new Map();
+    const rows = await res.json();
+    const map = new Map();
+    for (const r of (rows || [])) {
+      const addr = (r.from_address || "").toLowerCase();
+      if (!addr) continue;
+      if (!map.has(addr)) map.set(addr, []);
+      map.get(addr).push({ projectId: r.project_id, n: r.n, projects: r.projects });
+    }
+    return map;
+  } catch { return new Map(); }
+}
+
+// Merge the learned sender signal into a message's subject candidates. A sender
+// who historically files to ONE project is strong evidence (even with no subject
+// match); two projects is moderate. This is what lets sender-only emails (no
+// project name in the subject) still surface for review.
+function mergeSenderSignal(candidates, senderProjects) {
+  if (!senderProjects || !senderProjects.length) return candidates;
+  const byId = new Map(candidates.map((c) => [c.project.id, c]));
+  for (const sp of senderProjects) {
+    const proj = (allProjects || []).find((p) => p && p.id === sp.projectId);
+    if (!proj) continue;
+    const boost = sp.projects === 1 ? 8 : 4;
+    if (byId.has(sp.projectId)) {
+      const c = byId.get(sp.projectId);
+      c.score += boost;
+      if (!c.reasons.includes("known sender")) c.reasons.push("known sender");
+    } else {
+      const c = { project: proj, score: boost, reasons: ["known sender"] };
+      byId.set(sp.projectId, c);
+      candidates.push(c);
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates;
 }
 
 async function sweepRecentMail() {
@@ -3077,6 +3145,7 @@ async function sweepScan() {
   const data = await graphFetch("GET", path, null, token);
   const messages = data?.value || [];
   const filed = await sweepLoadFiledIds();
+  const senderMap = await sweepLoadSenderMap();
   const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0 };
   for (const m of messages) {
     if (m.inferenceClassification && m.inferenceClassification !== "focused") continue; // Focused only
@@ -3085,7 +3154,7 @@ async function sweepScan() {
     if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
     const mid = m.internetMessageId || "";
     if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
-    const verdict = classifySweep(sweepSuggest(m.subject || ""));
+    const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
     if (verdict.action === "skip") { out.skip++; continue; }
     const item = {
       gid: m.id, convId: m.conversationId || "", msgId: mid,
@@ -3095,7 +3164,7 @@ async function sweepScan() {
       cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
       date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
     };
-    if (verdict.action === "file") out.file.push({ ...item, project: verdict.project });
+    if (verdict.action === "file") out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
     else out.review.push({ ...item, candidates: verdict.candidates });
   }
   return out;
