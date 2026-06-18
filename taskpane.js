@@ -2864,25 +2864,61 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 const SWEEP_FETCH_COUNT     = 150; // recent messages to scan (some filtered to Focused)
 const SWEEP_AUTOFILE_MARGIN = 2;   // a subject match must beat the runner-up by this to auto-file
 
-// Subject-only project matcher for the sweep. Deliberately ignores sender-domain
-// and shared-contact signals (too noisy across internal threads) — a batch sweep
-// should only act when the SUBJECT names or numbers a project. Reuses the shared
-// tokenizer/acronym/weights. Returns up to 3 ranked { project, score, reasons }.
+// Common AEC / institutional words that appear across many project names — too
+// generic to identify a project alone (data-driven from the filed-email subjects).
+const SWEEP_EXTRA_STOPWORDS = new Set([
+  "nyc", "ny", "new", "york", "city", "state", "county", "public", "authority", "dormitory",
+  "suny", "sucf", "ogs", "dasny", "sca", "cuny", "dcas", "ddc", "dsny", "nycha", "mta",
+  "university", "college", "school", "schools", "campus", "hall", "building", "bldg", "center", "centre",
+  "design", "services", "service", "engineering", "consulting", "construction", "architectural",
+  "replacement", "replace", "upgrade", "upgrades", "improvements", "improvement",
+  "rehabilitation", "rehab", "roof", "hvac", "mep", "electrical", "mechanical", "plumbing", "fire", "alarm",
+  "study", "feasibility", "assessment", "survey", "report", "garage", "facility", "facilities",
+  "department", "dept", "office", "task", "order",
+]);
+function sweepTokenize(s) {
+  return suggestionTokenize(s).filter((t) => !SWEEP_EXTRA_STOPWORDS.has(t));
+}
+
+// Conservative bulk/marketing sender check — clear no-reply / ESP senders only.
+function looksPromotional(addr) {
+  const a = (addr || "").toLowerCase();
+  const local = a.split("@")[0] || "";
+  const domain = a.split("@")[1] || "";
+  if (/(^|[._-])(no-?reply|do-?not-?reply|donotreply|newsletter|marketing|mailer)([._-]|$)/.test(local)) return true;
+  if (/(mailchimp|constantcontact|sendgrid|eventbrite|substack|hubspot|marketo|pardot|sparkpostmail|rsgsv|mcsv|cmail\d)/.test(domain)) return true;
+  return false;
+}
+
+// Is a project ID present in the subject? The SAPX number (full or sans .00
+// suffix) OR the client's prime number — both appear in ~7-9% of filed subjects
+// and are the strongest possible signal. Guards against junk/short prime values.
+function subjectHasProjectId(subjLower, p) {
+  const ids = [];
+  const sapx = String(p.projectNumber || "").trim().toLowerCase();
+  if (sapx.length >= 5) { ids.push(sapx); ids.push(sapx.split(".")[0]); }
+  const prime = String(p.primeProjectNumber || "").trim().toLowerCase();
+  if (prime.length >= 5 && /\d/.test(prime)) ids.push(prime);
+  return ids.some((id) => id && subjLower.includes(id));
+}
+
+// Subject-only project matcher for the sweep. Ignores sender-domain / shared-
+// contact signals (noise in a batch). Signals (data-driven from filed emails):
+// project ID in subject (strong), DISTINCTIVE name words, acronym.
 function sweepSuggest(subject) {
   const subj = (subject || "").toLowerCase();
   if (!subj) return [];
-  const subjTokens = new Set(suggestionTokenize(subj));
-  const numMatches = [...subj.matchAll(/\b(\d{4,6})\b/g)].map((m) => m[1]);
+  const subjTokens = new Set(sweepTokenize(subj));
   const scored = [];
   for (const p of (allProjects || [])) {
     if (!p || p.archived || (!p.name && !p.projectNumber)) continue;
     let score = 0;
     const reasons = [];
-    if (p.projectNumber && numMatches.includes(String(p.projectNumber))) {
-      score += SUGGESTION_WEIGHTS.projectNumberInSubject;
+    if (subjectHasProjectId(subj, p)) {
+      score += SUGGESTION_WEIGHTS.projectNumberInSubject; // 10 — near-certain
       reasons.push("project # in subject");
     }
-    const hits = suggestionTokenize(p.name || "").filter((t) => subjTokens.has(t));
+    const hits = sweepTokenize(p.name || "").filter((t) => subjTokens.has(t));
     if (hits.length) {
       score += hits.length * SUGGESTION_WEIGHTS.perNameTokenInSubject;
       reasons.push(hits.length + " name word" + (hits.length > 1 ? "s" : "") + " match");
@@ -3045,9 +3081,10 @@ async function sweepScan() {
   for (const m of messages) {
     if (m.inferenceClassification && m.inferenceClassification !== "focused") continue; // Focused only
     out.scanned++;
+    const sender = m.from?.emailAddress?.address || "";
+    if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
     const mid = m.internetMessageId || "";
     if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
-    const sender = m.from?.emailAddress?.address || "";
     const verdict = classifySweep(sweepSuggest(m.subject || ""));
     if (verdict.action === "skip") { out.skip++; continue; }
     const item = {
