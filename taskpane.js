@@ -1122,17 +1122,18 @@ function refreshEmailSavedIndicator(animate = false) {
     return;
   }
 
-  // Record is saved. Only collapse to the "done" card once it's filed to
-  // SharePoint; while it's record-only (e.g. auto-saved on tag), KEEP the Save to
-  // SharePoint button available so attachments can still be filed.
+  // Record is logged. Keep the Save to SharePoint button ONLY when there are
+  // attachments not yet filed there; otherwise collapse to the "✓ logged" card.
   const wasFiledToSharePoint = !!existing.spFolderUrl;
-  if (!wasFiledToSharePoint) {
-    applyEmailFlowEmphasis();
+  const hasAttachments = !!existing.hasAttachments || (attCount && attCount > 0);
+  if (!wasFiledToSharePoint && hasAttachments) {
+    applyEmailFlowEmphasis(); // keeps the SharePoint button visible for attachments
     if (confirmation) confirmation.style.display = "none";
+    setStatus("actionStatus", "success", "✓ Logged to project record — Save attachments to SharePoint below.");
     try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
-  // Filed to SharePoint → collapse the save row into a single big-check card.
+  // Filed to SharePoint, or nothing to file → collapse into the "✓ logged" card.
   if (saveRow) saveRow.style.display = "none";
   if (saveCapRow) saveCapRow.style.display = "none";
 
@@ -1143,7 +1144,7 @@ function refreshEmailSavedIndicator(animate = false) {
 
   const primary = wasFiledToSharePoint
     ? "Saved to SharePoint + project record"
-    : "Saved to project record";
+    : "Logged to project record";
   const secondaryParts = [`Filed ${savedDate}`];
   if (wasFiledToSharePoint && attCount && attCount > 0) {
     secondaryParts.push(`${attCount} file${attCount > 1 ? "s" : ""}`);
@@ -2538,7 +2539,6 @@ function setSelectedProject(project, persistForEmail = false) {
       saveConversationProjectMap(convoMap);
       await saveSharedConversationProjectTag(sharedKey, selectedProject.id);
     })();
-    void autoSaveEmailToRecord(); // capture this email to the log on tag (no button needed)
   }
   updateProjectQuickLinks();
   refreshActionItemOwnerOptions();
@@ -2548,20 +2548,29 @@ function setSelectedProject(project, persistForEmail = false) {
   applyPipelineUiRules();
   renderProjectSuggestions();
   void renderDateSuggestions();
+  // Auto-capture the email to the project log whenever it resolves to a project —
+  // explicit tag OR inherited from the conversation tag (restored on open) — so the
+  // whole tagged chain gets logged as you read it. Quiet + deduped inside.
+  void autoSaveEmailToRecord();
 }
 
 // Auto-save the open email to the project log the moment a project is tagged —
 // no "save to record" click needed (capture everything; the SharePoint button is
 // still used to file attachments down). Read-mode + dedup guarded.
+let _autoSavingMsgId = null; // in-flight guard so rapid restores don't double-save
 async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
     if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
     const msgId = getCurrentMessageRecordId();
-    if (!msgId || findSavedEmailRecord(selectedProject, msgId)) return; // already filed
-    await doSaveToProjectRecordOnly(); // same path as the button; dedups again internally
+    if (!msgId) return;
+    if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
+    if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
+    _autoSavingMsgId = msgId;
+    try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
+    finally { _autoSavingMsgId = null; }
   } catch (e) {
-    console.warn("auto-save on tag failed:", e);
+    console.warn("auto-save failed:", e);
   }
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
@@ -4065,15 +4074,36 @@ async function resolveSpIds() {
 const _emailBodyCache = new Map();
 function clearEmailBodyCache() { _emailBodyCache.clear(); }
 async function getEmailBodyHtml(token) {
+  const item = Office.context.mailbox.item;
+  const msgId = item?.itemId;
+  if (msgId && _emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
+
+  let body = "";
+  // 1) Graph — full-fidelity HTML body.
   try {
-    const msgId = Office.context.mailbox.item.itemId;
-    if (_emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
     const restId = Office.context.mailbox.convertToRestId(msgId, Office.MailboxEnums.RestVersion.v2_0);
     const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token);
-    const body = data?.body?.content || "";
-    if (body) _emailBodyCache.set(msgId, body);
-    return body;
-  } catch { return ""; }
+    body = data?.body?.content || "";
+  } catch { /* fall through to the Office.js route */ }
+
+  // 2) Office.js fallback — reads the OPEN item's HTML directly, no network, so it
+  //    works when the Graph /me/messages fetch fails (the cause of "Email body
+  //    could not be retrieved" → empty records). getAsync can fail transiently
+  //    right after an item opens, so retry with short backoff.
+  if (!body && item?.body?.getAsync) {
+    for (let i = 0; i < 3 && !body; i++) {
+      body = await new Promise(resolve => {
+        try {
+          item.body.getAsync(Office.CoercionType.Html, r =>
+            resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : ""));
+        } catch { resolve(""); }
+      });
+      if (!body && i < 2) await new Promise(res => setTimeout(res, 300 * (i + 1)));
+    }
+  }
+
+  if (body && msgId) _emailBodyCache.set(msgId, body);
+  return body;
 }
 
 // ── RELIABLE PLAIN-TEXT BODY ─────────────────────────────────────────────────
@@ -5602,8 +5632,8 @@ if (existingRecord) {
 async function doSaveToProjectRecordOnly() {
   return withSaveGuard("save-record", _doSaveToProjectRecordOnly, ["saveSpBtn", "saveRecordBtn"]);
 }
-async function _doSaveToProjectRecordOnly() {
-  if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+async function _doSaveToProjectRecordOnly(quiet = false) {
+  if (!selectedProject) { if (!quiet) setStatus("actionStatus", "error", "Select a project first."); return; }
   // Body-only save works regardless of attachments — the visual emphasis (de-emph
   // + caption) is the soft nudge toward SharePoint when attachments exist.
   // No confirm dialog: trust the user's intent, surface the consequence in the
@@ -5613,7 +5643,7 @@ async function _doSaveToProjectRecordOnly() {
     refreshEmailSavedIndicator();
     return;
   }
-  setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
+  if (!quiet) setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
@@ -5661,13 +5691,14 @@ async function _doSaveToProjectRecordOnly() {
     if (indexSaveFailed) warnings.push("⚠ Search-index write failed — may not appear in PMS email searches until next resave.");
     if (warnings.length > 0) {
       setStatus("actionStatus", "info", "✓ Saved to project record. " + warnings.join(" "));
-    } else {
+    } else if (!quiet) {
       setStatus("actionStatus", "success", "✓ Saved to project record (no SharePoint upload).");
     }
-    recordSaveAndCelebrate();
-    refreshEmailSavedIndicator(true);
+    if (!quiet) recordSaveAndCelebrate();
+    refreshEmailSavedIndicator(!quiet);
   } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+    if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+    else console.warn("auto-save record failed:", e);
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
