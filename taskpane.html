@@ -884,7 +884,10 @@
   <div id="sweepBlock" class="watchlist-block" style="display:none;">
     <div class="watchlist-head">
       <div class="watchlist-label">🧹 Sweep recent mail</div>
-      <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview which recent emails would file to projects">Preview</button>
+      <span>
+        <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview only — writes nothing">Preview</button>
+        <button type="button" id="sweepFileBtn" class="watchlist-refresh" title="File confident matches and queue the rest for review">Run &amp; file</button>
+      </span>
     </div>
     <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
     <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>

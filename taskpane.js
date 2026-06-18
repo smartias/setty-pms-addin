@@ -203,6 +203,8 @@ function setupEventListeners() {
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
   const sweepBtn = document.getElementById("sweepRunBtn");
   if (sweepBtn) sweepBtn.onclick = () => { void sweepRecentMail(); };
+  const sweepFileBtn = document.getElementById("sweepFileBtn");
+  if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   // Pin hint banner — show unless previously dismissed or pinning was detected.
@@ -1963,7 +1965,7 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
   // Pre-migration: legacy path is still authoritative
   return legacyApplyLocalChangeAndSave(projectId, mutateProject);
 }
-async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
+async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, conversationId) {
   if (!projectId || !emailRecord?.msgId) return;
   // Phase 6 dual-write: write both slim index fields AND new body/metadata
   // columns. Some fields (to/cc/preview/hasAttachments/attachmentNames/savedBy)
@@ -1976,7 +1978,7 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint) {
     record_id: emailRecord.id,
     project_id: projectId,
     msg_id: emailRecord.msgId,
-    conversation_id: currentConversationId || null,
+    conversation_id: conversationId ?? (currentConversationId || null),
     subject: emailRecord.subject || "",
     from_name: emailRecord.from || "",
     from_address: emailRecord.fromAddress || "",
@@ -2987,6 +2989,171 @@ function renderSweepResults(scanned, b) {
     }
   }
   resultsEl.innerHTML = out.join("") || meta("No new emails matched a project.");
+}
+
+// ─── EMAIL SWEEP v2: actual filing + review queue ─────────────────────────────
+// "Run & file" auto-files the confident bucket and queues ambiguous ones for a
+// one-click human confirm. Filing reuses the per-email recipe from
+// _doSaveToProjectRecordOnly (getToken → fetch body → compressHtmlAddin) and ALSO
+// stores stripped body_text so swept mail is full-text searchable immediately
+// (the manual flow leaves body_text empty — that was the backfill root cause).
+let _sweepReview = []; // ambiguous items awaiting confirm after a Run & file
+const sweepEsc = (s) => String(s == null ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Fetch + classify recent mail into rich items carrying the Graph id +
+// conversationId needed to file later. Writes nothing.
+async function sweepScan() {
+  const token = await getToken();
+  const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
+    "&$select=id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
+    "&$orderby=receivedDateTime%20desc";
+  const data = await graphFetch("GET", path, null, token);
+  const messages = data?.value || [];
+  const filed = await sweepLoadFiledIds();
+  const out = { scanned: messages.length, file: [], review: [], skip: 0, alreadyFiled: 0 };
+  for (const m of messages) {
+    const mid = m.internetMessageId || "";
+    if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
+    const sender = m.from?.emailAddress?.address || "";
+    const verdict = classifySweep(suggestProjects(m.subject || "", sender, sweepParticipants(m)));
+    if (verdict.action === "skip") { out.skip++; continue; }
+    const item = {
+      gid: m.id, convId: m.conversationId || "", msgId: mid,
+      subject: m.subject || "(no subject)",
+      from: m.from?.emailAddress?.name || sender, fromAddress: sender,
+      to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+      cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+      date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
+    };
+    if (verdict.action === "file") out.file.push({ ...item, project: verdict.project });
+    else out.review.push({ ...item, candidates: verdict.candidates });
+  }
+  return out;
+}
+
+// Strip HTML to plain text for searchable body_text (mirrors the server side).
+function stripHtmlToText(html) {
+  return (html || "")
+    .replace(new RegExp("<script[^>]*>[^]*?</script>", "gi"), " ")
+    .replace(new RegExp("<style[^>]*>[^]*?</style>", "gi"), " ")
+    .replace(new RegExp("<br[^>]*>", "gi"), "\n")
+    .replace(new RegExp("</(p|div|tr|li|h[1-6])>", "gi"), "\n")
+    .replace(new RegExp("<[^>]+>", "g"), " ")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/&#39;/gi, "'").replace(/&apos;/gi, "'").replace(/&quot;/gi, '"')
+    .replace(/ +/g, " ").replace(/\n +/g, "\n").trim();
+}
+
+// File sweep items to item.projectId: writes the search-index row (with stripped
+// body_text) and dual-writes project.emails[] grouped per project. {filed, failed}.
+async function sweepFileItems(items) {
+  if (!items.length) return { filed: 0, failed: 0 };
+  const token = await getToken();
+  const byProject = new Map();
+  let filed = 0, failed = 0;
+  for (const it of items) {
+    try {
+      let bodyHtml = "";
+      try {
+        const d = await graphFetch("GET", "/me/messages/" + it.gid + "?$select=body", null, token);
+        bodyHtml = d?.body?.content || "";
+      } catch (_) { /* body fetch is best-effort */ }
+      const rec = {
+        id: uid(), msgId: it.msgId,
+        subject: it.subject, from: it.from, fromAddress: it.fromAddress,
+        to: it.to, cc: it.cc, date: it.date,
+        bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
+        bodyHtmlCompressed: bodyHtml ? compressHtmlAddin(bodyHtml) : "",
+        bodyHtmlSize: bodyHtml.length,
+        hasAttachments: it.hasAttachments, attachmentNames: [],
+        spFolderUrl: "", links: [],
+        savedAt: new Date().toISOString(), savedBy: _getCurrentUserEmail() || "",
+        savedToSharePoint: false,
+      };
+      await saveProjectEmailRow(it.projectId, rec, false, it.convId || null);
+      if (!byProject.has(it.projectId)) byProject.set(it.projectId, []);
+      byProject.get(it.projectId).push(rec);
+      filed++;
+    } catch (e) {
+      console.warn("sweep file failed:", e);
+      failed++;
+    }
+  }
+  // Keep project.emails[] in sync — one save per project (avoids version churn).
+  for (const [pid, recs] of byProject) {
+    try {
+      await applyLocalChangeAndSave(pid, (fresh) => ({ ...fresh, emails: [...(fresh.emails || []), ...recs] }));
+    } catch (e) {
+      console.warn("sweep dual-write to project.emails failed for", pid, e);
+    }
+  }
+  return { filed, failed };
+}
+
+// RUN & FILE — auto-file the confident bucket, queue the ambiguous ones.
+async function sweepRunAndFile() {
+  const btn = document.getElementById("sweepFileBtn");
+  const statusEl = document.getElementById("sweepStatus");
+  if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return; }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = "⏳ Scanning and filing confident matches…";
+  try {
+    const r = await sweepScan();
+    for (const it of r.file) it.projectId = it.project.id;
+    const { filed, failed } = await sweepFileItems(r.file);
+    _sweepReview = r.review;
+    if (statusEl) statusEl.textContent =
+      "✓ Filed " + filed + (failed ? (" · " + failed + " failed") : "") +
+      " · " + _sweepReview.length + " to review · skipped " + r.skip + " · already filed " + r.alreadyFiled;
+    renderSweepReviewQueue();
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Review queue — each ambiguous email gets a button per candidate project + Skip.
+function renderSweepReviewQueue() {
+  const resultsEl = document.getElementById("sweepResults");
+  if (!resultsEl) return;
+  const pending = _sweepReview.filter((e) => !e._done);
+  if (!pending.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
+  const bcss = 'style="margin:2px 4px 2px 0;padding:2px 8px;font-size:12px;cursor:pointer;"';
+  const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + pending.length + ' left)</div>'];
+  _sweepReview.forEach((e, i) => {
+    if (e._done) return;
+    const cands = (e.candidates || []).map((c, ci) =>
+      '<button type="button" data-sw="file" data-i="' + i + '" data-ci="' + ci + '" ' + bcss + ">" +
+      sweepEsc(c.project.projectNumber || c.project.name) + "</button>").join("");
+    rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' +
+      sweepEsc(e.subject) + '<br><span style="color:#888;">' + sweepEsc(e.from) + " · " +
+      sweepEsc((e.date || "").slice(0, 10)) + "</span><br>File to: " + cands +
+      '<button type="button" data-sw="skip" data-i="' + i + '" ' + bcss + ">Skip</button></div>");
+  });
+  resultsEl.innerHTML = rows.join("");
+  resultsEl.querySelectorAll("button[data-sw]").forEach((b) => {
+    b.onclick = () => {
+      const i = +b.dataset.i;
+      if (b.dataset.sw === "skip") { if (_sweepReview[i]) _sweepReview[i]._done = "skip"; renderSweepReviewQueue(); return; }
+      void sweepConfirmReview(i, +b.dataset.ci);
+    };
+  });
+}
+
+async function sweepConfirmReview(i, ci) {
+  const e = _sweepReview[i];
+  if (!e || e._done) return;
+  const proj = e.candidates?.[ci]?.project;
+  if (!proj) return;
+  e._done = "filing";
+  renderSweepReviewQueue();
+  const { filed } = await sweepFileItems([{ ...e, projectId: proj.id }]);
+  e._done = filed ? "filed" : null;
+  if (!filed) { const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again."; }
+  renderSweepReviewQueue();
 }
 
 function renderProjectSuggestions() {
@@ -5332,7 +5499,7 @@ async function _doSaveToProjectRecordOnly() {
       to,
       cc,
       date: emailItem.dateTimeCreated,
-      bodyText: "",
+      bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
       hasAttachments: attachmentNames.length > 0,
