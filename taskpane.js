@@ -83,6 +83,8 @@ Office.onReady(async (info) => {
       await onSignedIn();
       // Surface the response watchlist once projects are loaded.
       void renderResponseWatchlist();
+      const sweepBlock = document.getElementById("sweepBlock");
+      if (sweepBlock) sweepBlock.style.display = "block";
     } else {
       showView("signInView");
     }
@@ -199,6 +201,8 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   const wlRefresh = document.getElementById("responseWatchlistRefresh");
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
+  const sweepBtn = document.getElementById("sweepRunBtn");
+  if (sweepBtn) sweepBtn.onclick = () => { void sweepRecentMail(); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   // Pin hint banner — show unless previously dismissed or pinning was detected.
@@ -2786,7 +2790,7 @@ function directorySignalScore(project, participants, senderEmail) {
   }
   return { points, reasons };
 }
-function suggestProjects(subject, senderEmail) {
+function suggestProjects(subject, senderEmail, participants = emailParticipants) {
   const subj = (subject || "").toLowerCase();
   if (!subj && !senderEmail) return [];
   const subjTokens = new Set(suggestionTokenize(subj));
@@ -2831,7 +2835,7 @@ function suggestProjects(subject, senderEmail) {
     }
 
     // Directory signals: project contacts on the To/CC line + sender = PM contact.
-    const dirSignal = directorySignalScore(p, emailParticipants, senderEmail);
+    const dirSignal = directorySignalScore(p, participants, senderEmail);
     if (dirSignal.points) {
       score += dirSignal.points;
       reasons.push(...dirSignal.reasons);
@@ -2845,6 +2849,146 @@ function suggestProjects(subject, senderEmail) {
   scored.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
   return scored.slice(0, SUGGESTION_MAX_RESULTS);
 }
+
+// ─── EMAIL SWEEP (dry-run preview) ────────────────────────────────────────────
+// Scans the user's recent mail and classifies each message with suggestProjects:
+//   file   → confident single match (project # in subject, OR top score
+//            >= SWEEP_AUTOFILE_MIN and beats the runner-up by SWEEP_AUTOFILE_MARGIN)
+//   review → plausible but ambiguous (>= SUGGESTION_MIN_SCORE) → human queue
+//   skip   → nothing matched
+// PREVIEW WRITES NOTHING. It exists to calibrate the thresholds against real mail
+// before auto-filing is enabled. Filing + the review queue come next once the
+// numbers look right.
+const SWEEP_FETCH_COUNT     = 100; // how many recent messages to scan
+const SWEEP_AUTOFILE_MIN    = 10;  // min top-score to auto-file without review…
+const SWEEP_AUTOFILE_MARGIN = 4;   // …and it must beat the 2nd candidate by this
+
+// To/CC list in the shape suggestProjects expects, from a Graph message.
+function sweepParticipants(msg) {
+  const out = [];
+  for (const r of (msg.toRecipients || [])) {
+    const a = r.emailAddress?.address; if (a) out.push({ label: "To", emailAddress: a });
+  }
+  for (const r of (msg.ccRecipients || [])) {
+    const a = r.emailAddress?.address; if (a) out.push({ label: "CC", emailAddress: a });
+  }
+  return out;
+}
+
+// What would the sweep do with one message's ranked candidates?
+// SARA — this is the confidence policy. After a dry run shows real score
+// spreads, tune SWEEP_AUTOFILE_MIN / SWEEP_AUTOFILE_MARGIN above.
+function classifySweep(candidates) {
+  if (!candidates.length) return { action: "skip" };
+  const top = candidates[0];
+  const margin = top.score - (candidates[1]?.score ?? 0);
+  const hasProjNum = (top.reasons || []).includes("project # in subject");
+  if (hasProjNum || (top.score >= SWEEP_AUTOFILE_MIN && margin >= SWEEP_AUTOFILE_MARGIN)) {
+    return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
+  }
+  if (top.score >= SUGGESTION_MIN_SCORE) {
+    return { action: "review", candidates: candidates.slice(0, 3) };
+  }
+  return { action: "skip" };
+}
+
+// msg_ids already in the email log, so the preview ignores already-filed mail.
+async function sweepLoadFiledIds() {
+  try {
+    const res = await fetchWithRetry(
+      SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id",
+      { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
+    if (!res.ok) return new Set();
+    const rows = await res.json();
+    return new Set((rows || []).map(r => r.msg_id).filter(Boolean));
+  } catch { return new Set(); }
+}
+
+async function sweepRecentMail() {
+  const btn = document.getElementById("sweepRunBtn");
+  const statusEl = document.getElementById("sweepStatus");
+  const resultsEl = document.getElementById("sweepResults");
+  if (!allProjects || !allProjects.length) {
+    if (statusEl) statusEl.textContent = "Projects still loading — try again in a moment.";
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = "⏳ Scanning your recent mail…";
+  if (resultsEl) resultsEl.innerHTML = "";
+  try {
+    const token = await getToken();
+    // No $filter, so $orderby is allowed on /me/messages. Newest first.
+    const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
+      "&$select=internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
+      "&$orderby=receivedDateTime%20desc";
+    const data = await graphFetch("GET", path, null, token);
+    const messages = data?.value || [];
+    const filed = await sweepLoadFiledIds();
+
+    const buckets = { file: [], review: [], skip: 0, alreadyFiled: 0 };
+    for (const m of messages) {
+      const mid = m.internetMessageId || "";
+      if (mid && filed.has(mid)) { buckets.alreadyFiled++; continue; }
+      const sender = m.from?.emailAddress?.address || "";
+      const candidates = suggestProjects(m.subject || "", sender, sweepParticipants(m));
+      const verdict = classifySweep(candidates);
+      if (verdict.action === "skip") { buckets.skip++; continue; }
+      const base = {
+        msgId: mid,
+        subject: m.subject || "(no subject)",
+        from: m.from?.emailAddress?.name || sender,
+        date: (m.receivedDateTime || "").slice(0, 10),
+      };
+      if (verdict.action === "file") {
+        buckets.file.push({ ...base, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
+      } else {
+        buckets.review.push({ ...base, candidates: verdict.candidates });
+      }
+    }
+    renderSweepResults(messages.length, buckets);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderSweepResults(scanned, b) {
+  const statusEl = document.getElementById("sweepStatus");
+  const resultsEl = document.getElementById("sweepResults");
+  if (statusEl) {
+    statusEl.textContent =
+      "Scanned " + scanned + " · would auto-file " + b.file.length +
+      " · review " + b.review.length + " · skip " + b.skip +
+      " · already filed " + b.alreadyFiled + "  — preview only, nothing saved.";
+  }
+  if (!resultsEl) return;
+  const esc = (s) => String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const grp = (t) => '<div style="font-weight:600;margin:8px 0 4px;">' + t + "</div>";
+  const meta = (t) => '<span style="color:#888;">' + t + "</span>";
+  const rowCss = 'style="padding:4px 0;border-top:1px solid #eee;font-size:12px;"';
+  const out = [];
+  if (b.file.length) {
+    out.push(grp("✅ Would auto-file (" + b.file.length + ")"));
+    for (const e of b.file) {
+      out.push("<div " + rowCss + "><b>" + esc(e.project.projectNumber || e.project.name) + "</b> — " +
+        esc(e.subject) + "<br>" + meta(esc(e.from) + " · " + esc(e.date) + " · score " + e.score +
+        " (" + esc((e.reasons || []).join(", ")) + ")") + "</div>");
+    }
+  }
+  if (b.review.length) {
+    out.push(grp("🟡 Needs review (" + b.review.length + ")"));
+    for (const e of b.review) {
+      const opts = (e.candidates || [])
+        .map((c) => esc(c.project.projectNumber || c.project.name) + " (" + c.score + ")").join(" · ");
+      out.push("<div " + rowCss + ">" + esc(e.subject) + "<br>" +
+        meta(esc(e.from) + " · " + esc(e.date) + " → " + opts) + "</div>");
+    }
+  }
+  resultsEl.innerHTML = out.join("") || meta("No new emails matched a project.");
+}
+
 function renderProjectSuggestions() {
   const block = document.getElementById("suggestionBlock");
   const chips = document.getElementById("suggestionChips");

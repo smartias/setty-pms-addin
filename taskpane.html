@@ -879,6 +879,17 @@
     <div id="responseWatchlistList"></div>
   </div>
 
+  <!-- Email sweep (preview) — scans recent mail and shows what would auto-file
+       vs. need review. Preview writes nothing; for calibrating confidence. -->
+  <div id="sweepBlock" class="watchlist-block" style="display:none;">
+    <div class="watchlist-head">
+      <div class="watchlist-label">🧹 Sweep recent mail</div>
+      <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview which recent emails would file to projects">Preview</button>
+    </div>
+    <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
+    <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
+  </div>
+
   <!-- Project suggestion chips — shown when no project tag exists for this thread -->
   <div id="suggestionBlock" class="suggestion-block" style="display:none;">
     <div class="suggestion-label">💡 <span id="suggestionLabelText">Possible projects</span></div>
