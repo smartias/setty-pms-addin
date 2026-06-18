@@ -1366,30 +1366,36 @@ function applyEmailFlowEmphasis() {
         btnRow.appendChild(clearBtn);
       }
     } else {
-      if (_customSpFolderName) {
-        const prefix = document.createTextNode("Folder: ");
-        const strong = document.createElement("strong");
-        strong.style.color = "var(--text)";
-        strong.textContent = _customSpFolderName;
-        capSp.appendChild(prefix);
-        capSp.appendChild(strong);
-      } else {
-        capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
-      }
-      // Quiet text link — discoverable next to the caption but not competing
-      // with the save buttons for attention.
+      // Prominent, always-visible folder control in the pending state. The old
+      // faint underlined link was easy to miss, so show the actual folder name
+      // that will be created plus a clearly-tappable Rename button. (The
+      // YYYY_MM_DD prefix is added automatically at save time, not shown here.)
+      const folderName = _customSpFolderName || _getDefaultSpFolderSubject();
+      const wrap = document.createElement("span");
+      wrap.style.cssText = "display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px 8px;justify-content:center;";
+
+      const label = document.createElement("span");
+      label.style.cssText = "font-size:11px;color:var(--muted);";
+      label.appendChild(document.createTextNode("📁 Folder: "));
+      const strong = document.createElement("strong");
+      strong.style.color = "var(--text)";
+      strong.textContent = folderName;
+      label.appendChild(strong);
+      wrap.appendChild(label);
+
       const renameBtn = document.createElement("button");
       renameBtn.type = "button";
       renameBtn.id = "saveSpRenameLink";
-      renameBtn.textContent = _customSpFolderName ? "change" : "rename folder";
+      renameBtn.textContent = _customSpFolderName ? "✏️ Change name" : "✏️ Rename folder";
       renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
-      renameBtn.style.cssText = "margin-left:8px;color:var(--muted);background:transparent;border:none;padding:2px 0;font:inherit;font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:2px;";
+      renameBtn.style.cssText = "font-size:11px;padding:3px 10px;border:1px solid var(--primary);background:#fff;color:var(--primary);border-radius:4px;cursor:pointer;white-space:nowrap;";
       renameBtn.addEventListener("click", e => {
         e.preventDefault();
         e.stopPropagation();
         openSpFolderRenameEditor();
       });
-      capSp.appendChild(renameBtn);
+      wrap.appendChild(renameBtn);
+      capSp.appendChild(wrap);
     }
   }
   if (row) row.style.gridTemplateColumns = "1fr";
@@ -5575,6 +5581,13 @@ if (existingRecord) {
       savedAt: new Date().toISOString(),
       savedBy: _getCurrentUserEmail() || "",
     };
+    // If this email was already logged (auto-save) and THIS pass couldn't fetch a
+    // body, keep the body the earlier save captured — don't blank it out.
+    if (existingRecord && !(emailRecord.bodyHtmlSize > 0)) {
+      emailRecord.bodyText = existingRecord.bodyText || emailRecord.bodyText;
+      emailRecord.bodyHtmlCompressed = existingRecord.bodyHtmlCompressed || emailRecord.bodyHtmlCompressed;
+      emailRecord.bodyHtmlSize = existingRecord.bodyHtmlSize || emailRecord.bodyHtmlSize;
+    }
     // Re-fetch latest projects, then append email to the FRESH copy of this project.
     // Prevents the add-in from overwriting concurrent PMS edits made during this session.
     await applyLocalChangeAndSave(selectedProject.id, fresh => {
