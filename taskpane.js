@@ -2919,10 +2919,11 @@ async function sweepRecentMail() {
   if (resultsEl) resultsEl.innerHTML = "";
   try {
     const token = await getToken();
-    // No $filter, so $orderby is allowed on /me/messages. Newest first.
+    // Focused Inbox only — skip the "Other" tab (newsletters/bulk). Graph forbids
+    // $filter + $orderby together on /me/messages; default order is newest-first.
     const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
       "&$select=internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-      "&$orderby=receivedDateTime%20desc";
+      "&$filter=inferenceClassification%20eq%20'focused'";
     const data = await graphFetch("GET", path, null, token);
     const messages = data?.value || [];
     const filed = await sweepLoadFiledIds();
@@ -3005,9 +3006,11 @@ const sweepEsc = (s) => String(s == null ? "" : s)
 // conversationId needed to file later. Writes nothing.
 async function sweepScan() {
   const token = await getToken();
+  // Focused Inbox only — skip "Other". Graph forbids $filter + $orderby together;
+  // default message order is newest-first.
   const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
     "&$select=id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-    "&$orderby=receivedDateTime%20desc";
+    "&$filter=inferenceClassification%20eq%20'focused'";
   const data = await graphFetch("GET", path, null, token);
   const messages = data?.value || [];
   const filed = await sweepLoadFiledIds();
