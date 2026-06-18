@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-10-company-dedup-guard";</script>
+  <script>window.__appVersion = "2026-06-18-sweep-bulkfile-multijob";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -996,14 +996,16 @@
       <!-- Email sweep — bulk-file recent Focused mail to projects (used less often). -->
       <div id="sweepBlock" class="watchlist-block">
         <div class="watchlist-head">
-          <div class="watchlist-label">🧹 Sweep recent mail</div>
+          <div class="watchlist-label">🧹 Sweep &amp; bulk-file mail</div>
           <span>
             <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview only — writes nothing">Preview</button>
             <button type="button" id="sweepFileBtn" class="watchlist-refresh" title="File confident matches and queue the rest for review">Run &amp; file</button>
           </span>
         </div>
+        <input type="text" id="sweepMailbox" autocomplete="off" placeholder="Scan my mailbox — or type a colleague's email to bulk-file theirs" title="Leave blank to scan your own mailbox. Enter a shared/delegated mailbox address (e.g. a departed PM) to bulk-file all of their mail across every folder, including Sent." style="width:100%;box-sizing:border-box;font-size:12px;padding:4px 6px;margin:4px 0;border:1px solid #ccc;border-radius:4px;" />
         <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
         <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
+        <button type="button" id="sweepMoreBtn" class="watchlist-refresh" style="display:none;width:100%;margin-top:6px;" title="Scan and file the next batch from this mailbox">⬇️ Load more from this mailbox</button>
       </div>
     </div>
   </details>

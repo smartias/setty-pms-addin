@@ -21,6 +21,11 @@ const GRAPH_SCOPES = [
 // associated feature triggers a one-time per-user consent popup; afterwards
 // the token is cached silently like any other Graph token.
 const CHANNEL_MESSAGE_SCOPES = ["ChannelMessage.Send"];
+// On-demand too: reading a mailbox that's been shared/delegated to the signed-in
+// user (e.g. a departed colleague's) needs Mail.Read.Shared. Kept out of the
+// default sign-in so the consent popup only appears the first time someone
+// actually scans another person's mailbox.
+const SHARED_MAIL_SCOPES = ["Mail.Read.Shared"];
 const TEAMS_TEAM_ID   = "a4c48361-7991-43db-af83-4c854918a760";
 const TEAMS_TENANT_ID = "f374c024-71c2-48b6-8420-076fff97327c";
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
@@ -208,7 +213,9 @@ function setupEventListeners() {
   const sweepBtn = document.getElementById("sweepRunBtn");
   if (sweepBtn) sweepBtn.onclick = () => { void sweepRecentMail(); };
   const sweepFileBtn = document.getElementById("sweepFileBtn");
-  if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(); };
+  if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(true); };
+  const sweepMoreBtn = document.getElementById("sweepMoreBtn");
+  if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   // Pin hint banner — show unless previously dismissed or pinning was detected.
@@ -1505,6 +1512,20 @@ async function getChannelMessageToken() {
     // First call → consent popup. Subsequent silent calls succeed because
     // the consent is cached on the user's MSAL account.
     const r = await msalApp.acquireTokenPopup({ scopes: CHANNEL_MESSAGE_SCOPES, account });
+    return r.accessToken;
+  }
+}
+// On-demand token for reading a mailbox shared/delegated to the signed-in user.
+// Same lazy-consent pattern as getChannelMessageToken: the Mail.Read.Shared
+// prompt fires once, the first time someone scans a colleague's mailbox.
+async function getSharedMailToken() {
+  const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+  if (!account) throw new Error("Not signed in");
+  try {
+    const r = await msalApp.acquireTokenSilent({ scopes: SHARED_MAIL_SCOPES, account });
+    return r.accessToken;
+  } catch {
+    const r = await msalApp.acquireTokenPopup({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
   }
 }
@@ -2894,7 +2915,9 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 // PREVIEW WRITES NOTHING. It exists to calibrate the thresholds against real mail
 // before auto-filing is enabled. Filing + the review queue come next once the
 // numbers look right.
-const SWEEP_FETCH_COUNT = 150; // recent messages to scan (some filtered to Focused)
+const SWEEP_PAGE_SIZE = 250;          // messages per Graph page — a lean $select keeps this well under the 504 ceiling
+const SWEEP_TARGET_ACTIONABLE = 50;   // keep paging within one batch until this many file+review surface — skips/already-filed no longer cap the run
+const SWEEP_MAX_PAGES_PER_BATCH = 30; // safety cap: at most 30×250 = 7,500 messages scanned per Preview / Load-more press
 const SWEEP_REVIEW_MIN  = 4;   // min name/acronym score to ENTER review (≥2 distinctive signals)
 
 // Common AEC / institutional words that appear across many project names — too
@@ -3066,25 +3089,28 @@ async function sweepRecentMail() {
     return;
   }
   if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = "⏳ Scanning your Focused inbox…";
+  if (statusEl) statusEl.textContent = "⏳ Scanning " + sweepResolveMailbox().label + " (all folders)…";
   if (resultsEl) resultsEl.innerHTML = "";
   try {
-    const r = await sweepScan(); // shared scanner: newest-first, Focused-only, subject-matched
+    const r = await sweepResolveScan(true); // fresh batch; paginates to ~target actionable across all folders
     if (statusEl) {
       statusEl.textContent =
-        "Scanned " + r.scanned + " focused · would auto-file " + r.file.length +
-        " · review " + r.review.length + " · skip " + r.skip +
-        " · already filed " + r.alreadyFiled + "  — preview only, nothing saved.";
+        "Scanned " + _sweepTotals.scanned + " in " + _sweepSource.label +
+        " · would auto-file " + r.file.length + " · review " + r.review.length +
+        " · skip " + _sweepTotals.skip + " · already filed " + _sweepTotals.alreadyFiled +
+        (_sweepCursor ? " · more await Run & file" : " · end of mailbox") +
+        "  — preview only, nothing saved.";
     }
     const grp = (t) => '<div style="font-weight:600;margin:8px 0 4px;">' + t + "</div>";
     const meta = (t) => '<span style="color:#888;">' + t + "</span>";
+    const num = (t) => t ? ' <span style="color:#888;font-family:Consolas,monospace;font-size:11px;">' + sweepEsc(t) + "</span>" : "";
     const rowCss = 'style="padding:4px 0;border-top:1px solid #eee;font-size:12px;"';
     const lines = [];
     if (r.file.length) {
       lines.push(grp("✅ Would auto-file (" + r.file.length + ")"));
       for (const e of r.file) {
-        lines.push("<div " + rowCss + "><b>" + sweepEsc(e.project.projectNumber || e.project.name) +
-          "</b> — " + sweepEsc(e.subject) + "<br>" +
+        lines.push("<div " + rowCss + "><b>" + sweepEsc(e.project.name || e.project.projectNumber) +
+          "</b>" + num(e.project.name ? e.project.projectNumber : "") + " — " + sweepEsc(e.subject) + "<br>" +
           meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " · score " + e.score) + "</div>");
       }
     }
@@ -3092,12 +3118,12 @@ async function sweepRecentMail() {
       lines.push(grp("🟡 Needs review (" + r.review.length + ")"));
       for (const e of r.review) {
         const opts = (e.candidates || [])
-          .map((c) => sweepEsc(c.project.projectNumber || c.project.name) + " (" + c.score + ")").join(" · ");
+          .map((c) => sweepEsc(c.project.name || c.project.projectNumber) + " (" + c.score + ")").join(" · ");
         lines.push("<div " + rowCss + ">" + sweepEsc(e.subject) + "<br>" +
           meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " → " + opts) + "</div>");
       }
     }
-    if (resultsEl) resultsEl.innerHTML = lines.join("") || meta("No new emails matched a project.");
+    if (resultsEl) resultsEl.innerHTML = lines.join("") || meta("No new emails matched a project — try Load more or a different mailbox.");
   } catch (e) {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
@@ -3151,38 +3177,85 @@ let _sweepReview = []; // ambiguous items awaiting confirm after a Run & file
 const sweepEsc = (s) => String(s == null ? "" : s)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// Fetch + classify recent mail into rich items carrying the Graph id +
-// conversationId needed to file later. Writes nothing.
-async function sweepScan() {
-  const token = await getToken();
-  // Newest first, then keep only Focused (Graph can't combine $filter + $orderby).
-  const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
-    "&$select=id,internetMessageId,inferenceClassification,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-    "&$orderby=receivedDateTime%20desc";
-  const data = await graphFetch("GET", path, null, token);
-  const messages = data?.value || [];
+// ── Mailbox source resolution ────────────────────────────────────────────────
+// Empty field (or your own address) → "/me"; a colleague's address → "/users/{addr}"
+// so the same scan code can target a departed PM's shared mailbox.
+function sweepResolveMailbox() {
+  const raw = (document.getElementById("sweepMailbox")?.value || "").trim();
+  const me = (_getCurrentUserEmail() || "").trim().toLowerCase();
+  if (!raw || raw.toLowerCase() === me || raw.toLowerCase() === "me") {
+    return { base: "/me", shared: false, label: "your mailbox" };
+  }
+  return { base: "/users/" + encodeURIComponent(raw), shared: true, label: raw };
+}
+// Module-level scan source + cursor, shared across Preview / Run & file / Load more.
+// _sweepSource carries the messages-collection base ("/me" or "/users/{addr}") and
+// the token (a Mail.Read.Shared token for a colleague's mailbox); _sweepCursor is
+// the @odata.nextLink for the next batch (null = start fresh or mailbox exhausted).
+let _sweepSource = { base: "/me", token: null, label: "your mailbox", shared: false };
+let _sweepCursor = null;
+let _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+
+// Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
+// run from the chosen mailbox; reset=false continues the saved cursor (Load more).
+async function sweepResolveScan(reset) {
+  if (reset) {
+    const mb = sweepResolveMailbox();
+    _sweepSource = { base: mb.base, label: mb.label, shared: mb.shared, token: null };
+    _sweepCursor = null;
+    _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+  }
+  // Refresh the token at the start of EVERY batch (incl. Load more) so a long
+  // backfill never carries a stale token into graphFetch's 401 path — which would
+  // otherwise retry a shared-mailbox call with the wrong (own-mailbox) token.
+  _sweepSource.token = _sweepSource.shared ? await getSharedMailToken() : await getToken();
+  const batch = await sweepScanBatch({ base: _sweepSource.base, token: _sweepSource.token, cursor: _sweepCursor });
+  _sweepCursor = batch.nextLink; // null once the mailbox is fully walked
+  _sweepTotals.scanned += batch.scanned;
+  _sweepTotals.skip += batch.skip;
+  _sweepTotals.alreadyFiled += batch.alreadyFiled;
+  return batch;
+}
+// Fetch + classify mail into rich items carrying the Graph id + conversationId
+// needed to file later. Writes nothing. Paginates within the batch — following
+// @odata.nextLink verbatim, per Graph's paging rules — until enough actionable
+// items surface (so skipped / already-filed messages no longer cap the run), the
+// mailbox is exhausted, or the per-batch page cap is hit. Scans ALL folders
+// (incl. Sent): no Focused filter, since a backfill wants the whole mailbox.
+async function sweepScanBatch({ base, token, cursor }) {
   const filed = await sweepLoadFiledIds();
   const senderMap = await sweepLoadSenderMap();
-  const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0 };
-  for (const m of messages) {
-    if (m.inferenceClassification && m.inferenceClassification !== "focused") continue; // Focused only
-    out.scanned++;
-    const sender = m.from?.emailAddress?.address || "";
-    if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
-    const mid = m.internetMessageId || "";
-    if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
-    const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
-    if (verdict.action === "skip") { out.skip++; continue; }
-    const item = {
-      gid: m.id, convId: m.conversationId || "", msgId: mid,
-      subject: m.subject || "(no subject)",
-      from: m.from?.emailAddress?.name || sender, fromAddress: sender,
-      to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
-      cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
-      date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
-    };
-    if (verdict.action === "file") out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
-    else out.review.push({ ...item, candidates: verdict.candidates });
+  const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
+  // First page builds the query; later pages follow the (base-stripped) nextLink.
+  let path = cursor || (base + "/messages?$top=" + SWEEP_PAGE_SIZE +
+    "&$select=id,internetMessageId,inferenceClassification,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
+    "&$orderby=receivedDateTime%20desc");
+  for (let page = 0; page < SWEEP_MAX_PAGES_PER_BATCH; page++) {
+    const data = await graphFetch("GET", path, null, token);
+    for (const m of (data?.value || [])) {
+      out.scanned++;
+      const sender = m.from?.emailAddress?.address || "";
+      if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
+      const mid = m.internetMessageId || "";
+      if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
+      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
+      if (verdict.action === "skip") { out.skip++; continue; }
+      const item = {
+        gid: m.id, convId: m.conversationId || "", msgId: mid,
+        subject: m.subject || "(no subject)",
+        from: m.from?.emailAddress?.name || sender, fromAddress: sender,
+        to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+        cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+        date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
+      };
+      if (verdict.action === "file") out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
+      else out.review.push({ ...item, candidates: verdict.candidates });
+    }
+    const next = data?.["@odata.nextLink"] || null;
+    out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
+    if (!out.nextLink) break;                                                  // mailbox fully walked
+    if (out.file.length + out.review.length >= SWEEP_TARGET_ACTIONABLE) break; // enough to act on this batch
+    path = out.nextLink;
   }
   return out;
 }
@@ -3205,14 +3278,19 @@ function stripHtmlToText(html) {
 // body_text) and dual-writes project.emails[] grouped per project. {filed, failed}.
 async function sweepFileItems(items) {
   if (!items.length) return { filed: 0, failed: 0 };
-  const token = await getToken();
+  // Read bodies from whatever mailbox this batch was scanned from — a colleague's
+  // shared mailbox needs its Mail.Read.Shared token + /users/{addr} message path.
+  // Acquire fresh (silent, cached) so a later review-confirm can't fail on a stale
+  // token routing through graphFetch's own-mailbox 401 fallback.
+  const token = _sweepSource?.shared ? await getSharedMailToken() : await getToken();
+  const base = _sweepSource?.base || "/me";
   const byProject = new Map();
   let filed = 0, failed = 0;
   for (const it of items) {
     try {
       let bodyHtml = "";
       try {
-        const d = await graphFetch("GET", "/me/messages/" + it.gid + "?$select=body", null, token);
+        const d = await graphFetch("GET", base + "/messages/" + it.gid + "?$select=body", null, token);
         bodyHtml = d?.body?.content || "";
       } catch (_) { /* body fetch is best-effort */ }
       const rec = {
@@ -3248,66 +3326,138 @@ async function sweepFileItems(items) {
 }
 
 // RUN & FILE — auto-file the confident bucket, queue the ambiguous ones.
-async function sweepRunAndFile() {
+async function sweepRunAndFile(reset = true) {
   const btn = document.getElementById("sweepFileBtn");
+  const moreBtn = document.getElementById("sweepMoreBtn");
   const statusEl = document.getElementById("sweepStatus");
   if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return; }
   if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = "⏳ Scanning and filing confident matches…";
+  if (moreBtn) moreBtn.disabled = true;
+  if (statusEl) statusEl.textContent = reset ? "⏳ Scanning and filing confident matches…" : "⏳ Loading the next batch…";
   try {
-    const r = await sweepScan();
+    if (reset) _sweepReview = [];
+    const r = await sweepResolveScan(reset);
     for (const it of r.file) it.projectId = it.project.id;
     const { filed, failed } = await sweepFileItems(r.file);
-    _sweepReview = r.review;
+    _sweepTotals.filed += filed;
+    _sweepReview.push(...r.review);
+    const pending = _sweepReview.filter((e) => !e._done && !(e._filedTo && e._filedTo.length)).length;
     if (statusEl) statusEl.textContent =
-      "✓ Filed " + filed + (failed ? (" · " + failed + " failed") : "") +
-      " · " + _sweepReview.length + " to review · skipped " + r.skip + " · already filed " + r.alreadyFiled;
+      "✓ Filed " + _sweepTotals.filed + (failed ? (" · " + failed + " failed this batch") : "") +
+      " · " + pending + " to review · scanned " + _sweepTotals.scanned +
+      " · skipped " + _sweepTotals.skip + " · already filed " + _sweepTotals.alreadyFiled +
+      " · [" + _sweepSource.label + "]" + (_sweepCursor ? " · more available" : " · end of mailbox");
     renderSweepReviewQueue();
   } catch (e) {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
     if (btn) btn.disabled = false;
+    updateSweepMoreBtn();
   }
 }
+// Show the Load-more button only while the chosen mailbox still has pages left.
+function updateSweepMoreBtn() {
+  const moreBtn = document.getElementById("sweepMoreBtn");
+  if (!moreBtn) return;
+  moreBtn.style.display = _sweepCursor ? "" : "none";
+  moreBtn.disabled = false;
+}
 
-// Review queue — each ambiguous email gets a button per candidate project + Skip.
+// Review queue — each ambiguous email gets a button per candidate project. Filing
+// to one does NOT close the row: an email can belong to two jobs, so once filed it
+// collapses to a ✓ confirmation with "＋ also file to another job", which re-opens
+// the candidates to copy the SAME email into a second project. One file resolves
+// the item (drops it from the "left" count); Skip dismisses an unmatched one.
 function renderSweepReviewQueue() {
   const resultsEl = document.getElementById("sweepResults");
   if (!resultsEl) return;
-  const pending = _sweepReview.filter((e) => !e._done);
-  if (!pending.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
+  const isFiled = (e) => !!(e._filedTo && e._filedTo.length);
+  const needsAttention = (e) => !e._done && !isFiled(e);
+  const visible = _sweepReview.filter((e) => e._done !== "skip"); // hide skipped; keep ✓ confirmations
+  if (!visible.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
   const bcss = 'style="margin:2px 4px 2px 0;padding:2px 8px;font-size:12px;cursor:pointer;"';
-  const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + pending.length + ' left)</div>'];
+  const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + _sweepReview.filter(needsAttention).length + ' left)</div>'];
   _sweepReview.forEach((e, i) => {
-    if (e._done) return;
-    const cands = (e.candidates || []).map((c, ci) =>
-      '<button type="button" data-sw="file" data-i="' + i + '" data-ci="' + ci + '" ' + bcss + ">" +
-      sweepEsc(c.project.projectNumber || c.project.name) + "</button>").join("");
-    rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' +
-      sweepEsc(e.subject) + '<br><span style="color:#888;">' + sweepEsc(e.from) + " · " +
-      sweepEsc((e.date || "").slice(0, 10)) + "</span><br>File to: " + cands +
-      '<button type="button" data-sw="skip" data-i="' + i + '" ' + bcss + ">Skip</button></div>");
+    if (e._done === "skip") return;
+    const subjLine = sweepEsc(e.subject) + '<br><span style="color:#888;">' +
+      sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + "</span>";
+    if (e._done === "filing") {
+      rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' + subjLine +
+        '<br><span style="color:#888;">⏳ filing…</span></div>');
+      return;
+    }
+    const filed = e._filedTo || [];
+    const filedNames = filed.map((f) => f.name).join(", ");
+    const filedIds = new Set(filed.map((f) => f.id));
+    const moreToFile = filed.length < (e.candidates || []).length;
+    // Filed and not re-expanded → compact ✓ confirmation + opt-in to copy elsewhere.
+    if (filed.length && !e._expand) {
+      rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;opacity:0.9;">' + subjLine +
+        '<br><span style="color:#107c10;">✓ Filed to ' + sweepEsc(filedNames) + "</span>" +
+        (moreToFile ? ' <button type="button" data-sw="expand" data-i="' + i + '" ' + bcss + ">＋ also file to another job</button>" : "") +
+        "</div>");
+      return;
+    }
+    // Buttons lead with the project NAME — people recognize "CHCR Grove and New
+    // Dorp", not "SAPX226014.00". The number rides along as a muted subtitle so
+    // same-named candidates (e.g. two phases of one job) stay distinguishable.
+    // A project already filed shows as a disabled green ✓ chip.
+    const cands = (e.candidates || []).map((c, ci) => {
+      const name = (c.project.name || "").trim();
+      const num  = (c.project.projectNumber || "").trim();
+      const primary  = name || num;                 // always show something
+      const subtitle = (name && num) ? num : "";    // number as a subtitle, never the sole label
+      const already  = filedIds.has(c.project.id);
+      const style = "margin:2px 4px 2px 0;padding:3px 8px;font-size:12px;text-align:left;line-height:1.25;vertical-align:top;" +
+        (already ? "cursor:default;background:#dff6dd;border:1px solid #9fd89f;color:#0b5a0b;" : "cursor:pointer;");
+      const opener = already
+        ? '<button type="button" disabled style="' + style + '">'
+        : '<button type="button" data-sw="file" data-i="' + i + '" data-ci="' + ci + '" style="' + style + '">';
+      return opener +
+        '<span style="font-weight:600;">' + (already ? "✓ " : "") + sweepEsc(primary) + "</span>" +
+        (subtitle ? '<br><span style="color:#888;font-size:11px;font-family:Consolas,monospace;">' + sweepEsc(subtitle) + "</span>" : "") +
+        "</button>";
+    }).join("");
+    const lead = filed.length
+      ? '<span style="color:#107c10;">✓ Filed to ' + sweepEsc(filedNames) + "</span> · also file to:"
+      : "File to:";
+    const tail = filed.length
+      ? '<button type="button" data-sw="done" data-i="' + i + '" ' + bcss + ">✓ Done</button>"
+      : '<button type="button" data-sw="skip" data-i="' + i + '" ' + bcss + ">Skip</button>";
+    rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' + subjLine +
+      "<br>" + lead + " " + cands + tail + "</div>");
   });
   resultsEl.innerHTML = rows.join("");
   resultsEl.querySelectorAll("button[data-sw]").forEach((b) => {
     b.onclick = () => {
-      const i = +b.dataset.i;
-      if (b.dataset.sw === "skip") { if (_sweepReview[i]) _sweepReview[i]._done = "skip"; renderSweepReviewQueue(); return; }
-      void sweepConfirmReview(i, +b.dataset.ci);
+      const i = +b.dataset.i; const e = _sweepReview[i]; if (!e) return;
+      switch (b.dataset.sw) {
+        case "skip":   e._done = "skip";  renderSweepReviewQueue(); break;
+        case "done":   e._expand = false; renderSweepReviewQueue(); break;  // collapse to the ✓ confirmation
+        case "expand": e._expand = true;  renderSweepReviewQueue(); break;  // re-open candidates to copy elsewhere
+        case "file":   void sweepConfirmReview(i, +b.dataset.ci); break;
+      }
     };
   });
 }
 
 async function sweepConfirmReview(i, ci) {
   const e = _sweepReview[i];
-  if (!e || e._done) return;
+  if (!e || e._done === "skip" || e._done === "filing") return;
   const proj = e.candidates?.[ci]?.project;
   if (!proj) return;
+  e._filedTo = e._filedTo || [];
+  if (e._filedTo.some((f) => f.id === proj.id)) return; // don't double-file the same job
   e._done = "filing";
   renderSweepReviewQueue();
   const { filed } = await sweepFileItems([{ ...e, projectId: proj.id }]);
-  e._done = filed ? "filed" : null;
-  if (!filed) { const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again."; }
+  e._done = null;
+  if (filed) {
+    e._filedTo.push({ id: proj.id, name: (proj.name || proj.projectNumber || "project") });
+    e._expand = false; // collapse to the ✓ confirmation; "＋ also file" re-expands to copy to another job
+  } else {
+    const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again.";
+  }
   renderSweepReviewQueue();
 }
 
@@ -3940,6 +4090,11 @@ function isSettyInternalEmail(email) {
 function senderNeedsEnrichment() {
   const addr = (emailFromAddress || "").trim().toLowerCase();
   if (!addr) return null;
+  // Setty staff are managed via the project's Teams tab, not the contact
+  // directories (same exclusion getParticipantDirectoryStatus applies). Never
+  // nudge to enrich an internal sender from their signature — even if a stale
+  // @setty.com record lingers in a directory from before that rule existed.
+  if (isSettyInternalEmail(addr)) return null;
   // Saved/enriched this session — stop nudging immediately, even before the
   // in-memory directory cache reflects the backfilled title/phone.
   if (_sessionSavedContactEmails.has(addr)) return null;
