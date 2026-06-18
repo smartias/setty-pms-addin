@@ -3345,7 +3345,14 @@ async function sweepFileItems(items) {
   // Keep project.emails[] in sync — one save per project (avoids version churn).
   for (const [pid, recs] of byProject) {
     try {
-      await applyLocalChangeAndSave(pid, (fresh) => ({ ...fresh, emails: [...(fresh.emails || []), ...recs] }));
+      await applyLocalChangeAndSave(pid, (fresh) => {
+        // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
+        // uniqueness: drop any copy already filed here since our last sync so the
+        // JSON array can't drift even though the table now can't.
+        const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
+        const add = recs.filter(r => !r.msgId || !have.has(r.msgId));
+        return add.length ? { ...fresh, emails: [...(fresh.emails || []), ...add] } : fresh;
+      });
     } catch (e) {
       console.warn("sweep dual-write to project.emails failed for", pid, e);
     }
@@ -5935,10 +5942,13 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       savedBy: _getCurrentUserEmail() || "",
       savedToSharePoint: false,
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      emails: [...(fresh.emails || []), emailRecord],
-    }));
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
+      // uniqueness: if this email was filed here since our pane last synced
+      // (another user, or a prior auto-save), don't append a second copy.
+      if ((fresh.emails || []).some(e => e.msgId && e.msgId === emailRecord.msgId)) return fresh;
+      return { ...fresh, emails: [...(fresh.emails || []), emailRecord] };
+    });
     let indexSaveFailed = false;
     try {
       await saveProjectEmailRow(selectedProject.id, emailRecord, false);
