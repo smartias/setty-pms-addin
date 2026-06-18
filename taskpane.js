@@ -4073,6 +4073,27 @@ async function resolveSpIds() {
 // Cleared on item switch (loadItemContext).
 const _emailBodyCache = new Map();
 function clearEmailBodyCache() { _emailBodyCache.clear(); }
+// The email's true send date. For ARCHIVED items, emailItem.dateTimeCreated is the
+// archive-copy time (a 2021 email can read as 2023), so prefer the internet "Date:"
+// header — the real send date Outlook shows. Falls back to dateTimeCreated.
+async function getEmailDateReliable() {
+  const headerDate = await new Promise(resolve => {
+    try {
+      if (!emailItem?.getAllInternetHeadersAsync) return resolve("");
+      emailItem.getAllInternetHeadersAsync(r => {
+        if (r.status !== Office.AsyncResultStatus.Succeeded) return resolve("");
+        const m = String(r.value || "").match(/^Date:\s*(.+)$/im);
+        resolve(m ? m[1].trim() : "");
+      });
+    } catch { resolve(""); }
+  });
+  if (headerDate) {
+    const d = new Date(headerDate);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  return emailItem?.dateTimeCreated || null;
+}
+
 async function getEmailBodyHtml(token) {
   const item = Office.context.mailbox.item;
   const msgId = item?.itemId;
@@ -5406,6 +5427,18 @@ async function withFilingScaffold(opts, runUpload) {
 }
 
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
+// Update an already-saved email's SharePoint + body fields in pms_project_emails
+// (used when Save to SharePoint runs on a record that auto-save created earlier —
+// avoids a duplicate row). PATCH by record_id; no unique-constraint dependency.
+async function patchEmailSpFields(recordId, fields) {
+  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?record_id=eq." + encodeURIComponent(recordId);
+  const res = await fetchWithRetry(url, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(fields),
+  }, { label: "sb project_emails sp-update" });
+  if (!res.ok) throw new Error("pms_project_emails PATCH HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+}
 async function doSaveToSharePoint() {
   return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
 }
@@ -5448,8 +5481,11 @@ if (existingRecord) {
     try { refreshLinkToTargetDropdown(); } catch {}
     return;
   }
-  refreshEmailSavedIndicator();
-  return;
+  // Already filed to SharePoint → nothing to upload; just refresh the indicator.
+  if (existingRecord.spFolderUrl) { refreshEmailSavedIndicator(); return; }
+  // Otherwise this email was logged to the project record (e.g. by auto-save on
+  // tag) but never pushed to SharePoint. Fall through to upload the attachments
+  // and UPDATE this same record below — don't bail, and don't duplicate the row.
 }
   // Snapshot all per-item data SYNCHRONOUSLY before any await. Without this,
   // a fast item-switch (Office swaps mailbox.item silently on pinned panes)
@@ -5458,7 +5494,7 @@ if (existingRecord) {
   // generation counter alone can't protect later sync reads of `emailItem.*`.
   const snapItem = emailItem;
   const snapSubject = snapItem?.subject || "";
-  const snapDate = snapItem?.dateTimeCreated;
+  const snapDate = await getEmailDateReliable();
   const snapFromName = snapItem?.from?.displayName || "";
   const snapFromAddr = snapItem?.from?.emailAddress || "";
   // Capture recipients in the same snapshot so an item-switch mid-save can't
@@ -5523,14 +5559,14 @@ if (existingRecord) {
     // even if some uploads later failed — the email still HAS the attachments.
     const attachmentNames = (lastAttachmentUploadStats?.attemptedNames || []).slice();
     const emailRecord = {
-      id: uid(), msgId,
+      id: existingRecord ? existingRecord.id : uid(), msgId,
       subject: snapSubject,
       from: snapFromName,
       fromAddress: snapFromAddr,
       to: snapTo,
       cc: snapCc,
       date: snapDate,
-      bodyText: "",
+      bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
       hasAttachments: attachmentNames.length > 0,
@@ -5541,15 +5577,31 @@ if (existingRecord) {
     };
     // Re-fetch latest projects, then append email to the FRESH copy of this project.
     // Prevents the add-in from overwriting concurrent PMS edits made during this session.
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      emails: [...(fresh.emails || []), emailRecord],
-    }));
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      // Replace any existing entry for this email (auto-save may have logged it
+      // already) so the SharePoint URL lands on ONE record instead of duplicating.
+      const others = (fresh.emails || []).filter(e => e.id !== emailRecord.id && e.msgId !== emailRecord.msgId);
+      return { ...fresh, emails: [...others, emailRecord] };
+    });
     let indexSaveFailed = false;
     try {
-      await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+      if (existingRecord) {
+        // Auto-save already inserted the search-index row; just patch in the
+        // SharePoint URL + attachment names (and refresh the body if we got one)
+        // so we update that one row instead of inserting a duplicate.
+        await patchEmailSpFields(existingRecord.id, {
+          sp_folder_url: spFolderUrl || "",
+          saved_to_sharepoint: true,
+          attachment_names: attachmentNames || [],
+          body_text: emailRecord.bodyText || "",
+          body_html_compressed: emailRecord.bodyHtmlCompressed || null,
+          body_html_size: emailRecord.bodyHtmlSize || 0,
+        });
+      } else {
+        await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+      }
     } catch (idxErr) {
-      console.warn("saveProjectEmailRow failed:", idxErr);
+      console.warn("project_emails index write failed:", idxErr);
       indexSaveFailed = true;
     }
     // Optional: if the user picked a "Link to RFI/Sub" target, copy the email
@@ -5643,7 +5695,9 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     refreshEmailSavedIndicator();
     return;
   }
-  if (!quiet) setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
+  // Always show an in-progress indicator (even on quiet auto-save) so users don't
+  // click off the email mid-capture. Quiet only suppresses the celebration.
+  setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
@@ -5664,7 +5718,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       fromAddress: from?.emailAddress || "",
       to,
       cc,
-      date: emailItem.dateTimeCreated,
+      date: await getEmailDateReliable(),
       bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
