@@ -1122,7 +1122,17 @@ function refreshEmailSavedIndicator(animate = false) {
     return;
   }
 
-  // Saved → collapse the save row into a single big-check confirmation card.
+  // Record is saved. Only collapse to the "done" card once it's filed to
+  // SharePoint; while it's record-only (e.g. auto-saved on tag), KEEP the Save to
+  // SharePoint button available so attachments can still be filed.
+  const wasFiledToSharePoint = !!existing.spFolderUrl;
+  if (!wasFiledToSharePoint) {
+    applyEmailFlowEmphasis();
+    if (confirmation) confirmation.style.display = "none";
+    try { refreshLoggedArtifactChips(); } catch {}
+    return;
+  }
+  // Filed to SharePoint → collapse the save row into a single big-check card.
   if (saveRow) saveRow.style.display = "none";
   if (saveCapRow) saveCapRow.style.display = "none";
 
@@ -1130,7 +1140,6 @@ function refreshEmailSavedIndicator(animate = false) {
     ? new Date(existing.savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
     : "earlier";
   const loggedLabels = getLoggedEmailArtifactLabels(selectedProject);
-  const wasFiledToSharePoint = !!existing.spFolderUrl;
 
   const primary = wasFiledToSharePoint
     ? "Saved to SharePoint + project record"
@@ -1382,26 +1391,11 @@ function applyEmailFlowEmphasis() {
       capSp.appendChild(renameBtn);
     }
   }
-  if (capRecord) capRecord.textContent = "Email body → project record only";
-  if (row) row.style.gridTemplateColumns = "1fr 1fr";
-  if (capRow) capRow.style.gridTemplateColumns = "1fr 1fr";
-
-  // No project picked yet — keep both visible/neutral; we don't know what's relevant.
-  if (!selectedProject) return;
-
-  const hasAtt = emailLikelyHasAttachments();
-  if (hasAtt === false) {
-    // No attachments → SharePoint isn't a meaningful path. Remove it entirely
-    // so there's no wrong button to click. Project Record takes full width.
-    btnSp.style.display = "none";
-    if (capSp) capSp.style.display = "none";
-    if (row) row.style.gridTemplateColumns = "1fr";
-    if (capRow) capRow.style.gridTemplateColumns = "1fr";
-  } else if (hasAtt === true) {
-    // Attachments exist → SharePoint is the recommended path (also writes to record).
-    btnRecord.classList.add("btn-deemph");
-  }
-  // hasAtt === null → keep both buttons visible and neutral; we don't know enough to bias.
+  if (row) row.style.gridTemplateColumns = "1fr";
+  if (capRow) capRow.style.gridTemplateColumns = "1fr";
+  // "Save to Project" retired (auto-file on tag covers the record). The SharePoint
+  // button stays full-width and always available — it files email + attachments
+  // into the project folder.
 }
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 async function doSignIn() {
@@ -2521,6 +2515,10 @@ function setSelectedProject(project, persistForEmail = false) {
       if (!badgeText) badge.textContent = "";
     }
   }
+  // Once a project is tagged, hide the search box (the badge shows the project +
+  // a × to clear). Show it again when there's no selection.
+  const searchWrap = document.getElementById("projectSearchWrapper");
+  if (searchWrap) searchWrap.style.display = selectedProject ? "none" : "";
   if (persistForEmail && selectedProject) {
     const msgId = getCurrentMessageRestId();
     if (msgId) {

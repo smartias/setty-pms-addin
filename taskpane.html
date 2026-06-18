@@ -879,19 +879,7 @@
     <div id="responseWatchlistList"></div>
   </div>
 
-  <!-- Email sweep (preview) — scans recent mail and shows what would auto-file
-       vs. need review. Preview writes nothing; for calibrating confidence. -->
-  <div id="sweepBlock" class="watchlist-block" style="display:none;">
-    <div class="watchlist-head">
-      <div class="watchlist-label">🧹 Sweep recent mail</div>
-      <span>
-        <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview only — writes nothing">Preview</button>
-        <button type="button" id="sweepFileBtn" class="watchlist-refresh" title="File confident matches and queue the rest for review">Run &amp; file</button>
-      </span>
-    </div>
-    <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
-    <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
-  </div>
+  <!-- (Email sweep moved into "More actions" at the bottom — used less often.) -->
 
   <!-- Project suggestion chips — shown when no project tag exists for this thread -->
   <div id="suggestionBlock" class="suggestion-block" style="display:none;">
@@ -899,7 +887,7 @@
     <div id="suggestionChips"></div>
   </div>
 
-  <div class="project-search-wrapper">
+  <div class="project-search-wrapper" id="projectSearchWrapper">
     <label>Project</label>
     <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
     <div id="projectDropdown"></div>
@@ -965,11 +953,13 @@
        Twin-save row: SharePoint (email + attachments) and Project Record (email body copy). -->
   <div class="save-row">
     <button class="btn btn-primary" id="saveSpBtn">📁 Save to SharePoint</button>
-    <button class="btn btn-primary" id="saveRecordBtn">🗂️ Save to Project</button>
+    <!-- "Save to Project" retired — auto-file on tag covers it. Kept hidden in the
+         DOM because the save logic references it; it's just no longer shown. -->
+    <button class="btn btn-primary" id="saveRecordBtn" style="display:none;">🗂️ Save to Project</button>
   </div>
   <div class="save-row-caption">
     <span id="saveSpCaption">Email + attachments → SharePoint + record</span>
-    <span id="saveRecordCaption">Email body → project record only</span>
+    <span id="saveRecordCaption" style="display:none;"></span>
   </div>
   <!-- Post-save confirmation — replaces the save buttons once the email is filed.
        Big check + summary line so the "done" state actually feels done.
@@ -1002,6 +992,19 @@
       <hr class="divider"/>
       <button class="btn btn-ghost" id="openDashboardBtn">📊 Open PMS Dashboard</button>
       <button class="btn btn-ghost" id="signOutBtn">Sign out</button>
+      <hr class="divider"/>
+      <!-- Email sweep — bulk-file recent Focused mail to projects (used less often). -->
+      <div id="sweepBlock" class="watchlist-block">
+        <div class="watchlist-head">
+          <div class="watchlist-label">🧹 Sweep recent mail</div>
+          <span>
+            <button type="button" id="sweepRunBtn" class="watchlist-refresh" title="Preview only — writes nothing">Preview</button>
+            <button type="button" id="sweepFileBtn" class="watchlist-refresh" title="File confident matches and queue the rest for review">Run &amp; file</button>
+          </span>
+        </div>
+        <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
+        <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
+      </div>
     </div>
   </details>
 
