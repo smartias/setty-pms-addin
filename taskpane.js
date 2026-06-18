@@ -145,8 +145,12 @@ function applyComposeModeUiGuard() {
   const compose = isComposeMode();
   document.body.classList.toggle("compose-mode", compose);
   // Hide in Compose: there's no sent email yet to file or log.
+  // NOTE: saveRecordBtn ("Save to Project") is deliberately NOT in this list — it's
+  // retired (auto-file on tag covers the record) and stays hidden via its inline
+  // display:none. Listing it here would reset display="" in read mode and un-hide it,
+  // since nothing else re-applies its visibility afterward.
   const hiddenInCompose = [
-    "saveSpBtn", "saveRecordBtn", "saveConfirmation",
+    "saveSpBtn", "saveConfirmation",
     "logNoteBtn", "sendToTeamsBtn", "newActionItemBtn",
     "moreActions", "oneNoteLinkBanner",
     "dateSuggestionBlock",
