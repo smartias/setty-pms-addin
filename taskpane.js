@@ -660,6 +660,35 @@ function getEffectiveInternetMessageId() {
   if (cachedInternetMessageIdGen === itemContextGeneration) return cachedInternetMessageId;
   return "";
 }
+// Awaitable form: resolves the STABLE internetMessageId, fetching it from raw
+// headers if Outlook didn't expose it synchronously (new Outlook for Windows
+// returns "" for internetMessageId). Callers MUST await this before keying a
+// record on getCurrentMessageRecordId(), so auto-log/save never fall back to the
+// volatile REST/item id — that fallback was drifting across re-opens, producing
+// duplicate rows and a disconnected Save-to-SharePoint patch. Resolves "" only if
+// headers are unavailable (Mailbox < 1.8) or the fetch times out, in which case
+// callers keep the legacy fallback — never worse than before.
+function ensureInternetMessageId() {
+  const sync = getEffectiveInternetMessageId();
+  if (sync) return Promise.resolve(sync);
+  const myGen = itemContextGeneration;
+  if (!emailItem?.getAllInternetHeadersAsync) return Promise.resolve("");
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => { if (!done) { done = true; resolve(v); } };
+    setTimeout(() => finish(""), 2500); // never hang a save on a stuck header fetch
+    try {
+      emailItem.getAllInternetHeadersAsync(result => {
+        if (myGen !== itemContextGeneration) return finish(""); // user moved on
+        if (result.status !== Office.AsyncResultStatus.Succeeded) return finish("");
+        const m = String(result.value || "").match(/^Message-ID:\s*(.+)$/im);
+        const id = m ? m[1].trim() : "";
+        if (id) { cachedInternetMessageId = id; cachedInternetMessageIdGen = myGen; }
+        finish(id);
+      });
+    } catch { finish(""); }
+  });
+}
 function getCurrentMessageRecordId() {
   // Prefer internetMessageId (shared across recipients) for cross-mailbox matching.
   // Keep REST/item IDs as fallbacks so existing records created before this change still resolve.
@@ -2593,6 +2622,7 @@ async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
     if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
+    await ensureInternetMessageId(); // resolve the STABLE id before keying the record (prevents re-log drift)
     const msgId = getCurrentMessageRecordId();
     if (!msgId) return;
     if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
@@ -5644,12 +5674,29 @@ async function patchEmailSpFields(recordId, fields) {
   }, { label: "sb project_emails sp-update" });
   if (!res.ok) throw new Error("pms_project_emails PATCH HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
 }
+// Patch by (project_id, msg_id) instead of the surrogate record_id. msg_id is the
+// stable business key, so the SharePoint link lands on the correct row even if the
+// inline record's id ever drifted — this is the direct cure for "saved to
+// SharePoint but the link didn't stick."
+async function patchEmailSpFieldsByMsg(projectId, msgId, fields) {
+  if (!projectId || !msgId) return;
+  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE +
+    "?project_id=eq." + encodeURIComponent(projectId) +
+    "&msg_id=eq." + encodeURIComponent(msgId);
+  const res = await fetchWithRetry(url, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(fields),
+  }, { label: "sb project_emails sp-update-by-msg" });
+  if (!res.ok) throw new Error("pms_project_emails PATCH(by msg) HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+}
 async function doSaveToSharePoint() {
   return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
 }
 async function _doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
+await ensureInternetMessageId(); // STABLE id so existingRecord + the SP patch resolve to the right row
 const currentMsgId = getCurrentMessageRecordId();
 const existingRecord = findSavedEmailRecord(selectedProject, currentMsgId);
 // Read the Link To target up front so we can branch on it BEFORE the
@@ -5801,7 +5848,10 @@ if (existingRecord) {
         // Auto-save already inserted the search-index row; just patch in the
         // SharePoint URL + attachment names (and refresh the body if we got one)
         // so we update that one row instead of inserting a duplicate.
-        await patchEmailSpFields(existingRecord.id, {
+        // Patch by the record's STORED msg_id (not its surrogate id), so the link
+        // lands on the right row whether it was keyed by internetMessageId or a
+        // legacy REST id.
+        await patchEmailSpFieldsByMsg(selectedProject.id, existingRecord.msgId || currentMsgId, {
           sp_folder_url: spFolderUrl || "",
           saved_to_sharepoint: true,
           attachment_names: attachmentNames || [],
@@ -5902,6 +5952,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // + caption) is the soft nudge toward SharePoint when attachments exist.
   // No confirm dialog: trust the user's intent, surface the consequence in the
   // post-save card ("3 attachments not filed").
+  await ensureInternetMessageId(); // STABLE id before we key/look-up the record
   const msgId = getCurrentMessageRecordId();
   if (findSavedEmailRecord(selectedProject, msgId)) {
     refreshEmailSavedIndicator();
