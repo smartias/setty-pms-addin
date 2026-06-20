@@ -2602,8 +2602,26 @@ function renderJobcard(project) {
     rows.push(row("Technical", esc(parts.join(" · "))));
   }
 
+  // Ask Claude about this job — opens the user's OWN Claude (their existing seat
+  // + the Setty PMS connector) with a prefilled, project-specific prompt. $0: no
+  // API key, no metering, no new service. Requires the connector to be enabled
+  // in that user's Claude for the answer to be grounded in real PMS data.
+  const askPrompt =
+    "Brief me on " + (project.projectNumber ? project.projectNumber + " " : "") +
+    (project.name || "this project") + " using the Setty PMS connector — current status, " +
+    "upcoming deadlines, open action items and RFIs, and which client emails I still owe a " +
+    "reply on. Cite the source email or document for each point.";
+  const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
+  rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
+
   el.innerHTML = rows.join("");
-  el.style.display = rows.length ? "block" : "none";
+  el.style.display = "block"; // the Ask-Claude link always renders, so the body always shows
+
+  const askEl = document.getElementById("jcAskClaude");
+  if (askEl) askEl.onclick = (e) => {
+    e.preventDefault();
+    try { openExternalUrl(askUrl); } catch (err) { console.warn("[jobcard] open Claude failed:", err); }
+  };
 }
 
 function setSelectedProject(project, persistForEmail = false) {
