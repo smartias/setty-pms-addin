@@ -3158,6 +3158,30 @@ async function sweepLoadFiledIds() {
   } catch { return new Set(); }
 }
 
+// conversation_id -> projectId for threads that already have a filed email, so a
+// thread tied to a job auto-files the rest instead of re-surfacing each message.
+// Only UNAMBIGUOUS threads (filed to exactly one project) auto-file; a thread
+// split across projects is left for normal per-message classification.
+async function sweepLoadConvoProjectMap() {
+  try {
+    const res = await fetchWithRetry(
+      SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null",
+      { headers: SB_HEADERS }, { label: "sb sweep convo map" });
+    if (!res.ok) return new Map();
+    const rows = await res.json();
+    const byConv = new Map();
+    for (const r of (rows || [])) {
+      const c = r.conversation_id;
+      if (!c || !r.project_id) continue;
+      if (!byConv.has(c)) byConv.set(c, new Set());
+      byConv.get(c).add(r.project_id);
+    }
+    const map = new Map();
+    for (const [c, set] of byConv) if (set.size === 1) map.set(c, [...set][0]);
+    return map;
+  } catch { return new Map(); }
+}
+
 // Learned sender→project signal from the filed log (RPC sender_project_signals).
 // Self-improving: as more emails get filed, more senders become project-specific.
 // Fetched once per sweep. Returns Map(lower-address -> [{projectId, n, projects}]).
@@ -3335,6 +3359,11 @@ function sweepResolveMailbox() {
 let _sweepSource = { base: "/me", token: null, label: "your mailbox", shared: false };
 let _sweepCursor = null;
 let _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+// Conversation-level dedup for the current run: convId -> projectId (the thread is
+// tied to a job) or "review" (already queued once this run). Reset each fresh run
+// so a thread is surfaced/auto-filed ONCE, not per-message. Persists across
+// Load-more batches so a long thread doesn't re-appear page after page.
+let _sweepConvoSeen = new Map();
 
 // Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
 // run from the chosen mailbox; reset=false continues the saved cursor (Load more).
@@ -3344,6 +3373,7 @@ async function sweepResolveScan(reset) {
     _sweepSource = { base: mb.base, label: mb.label, shared: mb.shared, token: null };
     _sweepCursor = null;
     _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+    _sweepConvoSeen = new Map();
   }
   // Refresh the token at the start of EVERY batch (incl. Load more) so a long
   // backfill never carries a stale token into graphFetch's 401 path — which would
@@ -3365,6 +3395,7 @@ async function sweepResolveScan(reset) {
 async function sweepScanBatch({ base, token, cursor }) {
   const filed = await sweepLoadFiledIds();
   const senderMap = await sweepLoadSenderMap();
+  const convoMap = await sweepLoadConvoProjectMap();
   const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
   // First page builds the query; later pages follow the (base-stripped) nextLink.
   let path = cursor || (base + "/messages?$top=" + SWEEP_PAGE_SIZE +
@@ -3378,8 +3409,6 @@ async function sweepScanBatch({ base, token, cursor }) {
       if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
       const mid = m.internetMessageId || "";
       if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
-      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
-      if (verdict.action === "skip") { out.skip++; continue; }
       const item = {
         gid: m.id, convId: m.conversationId || "", msgId: mid,
         subject: m.subject || "(no subject)",
@@ -3388,8 +3417,33 @@ async function sweepScanBatch({ base, token, cursor }) {
         cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
         date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
       };
-      if (verdict.action === "file") out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
-      else out.review.push({ ...item, candidates: verdict.candidates });
+      // Conversation-level dedup — one decision per thread, not per message. If the
+      // thread is already tied to a job (filed in a past run, or auto-filed earlier
+      // this run), file the rest of it there instead of surfacing each message. If
+      // it's already queued for review this run, skip the extras so it doesn't pop
+      // up over and over.
+      if (item.convId) {
+        const seen = _sweepConvoSeen.get(item.convId);
+        const tiedProj = convoMap.get(item.convId) || (seen && seen !== "review" ? seen : null);
+        if (tiedProj) {
+          const proj = (allProjects || []).find((p) => p && p.id === tiedProj);
+          if (proj) {
+            _sweepConvoSeen.set(item.convId, tiedProj);
+            out.file.push({ ...item, project: proj, score: 99, reasons: ["same thread already filed to this job"] });
+            continue;
+          }
+        }
+        if (seen === "review") { out.alreadyFiled++; continue; } // thread already queued once this run
+      }
+      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
+      if (verdict.action === "skip") { out.skip++; continue; }
+      if (verdict.action === "file") {
+        if (item.convId) _sweepConvoSeen.set(item.convId, verdict.project.id);
+        out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
+      } else {
+        if (item.convId) _sweepConvoSeen.set(item.convId, "review");
+        out.review.push({ ...item, candidates: verdict.candidates });
+      }
     }
     const next = data?.["@odata.nextLink"] || null;
     out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
