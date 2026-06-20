@@ -212,6 +212,14 @@ function setupEventListeners() {
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
   const sweepFileBtn = document.getElementById("sweepFileBtn");
   if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(true); };
+  const sweepRunAllBtn = document.getElementById("sweepRunAllBtn");
+  if (sweepRunAllBtn) sweepRunAllBtn.onclick = () => { void sweepAutoRunToEnd(); };
+  const sweepStopBtn = document.getElementById("sweepStopBtn");
+  if (sweepStopBtn) sweepStopBtn.onclick = () => {
+    _sweepAutoStop = true;
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent += "  ·  ⏹ stopping after this page…";
+  };
   const sweepMoreBtn = document.getElementById("sweepMoreBtn");
   if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
@@ -3360,6 +3368,10 @@ let _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
 // so a thread is surfaced/auto-filed ONCE, not per-message. Persists across
 // Load-more batches so a long thread doesn't re-appear page after page.
 let _sweepConvoSeen = new Map();
+// Auto-run ("Run to end") state: _sweepAutoRunning guards against a double start;
+// _sweepAutoStop is set by the Stop button and checked between pages and batches.
+let _sweepAutoRunning = false;
+let _sweepAutoStop = false;
 
 // Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
 // run from the chosen mailbox; reset=false continues the saved cursor (Load more).
@@ -3448,6 +3460,7 @@ async function sweepScanBatch({ base, token, cursor }) {
     const next = data?.["@odata.nextLink"] || null;
     out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
     if (!out.nextLink) break;                                                  // mailbox fully walked
+    if (_sweepAutoStop) break;                                                 // user hit Stop — cursor preserved so they can resume
     if (out.file.length + out.review.length >= SWEEP_TARGET_ACTIONABLE) break; // enough to act on this batch
     path = out.nextLink;
   }
@@ -3566,6 +3579,45 @@ function updateSweepMoreBtn() {
   if (!moreBtn) return;
   moreBtn.style.display = _sweepCursor ? "" : "none";
   moreBtn.disabled = false;
+}
+
+// Swap the run/more buttons for a Stop button while an auto-run is going.
+function _setSweepAutoUI(running) {
+  for (const id of ["sweepFileBtn", "sweepRunAllBtn", "sweepMoreBtn"]) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = running ? "none" : "";
+  }
+  const stop = document.getElementById("sweepStopBtn");
+  if (stop) stop.style.display = running ? "" : "none";
+}
+
+// "Run to end" — keep filing batches until the mailbox is exhausted or the user
+// hits Stop. sweepRunAndFile already shows per-page/per-email progress and the
+// cumulative totals after each batch, so the numbers climb as it goes. We reassert
+// the auto UI after each batch because sweepRunAndFile re-enables the normal
+// buttons in its own finally block.
+async function sweepAutoRunToEnd() {
+  if (_sweepAutoRunning) return;
+  _sweepAutoRunning = true;
+  _sweepAutoStop = false;
+  _setSweepAutoUI(true);
+  try {
+    await sweepRunAndFile(true);          // first batch — fresh scan from the top
+    _setSweepAutoUI(true);
+    while (_sweepCursor && !_sweepAutoStop) {
+      await sweepRunAndFile(false);       // next batch, continuing the cursor
+      _setSweepAutoUI(true);
+    }
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent += _sweepAutoStop ? "  ·  ⏹ stopped" : "  ·  ✅ reached the end of the mailbox";
+  } catch (e) {
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent = "✗ " + humanizeError(e);
+  } finally {
+    _sweepAutoRunning = false;
+    _setSweepAutoUI(false);
+    updateSweepMoreBtn();
+  }
 }
 
 // Review queue — each ambiguous email gets a button per candidate project. Filing
