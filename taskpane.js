@@ -4228,6 +4228,30 @@ function isInProjectDirectory(email) {
   if ((selectedProject.directory || []).some(d => (d.email || "").trim().toLowerCase() === emailLc)) return true;
   return ((selectedProject.projectContacts?.pm) || []).some(c => (c.email || "").trim().toLowerCase() === emailLc);
 }
+// "Already on SOME job" — is this email in ANY project's directory or PM list,
+// not just the selected one. Memoized against the allProjects reference
+// (loadProjects reassigns the array on refresh), so the set rebuilds only when
+// the project data changes.
+let _allDirEmailsCache = { ref: null, set: new Set() };
+function isInAnyProjectDirectory(email) {
+  const emailLc = (email || "").trim().toLowerCase();
+  if (!emailLc) return false;
+  if (_allDirEmailsCache.ref !== allProjects) {
+    const set = new Set();
+    for (const p of (allProjects || [])) {
+      for (const d of (p.directory || [])) {
+        const e = (d.email || "").trim().toLowerCase();
+        if (e) set.add(e);
+      }
+      for (const c of ((p.projectContacts?.pm) || [])) {
+        const e = (c.email || "").trim().toLowerCase();
+        if (e) set.add(e);
+      }
+    }
+    _allDirEmailsCache = { ref: allProjects, set };
+  }
+  return _allDirEmailsCache.set.has(emailLc);
+}
 // Setty staff are managed via the project's Teams tab in PMS, not the
 // contact directories — so they're excluded from the "new" nudge entirely.
 function isSettyInternalEmail(email) {
@@ -4264,9 +4288,15 @@ function getParticipantDirectoryStatus(p) {
   const sessionSaved = !!emailLc && _sessionSavedContactEmails.has(emailLc);
   const globalHit = internal ? null : findGlobalContact(emailLc);
   const inProject = internal ? false : isInProjectDirectory(emailLc);
+  // Filed on SOME job's directory even if not in the global directory or this
+  // project — still "known", so it must not read as a brand-new contact. Stops
+  // the nudge firing for people you've already got on another project. (inProject
+  // ⊂ inAnyProject, but the selected project may be a fresher object than the
+  // cached allProjects copy, so check both.)
+  const inAnyProject = internal ? false : (inProject || isInAnyProjectDirectory(emailLc));
   // "New" = external, nowhere in the firm's directories, and not just saved
   // this session.
-  return { internal, globalHit, inProject, sessionSaved, isNew: !internal && !globalHit && !inProject && !sessionSaved };
+  return { internal, globalHit, inProject, inAnyProject, sessionSaved, isNew: !internal && !globalHit && !inProject && !inAnyProject && !sessionSaved };
 }
 // Nudge on the main-view button: surface how many of this email's
 // participants aren't in any directory yet, BEFORE the user opens the list.
