@@ -3039,7 +3039,7 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 // before auto-filing is enabled. Filing + the review queue come next once the
 // numbers look right.
 const SWEEP_PAGE_SIZE = 250;          // messages per Graph page — a lean $select keeps this well under the 504 ceiling
-const SWEEP_TARGET_ACTIONABLE = 50;   // keep paging within one batch until this many file+review surface — skips/already-filed no longer cap the run
+const SWEEP_TARGET_ACTIONABLE = 300;  // keep paging within one batch until this many file+review surface. Raised from 50 for backfill: each Run & file / Load more now walks far deeper before pausing (older/sparser mail hits the SWEEP_MAX_PAGES_PER_BATCH ceiling instead) — fewer clicks to get through a mailbox
 const SWEEP_MAX_PAGES_PER_BATCH = 30; // safety cap: at most 30×250 = 7,500 messages scanned per Preview / Load-more press
 const SWEEP_REVIEW_MIN  = 4;   // min name/acronym score to ENTER review (≥2 distinctive signals)
 
