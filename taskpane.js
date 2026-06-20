@@ -210,8 +210,6 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   const wlRefresh = document.getElementById("responseWatchlistRefresh");
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
-  const sweepBtn = document.getElementById("sweepRunBtn");
-  if (sweepBtn) sweepBtn.onclick = () => { void sweepRecentMail(); };
   const sweepFileBtn = document.getElementById("sweepFileBtn");
   if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(true); };
   const sweepMoreBtn = document.getElementById("sweepMoreBtn");
@@ -3345,12 +3343,10 @@ const sweepEsc = (s) => String(s == null ? "" : s)
 // Empty field (or your own address) → "/me"; a colleague's address → "/users/{addr}"
 // so the same scan code can target a departed PM's shared mailbox.
 function sweepResolveMailbox() {
-  const raw = (document.getElementById("sweepMailbox")?.value || "").trim();
-  const me = (_getCurrentUserEmail() || "").trim().toLowerCase();
-  if (!raw || raw.toLowerCase() === me || raw.toLowerCase() === "me") {
-    return { base: "/me", shared: false, label: "your mailbox" };
-  }
-  return { base: "/users/" + encodeURIComponent(raw), shared: true, label: raw };
+  // Shared-mailbox entry retired (the box was removed) — the sweep always scans
+  // your own mailbox. To bulk-file a colleague's mail, open their mailbox in
+  // Outlook and file those emails directly.
+  return { base: "/me", shared: false, label: "your mailbox" };
 }
 // Module-level scan source + cursor, shared across Preview / Run & file / Load more.
 // _sweepSource carries the messages-collection base ("/me" or "/users/{addr}") and
