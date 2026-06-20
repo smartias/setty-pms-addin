@@ -3441,6 +3441,10 @@ async function sweepScanBatch({ base, token, cursor }) {
         out.review.push({ ...item, candidates: verdict.candidates });
       }
     }
+    // Live progress so a deep scan doesn't look frozen — refreshes once per page (~250 msgs).
+    const _se = document.getElementById("sweepStatus");
+    if (_se) _se.textContent = "⏳ Reading mailbox… " + out.scanned + " scanned · " +
+      out.file.length + " to file · " + out.review.length + " to review…";
     const next = data?.["@odata.nextLink"] || null;
     out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
     if (!out.nextLink) break;                                                  // mailbox fully walked
@@ -3476,7 +3480,11 @@ async function sweepFileItems(items) {
   const base = _sweepSource?.base || "/me";
   const byProject = new Map();
   let filed = 0, failed = 0;
+  let done = 0;
   for (const it of items) {
+    done++;
+    const _fe = document.getElementById("sweepStatus");
+    if (_fe) _fe.textContent = "⏳ Filing email " + done + " of " + items.length + "… (" + filed + " saved)";
     try {
       let bodyHtml = "";
       try {
