@@ -2543,6 +2543,69 @@ async function clearProjectTagForCurrentEmail() {
   setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project.");
 }
 
+// ── JOBCARD ──────────────────────────────────────────────────────────────────
+// At-a-glance "what we know about this job" lines, shown inside the green project
+// badge. Pure client-side render from the already-loaded project object (status,
+// milestones, RFIs, submittals, action-item notes) — no AI, no network call, $0.
+function renderJobcard(project) {
+  const el = document.getElementById("jobcardBody");
+  if (!el) return;
+  if (!project) { el.style.display = "none"; el.innerHTML = ""; return; }
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const today = new Date().toISOString().slice(0, 10);
+  const ok = (d) => typeof d === "string" && d >= "2015-01-01" && d <= "2100-12-31";
+  const fmt = (d) => { try { return new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return esc(d); } };
+
+  const liveMs = (project.milestones || []).filter(m =>
+    m && ok(m.dueDate) && !m.cancelled && (m.status || "") !== "Completed");
+  const overdue = liveMs.filter(m => m.dueDate < today).length;
+  const nextM = liveMs.filter(m => m.dueDate >= today)
+    .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))[0] || null;
+
+  const actions = (project.notes || []).filter(n =>
+    n && (n.actionItem || n.category === "Action Item") && (n.actionStatus || "open") !== "done");
+  const nextAction = actions.filter(a => ok(a.actionDueDate))
+    .sort((a, b) => String(a.actionDueDate).localeCompare(String(b.actionDueDate)))[0] || null;
+
+  const openRfis = (project.rfis || []).filter(r => RFI_OPEN_STATUSES.has(r?.status || "Open")).length;
+  const openSubs = (project.submittals || []).filter(s => SUB_OPEN_STATUSES.has(s?.status || "Received")).length;
+
+  const rows = [];
+  if (project.status) {
+    rows.push('<div style="margin-bottom:4px;"><span style="display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:var(--bg);border:1px solid #b6e3b6;color:var(--success);">' + esc(project.status) + '</span></div>');
+  }
+  const row = (label, valueHtml) =>
+    '<div style="display:flex;gap:8px;font-size:12px;line-height:1.45;color:var(--text);margin-top:4px;">' +
+    '<span style="color:var(--text-soft);min-width:64px;flex:none;font-weight:600;">' + label + '</span>' +
+    '<span style="min-width:0;">' + valueHtml + '</span></div>';
+
+  if (nextM) {
+    let v = esc(nextM.name || "Milestone") + " · due " + fmt(nextM.dueDate);
+    if (overdue > 0) v += ' <span style="color:var(--error);font-weight:600;white-space:nowrap;">· ' + overdue + ' overdue</span>';
+    rows.push(row("Next", v));
+  } else if (overdue > 0) {
+    rows.push(row("Next", '<span style="color:var(--error);font-weight:600;">' + overdue + ' milestone' + (overdue > 1 ? "s" : "") + ' overdue</span>'));
+  }
+
+  if (actions.length > 0) {
+    let v = actions.length + " action item" + (actions.length > 1 ? "s" : "");
+    if (nextAction) v += " · 1 due " + fmt(nextAction.actionDueDate);
+    rows.push(row("Actions", esc(v)));
+  }
+
+  if (openRfis > 0 || openSubs > 0) {
+    const parts = [];
+    if (openRfis > 0) parts.push(openRfis + " RFI" + (openRfis > 1 ? "s" : "") + " open");
+    if (openSubs > 0) parts.push(openSubs + " submittal" + (openSubs > 1 ? "s" : "") + " in review");
+    rows.push(row("Technical", esc(parts.join(" · "))));
+  }
+
+  el.innerHTML = rows.join("");
+  el.style.display = rows.length ? "block" : "none";
+}
+
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   // Hide phase-inappropriate logging buttons (Log as RFI / Submittal) when
@@ -2601,6 +2664,7 @@ function setSelectedProject(project, persistForEmail = false) {
     })();
   }
   updateProjectQuickLinks();
+  try { renderJobcard(selectedProject); } catch (e) { console.warn("[jobcard] render failed:", e.message); }
   refreshActionItemOwnerOptions();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();

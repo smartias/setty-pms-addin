@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-19-imid-stable-autolog";</script>
+  <script>window.__appVersion = "2026-06-19-jobcard";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -892,9 +892,13 @@
     <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
     <div id="projectDropdown"></div>
   </div>
-  <div id="selectedProjectBadge" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;font-size:13px;color:var(--success);font-weight:600;align-items:center;justify-content:space-between;gap:6px;">
-    <span id="selectedProjectBadgeText"></span>
-    <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:var(--text-soft);font-size:16px;line-height:1;cursor:pointer;padding:0 2px;" title="Clear tagged project for this email">×</button>
+  <div id="selectedProjectBadge" style="display:none;margin-bottom:8px;padding:8px 10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:4px;flex-direction:column;gap:6px;">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px;">
+      <span id="selectedProjectBadgeText" style="font-size:13px;color:var(--success);font-weight:600;"></span>
+      <button id="clearProjectTagBtn" type="button" style="display:none;background:transparent;border:none;color:var(--text-soft);font-size:16px;line-height:1;cursor:pointer;padding:0 2px;flex:none;" title="Clear tagged project for this email">×</button>
+    </div>
+    <!-- Jobcard: at-a-glance project status, filled by renderJobcard() from already-loaded data. -->
+    <div id="jobcardBody" style="display:none;border-top:1px solid #b6e3b6;padding-top:6px;"></div>
   </div>
   <div id="projectPipelineHint" style="display:none;margin:-4px 0 10px;padding:6px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;"></div>
 
