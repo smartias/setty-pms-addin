@@ -4444,6 +4444,141 @@ async function getEmailBodyHtml(token) {
   return body;
 }
 
+// ── Inline image resolution (for OneNote pages + the PMS email log) ──────────
+// Email HTML references embedded images as cid: pointers; the bytes live as
+// inline file attachments. OneNote can't read cid: (it needs multipart name:
+// parts) and the PMS log needs them as data: URIs — both start from this fetch.
+// Everything here is best-effort: on any failure callers keep the original body.
+const _inlineImgCache = new Map(); // itemId -> Map<cidLower, {contentType, bytes}>
+async function getInlineImagesForEmail(token) {
+  const item = Office.context.mailbox.item;
+  const itemId = item?.itemId;
+  if (itemId && _inlineImgCache.has(itemId)) return _inlineImgCache.get(itemId);
+  const map = new Map();
+  try {
+    const restId = Office.context.mailbox.convertToRestId(itemId, Office.MailboxEnums.RestVersion.v2_0);
+    const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
+    for (const att of (attData?.value || [])) {
+      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+      if (!att.isInline || !(att.contentType || "").startsWith("image/")) continue;
+      const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
+      if (!cid) continue;
+      let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
+      if (!bytes && att.id) {
+        const r = await fetchWithRetry(
+          "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
+          { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img" });
+        if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
+      }
+      if (bytes) map.set(cid, { contentType: att.contentType, bytes });
+    }
+  } catch (e) { console.warn("[inline-img] fetch failed:", e.message); }
+  if (itemId) _inlineImgCache.set(itemId, map);
+  return map;
+}
+
+// Best-effort raster downscale to keep the email log light + fit OneNote's 4MB
+// cap. Returns the ORIGINAL bytes if the canvas path is unavailable or doesn't help.
+const INLINE_IMG_MAX_DIM = 1500;
+async function downscaleInlineImage(bytes, contentType) {
+  try {
+    if (typeof createImageBitmap !== "function") return { bytes, contentType };
+    const bmp = await createImageBitmap(new Blob([bytes], { type: contentType }));
+    const longEdge = Math.max(bmp.width, bmp.height);
+    const scale = Math.min(1, INLINE_IMG_MAX_DIM / longEdge);
+    if (scale >= 1 && bytes.length <= 300000) { if (bmp.close) bmp.close(); return { bytes, contentType }; }
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    let blob;
+    if (typeof OffscreenCanvas === "function") {
+      const cv = new OffscreenCanvas(w, h);
+      cv.getContext("2d").drawImage(bmp, 0, 0, w, h);
+      blob = await cv.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+    } else {
+      const cv = document.createElement("canvas");
+      cv.width = w; cv.height = h;
+      cv.getContext("2d").drawImage(bmp, 0, 0, w, h);
+      blob = await new Promise(res => cv.toBlob(res, "image/jpeg", 0.72));
+    }
+    if (bmp.close) bmp.close();
+    if (!blob) return { bytes, contentType };
+    const out = new Uint8Array(await blob.arrayBuffer());
+    return out.length < bytes.length ? { bytes: out, contentType: "image/jpeg" } : { bytes, contentType };
+  } catch (e) {
+    console.warn("[inline-img] downscale failed:", e.message);
+    return { bytes, contentType };
+  }
+}
+
+function _bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+// Run an async replacer over every regex match (String.replace can't await).
+async function replaceAsyncAddin(str, regex, asyncFn) {
+  const collected = [];
+  str.replace(regex, (...a) => { collected.push(a); return ""; });
+  const reps = await Promise.all(collected.map(a => asyncFn(...a)));
+  let i = 0;
+  return str.replace(regex, () => reps[i++]);
+}
+
+// Matches src="cid:..." / src='cid:...' (quote-aware via the \1 backreference).
+const cidSrcRe = () => /src\s*=\s*(["'])cid:([^"']+)\1/gi;
+
+// Email log: replace cid: refs with downscaled data: URIs so images render in the
+// PMS email viewer. Caps total embedded size; anything over stays a cid (the
+// full-res original is in SharePoint).
+const INLINE_LOG_TOTAL_CAP = 6 * 1024 * 1024;
+async function embedInlineImagesAsDataUris(html, token) {
+  if (!html || !/src\s*=\s*["']cid:/i.test(html)) return html;
+  const imgs = await getInlineImagesForEmail(token);
+  if (!imgs || imgs.size === 0) return html;
+  let total = 0;
+  const done = new Map();
+  return await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (done.has(cid)) return done.get(cid);
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > INLINE_LOG_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const rep = `src=${q}data:${ds.contentType};base64,${_bytesToBase64(ds.bytes)}${q}`;
+    done.set(cid, rep);
+    return rep;
+  });
+}
+
+// OneNote: rewrite cid: -> name:imgN and return the binary parts for a multipart
+// create-page POST. Honors OneNote's ~4MB request / 30-image limits.
+const ONENOTE_TOTAL_CAP = 3.5 * 1024 * 1024;
+async function rewriteCidToOneNoteParts(html, imgs) {
+  const parts = [];
+  if (!html || !imgs || imgs.size === 0) return { html, parts };
+  let total = 0, idx = 0;
+  const named = new Map();
+  const out = await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (named.has(cid)) return `src=${q}name:${named.get(cid)}${q}`;
+    if (parts.length >= 28) return m;
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > ONENOTE_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const name = "img" + (idx++);
+    named.set(cid, name);
+    parts.push({ name, bytes: ds.bytes, contentType: ds.contentType });
+    return `src=${q}name:${name}${q}`;
+  });
+  return { html: out, parts };
+}
+
 // ── RELIABLE PLAIN-TEXT BODY ─────────────────────────────────────────────────
 // Office's item.body.getAsync fails transiently right after an item opens
 // (status Failed, especially in new Outlook / OWA) — the cause of "signature
@@ -5860,8 +5995,16 @@ if (existingRecord) {
     // Track body-fetch failure separately so we can surface it in the success
     // message — previously a silent "" fallback meant the user thought everything
     // worked but the email record had no readable body.
-    const bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
+    // Inline images arrive as cid: refs (bytes live as inline attachments) and
+    // don't render in the PMS log — re-embed them as downscaled data: URIs so they
+    // show. Best-effort; on failure the original body is kept (SharePoint has the
+    // full-res originals regardless).
+    if (bodyHtml) {
+      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
+    }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(snapDate);
@@ -6047,8 +6190,16 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
-    const bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
+    // Inline images arrive as cid: refs (bytes live as inline attachments) and
+    // don't render in the PMS log — re-embed them as downscaled data: URIs so they
+    // show. Best-effort; on failure the original body is kept (SharePoint has the
+    // full-res originals regardless).
+    if (bodyHtml) {
+      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
+    }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
     const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
@@ -6444,9 +6595,23 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   // the email-body page where the email IS the content.
   const fromName  = emailItem?.from?.displayName  || "";
   const fromEmail = emailItem?.from?.emailAddress || "";
+  // Resolve inline (cid:) images so they render on the OneNote page. OneNote can't
+  // read cid: or data: URIs — only public URLs or name: parts backed by binary
+  // parts in a multipart POST. Best-effort: on failure we fall back to the plain
+  // HTML page (images just won't show, exactly like before this change).
+  let oneNoteImgParts = [];
+  let emailBodyForNote = emailBodyHtml;
+  if (!isMeetingNoteCategory(category) && emailBodyHtml && /src\s*=\s*["']cid:/i.test(emailBodyHtml)) {
+    try {
+      const imgs = await getInlineImagesForEmail(await getToken());
+      const r = await rewriteCidToOneNoteParts(emailBodyHtml, imgs);
+      emailBodyForNote = r.html;
+      oneNoteImgParts = r.parts;
+    } catch (e) { console.warn("[OneNote inline-img] resolve failed:", e.message); }
+  }
   const bodyHtml = isMeetingNoteCategory(category)
     ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body, project)
-    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body, project);
+    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyForNote, body, project);
   // toAddinOneNoteCreatedLocal fixes the UTC-as-local rendering bug; fall
   // back to a fresh local timestamp if dateStr is missing or unparseable.
   const createdMeta = toAddinOneNoteCreatedLocal(dateStr) || toAddinOneNoteCreatedLocal(new Date().toISOString()) || new Date().toISOString();
@@ -6466,11 +6631,25 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   const maxAttempts = 3;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
-      body: pageHtml,
-    });
+    // With inline images, send a multipart create-page (HTML "Presentation" part +
+    // one binary part per image, referenced as name:imgN). Otherwise plain text/html
+    // exactly as before. (Don't set Content-Type for FormData — the browser adds the
+    // multipart boundary.)
+    let res;
+    if (oneNoteImgParts.length) {
+      const form = new FormData();
+      form.append("Presentation", new Blob([pageHtml], { type: "text/html" }));
+      for (const part of oneNoteImgParts) {
+        form.append(part.name, new Blob([part.bytes], { type: part.contentType }), part.name);
+      }
+      res = await fetch(url, { method: "POST", headers: { "Authorization": "Bearer " + token }, body: form });
+    } else {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+        body: pageHtml,
+      });
+    }
     if (res.ok) {
       const page = await res.json();
       const result = { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
