@@ -3154,14 +3154,24 @@ function classifySweep(candidates) {
 
 // msg_ids already in the email log, so the preview ignores already-filed mail.
 async function sweepLoadFiledIds() {
+  // PostgREST caps every response at 1000 rows, so a plain ?select=msg_id only ever
+  // returned the first 1000 of however many are filed — the rest looked "never filed"
+  // and got re-processed (and re-saved, only to be rejected by the unique index) on
+  // every run. Page through ALL rows so the dedup set is complete.
+  const ids = new Set();
   try {
-    const res = await fetchWithRetry(
-      SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id",
-      { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
-    if (!res.ok) return new Set();
-    const rows = await res.json();
-    return new Set((rows || []).map(r => r.msg_id).filter(Boolean));
-  } catch { return new Set(); }
+    const PAGE = 1000;
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&limit=" + PAGE + "&offset=" + offset,
+        { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) if (r.msg_id) ids.add(r.msg_id);
+      if (!rows || rows.length < PAGE) break;   // last page reached
+    }
+  } catch { /* return whatever we gathered */ }
+  return ids;
 }
 
 // conversation_id -> projectId for threads that already have a filed email, so a
@@ -3170,17 +3180,21 @@ async function sweepLoadFiledIds() {
 // split across projects is left for normal per-message classification.
 async function sweepLoadConvoProjectMap() {
   try {
-    const res = await fetchWithRetry(
-      SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null",
-      { headers: SB_HEADERS }, { label: "sb sweep convo map" });
-    if (!res.ok) return new Map();
-    const rows = await res.json();
     const byConv = new Map();
-    for (const r of (rows || [])) {
-      const c = r.conversation_id;
-      if (!c || !r.project_id) continue;
-      if (!byConv.has(c)) byConv.set(c, new Set());
-      byConv.get(c).add(r.project_id);
+    const PAGE = 1000;                          // page past the 1000-row PostgREST cap
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&limit=" + PAGE + "&offset=" + offset,
+        { headers: SB_HEADERS }, { label: "sb sweep convo map" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) {
+        const c = r.conversation_id;
+        if (!c || !r.project_id) continue;
+        if (!byConv.has(c)) byConv.set(c, new Set());
+        byConv.get(c).add(r.project_id);
+      }
+      if (!rows || rows.length < PAGE) break;    // last page reached
     }
     const map = new Map();
     for (const [c, set] of byConv) if (set.size === 1) map.set(c, [...set][0]);
