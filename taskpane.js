@@ -2066,6 +2066,9 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     from_address: emailRecord.fromAddress || "",
     to_addresses: emailRecord.to || "",
     cc_addresses: emailRecord.cc || "",
+    // Explicit direction so Claude can reason about "what we sent" vs "what we received"
+    // without inferring from the address. Firm domain (setty.com) sender => outgoing.
+    direction: String(emailRecord.fromAddress || "").toLowerCase().endsWith("@setty.com") ? "outgoing" : "incoming",
     email_date: emailRecord.date || null,
     saved_at: emailRecord.savedAt || new Date().toISOString(),
     saved_by: emailRecord.savedBy || null,
