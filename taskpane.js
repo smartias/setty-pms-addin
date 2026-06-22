@@ -1769,6 +1769,25 @@ function saveProjectsCache(projects, clients, versionMap) {
   }
 }
 
+// Page past PostgREST's 1000-row response cap for an arbitrary select, returning
+// ALL rows. `pathQuery` must already include its query string AND a stable
+// &order=<unique-ish key> so offset paging stays disjoint across pages. Throws on
+// the first non-ok page so callers can fall back (e.g. to the legacy pms_data row).
+async function sbFetchAllRows(pathQuery, label) {
+  const out = [];
+  const PAGE = 1000;
+  for (let offset = 0; offset < 500000; offset += PAGE) {
+    const res = await fetchWithRetry(
+      SUPABASE_URL + "/rest/v1/" + pathQuery + "&limit=" + PAGE + "&offset=" + offset,
+      { headers: SB_HEADERS }, { label });
+    if (!res.ok) throw new Error((label || "sbFetchAllRows") + " HTTP " + res.status);
+    const rows = await res.json();
+    if (rows && rows.length) out.push(...rows);
+    if (!rows || rows.length < PAGE) break;   // last page reached
+  }
+  return out;
+}
+
 async function loadProjects() {
   // Hydrate from cache instantly (if available) so the pane is responsive
   // even before the fresh fetch returns. The cache holds the *projects array*
@@ -1790,13 +1809,15 @@ async function loadProjects() {
   // don't exist yet or are empty (pre-migration). Once PMS migrates, V2 is
   // authoritative and the legacy row becomes a static safety net.
   try {
-    const [pRes, cRes] = await Promise.all([
-      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }, { label: "sb loadProjects v2 projects" }),
-      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }, { label: "sb loadProjects v2 clients" }),
+    // Page both reads past the 1000-row cap. pms_projects (≈130) and pms_clients
+    // (≈291) are under it today but both grow; an unpaged read would silently drop
+    // everything past row 1000 once they cross it. sbFetchAllRows throws on a failed
+    // page, so a transient error still lands in the catch below and falls back.
+    const [pRows, cRows] = await Promise.all([
+      sbFetchAllRows("pms_projects?select=id,project,version&order=id.asc", "sb loadProjects v2 projects"),
+      sbFetchAllRows("pms_clients?select=client&order=id.asc", "sb loadProjects v2 clients"),
     ]);
-    if (pRes.ok && cRes.ok) {
-      const pRows = await pRes.json();
-      const cRows = await cRes.json();
+    if (pRows && cRows) {
       if (pRows && pRows.length > 0) {
         // V2 path
         allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
@@ -3206,22 +3227,33 @@ async function sweepLoadConvoProjectMap() {
 // Self-improving: as more emails get filed, more senders become project-specific.
 // Fetched once per sweep. Returns Map(lower-address -> [{projectId, n, projects}]).
 async function sweepLoadSenderMap() {
+  // sender_project_signals RETURNS TABLE, so its RPC response is capped at 1000
+  // rows just like a plain table read. The result is one row per sender→project
+  // signal; that count climbs as the email backfill adds external senders (ceiling
+  // ≈ 2× distinct external senders), so page past the cap instead of trusting one
+  // call. PostgREST applies limit/offset/order to a table-valued function's result;
+  // the explicit order on a stable key keeps successive pages disjoint.
+  const map = new Map();
   try {
-    const res = await fetchWithRetry(
-      SUPABASE_URL + "/rest/v1/rpc/sender_project_signals",
-      { method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json" }, body: "{}" },
-      { label: "sb sender signals" });
-    if (!res.ok) return new Map();
-    const rows = await res.json();
-    const map = new Map();
-    for (const r of (rows || [])) {
-      const addr = (r.from_address || "").toLowerCase();
-      if (!addr) continue;
-      if (!map.has(addr)) map.set(addr, []);
-      map.get(addr).push({ projectId: r.project_id, n: r.n, projects: r.projects });
+    const PAGE = 1000;
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/rpc/sender_project_signals?limit=" + PAGE + "&offset=" + offset +
+          "&order=from_address.asc,project_id.asc",
+        { method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json" }, body: "{}" },
+        { label: "sb sender signals" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) {
+        const addr = (r.from_address || "").toLowerCase();
+        if (!addr) continue;
+        if (!map.has(addr)) map.set(addr, []);
+        map.get(addr).push({ projectId: r.project_id, n: r.n, projects: r.projects });
+      }
+      if (!rows || rows.length < PAGE) break;   // last page reached
     }
-    return map;
-  } catch { return new Map(); }
+  } catch { /* return whatever we gathered */ }
+  return map;
 }
 
 // Merge the learned sender signal into a message's subject candidates. A sender
