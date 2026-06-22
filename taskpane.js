@@ -2629,15 +2629,29 @@ function renderJobcard(project) {
     rows.push(row("Technical", esc(parts.join(" · "))));
   }
 
-  // Ask Claude about this job — opens the user's OWN Claude (their existing seat
-  // + the Setty PMS connector) with a prefilled, project-specific prompt. $0: no
-  // API key, no metering, no new service. Requires the connector to be enabled
-  // in that user's Claude for the answer to be grounded in real PMS data.
-  const askPrompt =
+  // Ask Claude about this job — opens the user's OWN Claude (their existing seat) with a
+  // prefilled prompt. The job snapshot is embedded INLINE so the answer works EVERYWHERE
+  // (web, desktop, mobile, even a free account) with no connector dependency — the connector
+  // is desktop-only and not yet approved org-wide, so a connector-only prompt would come back
+  // empty on web. A soft connector line lets desktop users who do have it pull live email/
+  // document detail too. $0: no API key, no metering, no new service.
+  const askLines = [
     "Brief me on " + (project.projectNumber ? project.projectNumber + " " : "") +
-    (project.name || "this project") + " using the Setty PMS connector — current status, " +
-    "upcoming deadlines, open action items and RFIs, and which client emails I still owe a " +
-    "reply on. Cite the source email or document for each point.";
+    (project.name || "this project") +
+    ". Here is the current snapshot from our PMS — tell me what needs my attention, what's at risk, and what to do next:",
+  ];
+  if (project.status) askLines.push("- Status: " + project.status);
+  if (nextM) askLines.push("- Next milestone: " + (nextM.name || "Milestone") + " due " + nextM.dueDate +
+    (overdue > 0 ? " (" + overdue + " other milestone" + (overdue > 1 ? "s" : "") + " overdue)" : ""));
+  else if (overdue > 0) askLines.push("- Milestones: " + overdue + " overdue");
+  if (actions.length > 0) askLines.push("- Open action items: " + actions.length +
+    (nextAction ? " (next due " + nextAction.actionDueDate + ")" : ""));
+  if (openRfis > 0) askLines.push("- Open RFIs: " + openRfis);
+  if (openSubs > 0) askLines.push("- Submittals in review: " + openSubs);
+  askLines.push(
+    "If you have the Setty PMS connector enabled, use it to pull the latest emails and documents " +
+    "(including anything I still owe a reply on) and cite sources; otherwise brief me from the snapshot above.");
+  const askPrompt = askLines.join("\n");
   const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
   rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
 
