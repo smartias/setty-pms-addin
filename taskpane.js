@@ -2590,9 +2590,16 @@ function renderJobcard(project) {
 
   const liveMs = (project.milestones || []).filter(m =>
     m && ok(m.dueDate) && !m.cancelled && (m.status || "") !== "Completed");
-  const overdue = liveMs.filter(m => m.dueDate < today).length;
+  const allMs = (project.milestones || []).filter(m =>
+    m && ok(m.dueDate) && !m.cancelled);
+  // Next = soonest still-open milestone ahead of us. Previous = the most recent
+  // checkpoint that has passed (completed or not). We dropped the "overdue" count:
+  // past milestones rarely get marked Completed, so nearly every job looked
+  // perpetually overdue. Next/Previous reads as a clean "where we are" timeline.
   const nextM = liveMs.filter(m => m.dueDate >= today)
     .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))[0] || null;
+  const prevM = allMs.filter(m => m.dueDate < today)
+    .sort((a, b) => String(b.dueDate).localeCompare(String(a.dueDate)))[0] || null;
 
   const actions = (project.notes || []).filter(n =>
     n && (n.actionItem || n.category === "Action Item") && (n.actionStatus || "open") !== "done");
@@ -2612,11 +2619,10 @@ function renderJobcard(project) {
     '<span style="min-width:0;">' + valueHtml + '</span></div>';
 
   if (nextM) {
-    let v = esc(nextM.name || "Milestone") + " · due " + fmt(nextM.dueDate);
-    if (overdue > 0) v += ' <span style="color:var(--error);font-weight:600;white-space:nowrap;">· ' + overdue + ' overdue</span>';
-    rows.push(row("Next", v));
-  } else if (overdue > 0) {
-    rows.push(row("Next", '<span style="color:var(--error);font-weight:600;">' + overdue + ' milestone' + (overdue > 1 ? "s" : "") + ' overdue</span>'));
+    rows.push(row("Next", esc(nextM.name || "Milestone") + " · due " + fmt(nextM.dueDate)));
+  }
+  if (prevM) {
+    rows.push(row("Previous", esc(prevM.name || "Milestone") + " · " + fmt(prevM.dueDate)));
   }
 
   if (actions.length > 0) {
@@ -2644,9 +2650,8 @@ function renderJobcard(project) {
     ". Here is the current snapshot from our PMS — tell me what needs my attention, what's at risk, and what to do next:",
   ];
   if (project.status) askLines.push("- Status: " + project.status);
-  if (nextM) askLines.push("- Next milestone: " + (nextM.name || "Milestone") + " due " + nextM.dueDate +
-    (overdue > 0 ? " (" + overdue + " other milestone" + (overdue > 1 ? "s" : "") + " overdue)" : ""));
-  else if (overdue > 0) askLines.push("- Milestones: " + overdue + " overdue");
+  if (nextM) askLines.push("- Next milestone: " + (nextM.name || "Milestone") + " due " + nextM.dueDate);
+  if (prevM) askLines.push("- Previous milestone: " + (prevM.name || "Milestone") + " on " + prevM.dueDate);
   if (actions.length > 0) askLines.push("- Open action items: " + actions.length +
     (nextAction ? " (next due " + nextAction.actionDueDate + ")" : ""));
   if (openRfis > 0) askLines.push("- Open RFIs: " + openRfis);
@@ -8999,7 +9004,7 @@ async function createMilestoneCalendarEvent(milestone, project) {
   const endD = new Date(milestone.dueDate + "T12:00:00");
   endD.setDate(endD.getDate() + 1);
   const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
-  const prefix  = project.projectNumber ? "[" + project.projectNumber + "] " : "";
+  const prefix  = project.projectNumber ? project.projectNumber + " " : "";
   const subject = prefix + project.name + " — " + milestone.name;
   const pmName  = (project.settyPm || "").trim();
   const event = {
