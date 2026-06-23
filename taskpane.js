@@ -2592,13 +2592,16 @@ function renderJobcard(project) {
     m && ok(m.dueDate) && !m.cancelled && (m.status || "") !== "Completed");
   const allMs = (project.milestones || []).filter(m =>
     m && ok(m.dueDate) && !m.cancelled);
-  // Next = soonest still-open milestone ahead of us. Previous = the most recent
-  // checkpoint that has passed (completed or not). We dropped the "overdue" count:
-  // past milestones rarely get marked Completed, so nearly every job looked
-  // perpetually overdue. Next/Previous reads as a clean "where we are" timeline.
-  const nextM = liveMs.filter(m => m.dueDate >= today)
+  // Next = soonest still-open milestone strictly ahead of us. Previous = the most
+  // recent checkpoint reached, today included (completed or not). Today belongs in
+  // Previous — it's been reached — so the boundary is > today / <= today, not
+  // >= today / < today, which dropped a milestone dated today from both rows.
+  // We dropped the "overdue" count: past milestones rarely get marked Completed,
+  // so nearly every job looked perpetually overdue. Next/Previous reads as a clean
+  // "where we are" timeline.
+  const nextM = liveMs.filter(m => m.dueDate > today)
     .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))[0] || null;
-  const prevM = allMs.filter(m => m.dueDate < today)
+  const prevM = allMs.filter(m => m.dueDate <= today)
     .sort((a, b) => String(b.dueDate).localeCompare(String(a.dueDate)))[0] || null;
 
   const actions = (project.notes || []).filter(n =>
