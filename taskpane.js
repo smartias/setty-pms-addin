@@ -3527,6 +3527,12 @@ let _sweepConvoSeen = new Map();
 // _sweepAutoStop is set by the Stop button and checked between pages and batches.
 let _sweepAutoRunning = false;
 let _sweepAutoStop = false;
+// "Run to end" defers its inline project.emails[] writes into this queue (pid -> slim
+// recs) and flushes ONCE per project when the run ends/stops. A per-batch save rewrote
+// each growing project blob and re-fired the slim-email guard trigger over the whole
+// array → row-lock pile-up that wedged the DB on big backfills (2026-06-24). null =
+// sync inline immediately (single Run & file / review-confirm — one batch, no churn).
+let _sweepInlineQueue = null;
 
 // Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
 // run from the chosen mailbox; reset=false continues the saved cursor (Load more).
@@ -3677,29 +3683,57 @@ async function sweepFileItems(items) {
       };
       await saveProjectEmailRow(it.projectId, rec, false, it.convId || null);
       if (!byProject.has(it.projectId)) byProject.set(it.projectId, []);
-      byProject.get(it.projectId).push(rec);
+      // Inline copy is slim — bodies live in pms_project_emails (and the guard trigger
+      // strips them anyway), so omit them here to keep the deferred queue + each
+      // project-row write small.
+      const slim = { ...rec }; delete slim.bodyHtmlCompressed; delete slim.bodyText;
+      byProject.get(it.projectId).push(slim);
       filed++;
     } catch (e) {
       console.warn("sweep file failed:", e);
       failed++;
     }
   }
-  // Keep project.emails[] in sync — one save per project (avoids version churn).
-  for (const [pid, recs] of byProject) {
-    try {
-      await applyLocalChangeAndSave(pid, (fresh) => {
-        // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
-        // uniqueness: drop any copy already filed here since our last sync so the
-        // JSON array can't drift even though the table now can't.
-        const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
-        const add = recs.filter(r => !r.msgId || !have.has(r.msgId));
-        return add.length ? { ...fresh, emails: [...(fresh.emails || []), ...add] } : fresh;
-      });
-    } catch (e) {
-      console.warn("sweep dual-write to project.emails failed for", pid, e);
+  // Keep project.emails[] in sync. During "Run to end" these writes are DEFERRED into
+  // _sweepInlineQueue and flushed ONCE per project when the run ends (see the queue's
+  // declaration) — a per-batch save here rewrote each growing project blob and re-fired
+  // the slim-email guard trigger over the whole array, wedging the DB on big backfills.
+  // Single "Run & file" / review-confirm (queue null) still sync immediately — one batch.
+  if (_sweepInlineQueue) {
+    for (const [pid, recs] of byProject) {
+      const q = _sweepInlineQueue.get(pid) || [];
+      for (const r of recs) q.push(r);
+      _sweepInlineQueue.set(pid, q);
     }
+  } else {
+    await flushSweepInlineForProjects(byProject);
   }
   return { filed, failed };
+}
+
+// Apply the per-project inline project.emails[] sync (dedup vs FRESH, one save per
+// project). Used for both immediate saves (single batch) and the deferred end-of-run
+// flush. Retries once on a save conflict; an unrecoverable failure is logged, not
+// thrown — the email is already safe in pms_project_emails, only the slim inline
+// mirror is skipped (it self-heals on the next save to that project).
+async function flushSweepInlineForProjects(byProject) {
+  for (const [pid, recs] of byProject) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await applyLocalChangeAndSave(pid, (fresh) => {
+          // Dedup against FRESH data, mirroring the DB's (project_id, msg_id) uniqueness,
+          // so the JSON array can't drift even though the table now can't.
+          const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
+          const add = recs.filter(r => !r.msgId || !have.has(r.msgId));
+          return add.length ? { ...fresh, emails: [...(fresh.emails || []), ...add] } : fresh;
+        });
+        break;
+      } catch (e) {
+        if (attempt === 0) continue; // transient conflict — applyLocalChangeAndSave re-fetches, retry once
+        console.warn("sweep inline sync failed for", pid, e);
+      }
+    }
+  }
 }
 
 // RUN & FILE — auto-file the confident bucket, queue the ambiguous ones.
@@ -3761,6 +3795,7 @@ async function sweepAutoRunToEnd() {
   if (_sweepAutoRunning) return;
   _sweepAutoRunning = true;
   _sweepAutoStop = false;
+  _sweepInlineQueue = new Map(); // defer inline project.emails[] writes; flush once at run end
   _setSweepAutoUI(true);
   try {
     let res = await sweepRunAndFile(true);   // first batch — fresh scan from the top
@@ -3782,6 +3817,17 @@ async function sweepAutoRunToEnd() {
     const s = document.getElementById("sweepStatus");
     if (s) s.textContent = "✗ " + humanizeError(e);
   } finally {
+    // Flush the deferred inline writes BEFORE releasing the run lock — ONE save per
+    // project for the whole run instead of one per batch (the backfill-wedge fix).
+    // Runs on normal end, Stop, or error; bodies are already safe in pms_project_emails.
+    const queue = _sweepInlineQueue; _sweepInlineQueue = null;
+    if (queue && queue.size) {
+      const s = document.getElementById("sweepStatus");
+      const base = s ? s.textContent : "";
+      if (s) s.textContent = base + "  ·  💾 syncing " + queue.size + " project record(s)…";
+      try { await flushSweepInlineForProjects(queue); } catch (e) { console.warn("inline flush failed", e); }
+      if (s) s.textContent = base;
+    }
     _sweepAutoRunning = false;
     _setSweepAutoUI(false);
     updateSweepMoreBtn();
