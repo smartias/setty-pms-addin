@@ -224,6 +224,8 @@ function setupEventListeners() {
   if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
+  const linkArtifactBtn = document.getElementById("linkArtifactBtn");
+  if (linkArtifactBtn) linkArtifactBtn.onclick = () => { void linkSelectedArtifactFromMain(); };
   // Pin hint banner — show unless previously dismissed or pinning was detected.
   initPinHintBanner();
   // Version footer — took over the old main-view logo's jobs (hover tooltip +
@@ -298,8 +300,12 @@ function setupEventListeners() {
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveActionItemBtn").onclick = doSaveActionItem;
-  document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
-  document.getElementById("saveSubBtn").onclick     = doSaveSub;
+  document.getElementById("saveRfiBtn").onclick     = () => { void saveArtifactThen("rfi", false); };
+  document.getElementById("saveSubBtn").onclick     = () => { void saveArtifactThen("sub", false); };
+  const saveRfiAnotherBtn = document.getElementById("saveRfiAnotherBtn");
+  if (saveRfiAnotherBtn) saveRfiAnotherBtn.onclick = () => { void saveArtifactThen("rfi", true); };
+  const saveSubAnotherBtn = document.getElementById("saveSubAnotherBtn");
+  if (saveSubAnotherBtn) saveSubAnotherBtn.onclick = () => { void saveArtifactThen("sub", true); };
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
@@ -994,6 +1000,43 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
   } catch (e) {
     console.warn("[link-to] secondary copy failed:", e.message);
     return { ok: false, label: ` · ⚠ link to RFI/Sub failed: ${e.message.slice(0, 100)}` };
+  }
+}
+
+// Explicit "🔗 Link" action for the main-view dropdown. Auto-tagging now files the
+// email on open, so users no longer click Save SP — which is what used to trigger
+// the link as a side-effect. This decouples it: pick a target, click Link, repeat
+// (one email can relate to several open RFIs/Subs). Ensures the email record exists
+// first so there's an id to cross-link.
+async function linkSelectedArtifactFromMain() {
+  const sel = document.getElementById("linkToTarget");
+  const btn = document.getElementById("linkArtifactBtn");
+  const linkValue = sel?.value || "";
+  if (!selectedProject) { setStatus("actionStatus", "error", "Pick a project first."); return; }
+  if (!linkValue) { setStatus("actionStatus", "info", "Choose an RFI or Submittal from the dropdown first."); return; }
+  if (btn) btn.disabled = true;
+  try {
+    await ensureInternetMessageId();
+    let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+    if (!rec) {
+      await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
+      rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+    }
+    if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
+    setStatus("actionStatus", "info", "⏳ Linking…");
+    const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
+    if (result.ok) {
+      setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
+      if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
+      try { refreshLinkToTargetDropdown(); } catch {}
+      try { refreshLoggedArtifactChips(); } catch {}
+    } else {
+      setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
+    }
+  } catch (e) {
+    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -3619,7 +3662,7 @@ async function sweepRunAndFile(reset = true) {
   const btn = document.getElementById("sweepFileBtn");
   const moreBtn = document.getElementById("sweepMoreBtn");
   const statusEl = document.getElementById("sweepStatus");
-  if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return; }
+  if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return { ok: false }; }
   if (btn) btn.disabled = true;
   if (moreBtn) moreBtn.disabled = true;
   if (statusEl) statusEl.textContent = reset ? "⏳ Scanning and filing confident matches…" : "⏳ Loading the next batch…";
@@ -3637,8 +3680,10 @@ async function sweepRunAndFile(reset = true) {
       " · skipped " + _sweepTotals.skip + " · already filed " + _sweepTotals.alreadyFiled +
       " · [" + _sweepSource.label + "]" + (_sweepCursor ? " · more available" : " · end of mailbox");
     renderSweepReviewQueue();
+    return { ok: true };
   } catch (e) {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
+    return { ok: false };
   } finally {
     if (btn) btn.disabled = false;
     updateSweepMoreBtn();
@@ -3673,14 +3718,21 @@ async function sweepAutoRunToEnd() {
   _sweepAutoStop = false;
   _setSweepAutoUI(true);
   try {
-    await sweepRunAndFile(true);          // first batch — fresh scan from the top
+    let res = await sweepRunAndFile(true);   // first batch — fresh scan from the top
     _setSweepAutoUI(true);
-    while (_sweepCursor && !_sweepAutoStop) {
-      await sweepRunAndFile(false);       // next batch, continuing the cursor
+    while (res?.ok && _sweepCursor && !_sweepAutoStop) {
+      res = await sweepRunAndFile(false);    // next batch, continuing the cursor
       _setSweepAutoUI(true);
     }
     const s = document.getElementById("sweepStatus");
-    if (s) s.textContent += _sweepAutoStop ? "  ·  ⏹ stopped" : "  ·  ✅ reached the end of the mailbox";
+    if (res && res.ok === false) {
+      // A batch errored (e.g. network hiccup) — sweepRunAndFile already painted the
+      // "✗ …". Don't tack on a false "reached the end"; the cursor is preserved, so
+      // clicking Run to end again resumes from here.
+      if (s && /^✗/.test(s.textContent)) s.textContent += "  ·  ⏹ stopped — click “Run to end” again to resume.";
+    } else if (s) {
+      s.textContent += _sweepAutoStop ? "  ·  ⏹ stopped" : "  ·  ✅ reached the end of the mailbox";
+    }
   } catch (e) {
     const s = document.getElementById("sweepStatus");
     if (s) s.textContent = "✗ " + humanizeError(e);
@@ -8710,6 +8762,27 @@ async function doSaveSub() {
       };
     }
   );
+}
+
+// "Log" vs "Log & add another": a single transmittal email often carries several
+// RFIs/Subs. doSaveRfi/doSaveSub return the filing result on success (undefined on a
+// validation bail or error) and leave the form cleared but on-screen. So on a plain
+// Log we return to the main view; on "& add another" we stay put, re-seed the next
+// auto-number, and nudge for the next entry. One source email → many artifacts.
+async function saveArtifactThen(kind, another) {
+  const isRfi = kind === "rfi";
+  const r = isRfi ? await doSaveRfi() : await doSaveSub();
+  if (!r) return; // validation failed or save errored — stay on the form, keep input
+  if (another) {
+    const numEl = document.getElementById(isRfi ? "rfiNumber" : "subNumber");
+    if (numEl) numEl.value = isRfi ? nextAutoRfiNumber() : nextAutoSubNumber();
+    const statusId = isRfi ? "rfiStatus" : "subStatus";
+    const noun = isRfi ? "RFI" : "submittal";
+    setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
+  } else {
+    try { setStatus("actionStatus", "success", r.successMessage || "✓ Logged."); } catch {}
+    showView("mainView");
+  }
 }
 // ─── LOG SUBMITTAL REVIEW ────────────────────────────────────────────────────
 let _activeReviewSubId = "";

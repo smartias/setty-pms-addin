@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-19-jobcard-ask";</script>
+  <script>window.__appVersion = "2026-06-23-sweep-rfi-link";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -951,6 +951,7 @@
     <select id="linkToTarget" style="width:100%;">
       <option value="">— Standalone (no linking) —</option>
     </select>
+    <button type="button" class="btn btn-secondary" id="linkArtifactBtn" style="margin-top:6px;width:100%;">🔗 Link this email to the selected RFI/Submittal</button>
   </div>
 
   <!-- Primary action zone — the 80/20 actions, always visible.
@@ -1123,6 +1124,7 @@
     <textarea id="rfiNotes" rows="2" placeholder="Internal notes — context for your team, not the contractor"></textarea>
     <div id="rfiStatus" class="status-msg"></div>
     <button class="btn btn-blue" id="saveRfiBtn">💾 Log New RFI</button>
+    <button class="btn btn-secondary" id="saveRfiAnotherBtn" style="margin-top:6px;">➕ Log RFI &amp; add another from this email</button>
   </div>
 
   <div id="rfiExistingForm" style="display:none;">
@@ -1183,6 +1185,7 @@
     <textarea id="subNotes" rows="2" placeholder="Internal notes — context for your team"></textarea>
     <div id="subStatus" class="status-msg"></div>
     <button class="btn btn-purple" id="saveSubBtn">💾 Log New Submittal</button>
+    <button class="btn btn-secondary" id="saveSubAnotherBtn" style="margin-top:6px;">➕ Log Submittal &amp; add another from this email</button>
   </div>
 
   <div id="subExistingForm" style="display:none;">
