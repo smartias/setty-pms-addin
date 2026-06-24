@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-24-sweep-mailbox-box";</script>
+  <script>window.__appVersion = "2026-06-24-sweep-project-filter";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -1011,6 +1011,9 @@
         <input type="text" id="sweepMailbox" autocomplete="off" spellcheck="false"
           placeholder="Scanning your mailbox — or type a colleague's email to bulk-file theirs"
           style="width:100%;box-sizing:border-box;margin:4px 0;padding:3px 6px;font-size:11px;color:#444;border:1px solid #ddd;border-radius:3px;" />
+        <input type="text" id="sweepProject" autocomplete="off" spellcheck="false"
+          placeholder="Limit to one project? type its number or name (blank = all projects)"
+          style="width:100%;box-sizing:border-box;margin:0 0 4px;padding:3px 6px;font-size:11px;color:#444;border:1px solid #ddd;border-radius:3px;" />
         <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
         <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
         <button type="button" id="sweepMoreBtn" class="watchlist-refresh" style="display:none;width:100%;margin-top:6px;" title="Scan and file the next batch from this mailbox">⬇️ Load more from this mailbox</button>

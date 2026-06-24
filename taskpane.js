@@ -3232,8 +3232,26 @@ function sweepParticipants(msg) {
 //   auto-file ONLY when a project ID (SAPX or client prime #) is in the subject;
 //   review only when the name/acronym score clears SWEEP_REVIEW_MIN (≥2 distinctive
 //   signals); otherwise skip. A single coincidental word no longer files anything.
-function classifySweep(candidates) {
+function classifySweep(candidates, filterId = null) {
   if (!candidates.length) return { action: "skip" };
+  // Project-scoped run ("only this job"): decide solely about the chosen project.
+  // Auto-file as much as possible for it — a project # in the subject is decisive;
+  // otherwise file when it's a solid match (≥ review min) that no OTHER job outscores.
+  // Queue anything plausible-but-uncertain as a maybe, and skip mail that clearly
+  // belongs elsewhere (a different job's # in the subject, or no signal for this one).
+  if (filterId) {
+    const match = candidates.find((c) => c.project && c.project.id === filterId);
+    if (!match) return { action: "skip" };                                   // no signal for this job
+    const matchHasId = (match.reasons || []).some((r) => r.includes("project #"));
+    if (matchHasId) return { action: "file", project: match.project, score: match.score, reasons: match.reasons };
+    const otherHasId = candidates.some((c) => c !== match && (c.reasons || []).some((r) => r.includes("project #")));
+    if (otherHasId) return { action: "skip" };                               // a DIFFERENT job's # is in the subject
+    const best = Math.max(...candidates.map((c) => c.score));
+    if (match.score >= SWEEP_REVIEW_MIN && match.score >= best) {             // solid, and nothing outscores it
+      return { action: "file", project: match.project, score: match.score, reasons: match.reasons };
+    }
+    return { action: "review", candidates: [match, ...candidates.filter((c) => c !== match).slice(0, 2)] };
+  }
   const top = candidates[0];
   const hasId = (top.reasons || []).some((r) => r.includes("project #"));
   if (hasId) return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
@@ -3476,6 +3494,19 @@ function sweepResolveMailbox() {
   }
   return { base: "/users/" + encodeURIComponent(raw), shared: true, label: raw };
 }
+// Resolve the optional "only this project" box to a single project {id,label}, or
+// null for a whole-mailbox sweep. Exact project number wins; otherwise the first
+// number/name substring match. The resolved label is echoed in the scan status so
+// a wrong guess is obvious before much is filed.
+function sweepResolveProjectFilter() {
+  const raw = (document.getElementById("sweepProject")?.value || "").trim().toLowerCase();
+  if (!raw) return null;
+  const live = (allProjects || []).filter((p) => p && !p.archived && (p.name || p.projectNumber));
+  const exact = live.find((p) => (p.projectNumber || "").toLowerCase() === raw);
+  const hit = exact || live.find((p) =>
+    (p.projectNumber || "").toLowerCase().includes(raw) || (p.name || "").toLowerCase().includes(raw));
+  return hit ? { id: hit.id, label: ((hit.projectNumber ? hit.projectNumber + " " : "") + (hit.name || "")).trim() } : null;
+}
 // Module-level scan source + cursor, shared across Preview / Run & file / Load more.
 // _sweepSource carries the messages-collection base ("/me" or "/users/{addr}") and
 // the token (a Mail.Read.Shared token for a colleague's mailbox); _sweepCursor is
@@ -3483,6 +3514,10 @@ function sweepResolveMailbox() {
 let _sweepSource = { base: "/me", token: null, label: "your mailbox", shared: false };
 let _sweepCursor = null;
 let _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+// Project-scope filter for the current run: {id,label} when the user typed a job in
+// the sweep's "only this project" box, else null (whole-mailbox sweep). Resolved on
+// reset, read by sweepScanBatch to file/queue ONLY that job and skip the rest.
+let _sweepProjectFilter = null;
 // Conversation-level dedup for the current run: convId -> projectId (the thread is
 // tied to a job) or "review" (already queued once this run). Reset each fresh run
 // so a thread is surfaced/auto-filed ONCE, not per-message. Persists across
@@ -3502,6 +3537,7 @@ async function sweepResolveScan(reset) {
     _sweepCursor = null;
     _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
     _sweepConvoSeen = new Map();
+    _sweepProjectFilter = sweepResolveProjectFilter(); // null = whole mailbox; else {id,label}
   }
   // Refresh the token at the start of EVERY batch (incl. Load more) so a long
   // backfill never carries a stale token into graphFetch's 401 path — which would
@@ -3524,6 +3560,7 @@ async function sweepScanBatch({ base, token, cursor }) {
   const filed = await sweepLoadFiledIds();
   const senderMap = await sweepLoadSenderMap();
   const convoMap = await sweepLoadConvoProjectMap();
+  const filterId = _sweepProjectFilter?.id || null; // scoped run → only file/queue this one job
   const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
   // First page builds the query; later pages follow the (base-stripped) nextLink.
   let path = cursor || (base + "/messages?$top=" + SWEEP_PAGE_SIZE +
@@ -3554,6 +3591,7 @@ async function sweepScanBatch({ base, token, cursor }) {
         const seen = _sweepConvoSeen.get(item.convId);
         const tiedProj = convoMap.get(item.convId) || (seen && seen !== "review" ? seen : null);
         if (tiedProj) {
+          if (filterId && tiedProj !== filterId) { out.skip++; continue; } // scoped run: another job's thread
           const proj = (allProjects || []).find((p) => p && p.id === tiedProj);
           if (proj) {
             _sweepConvoSeen.set(item.convId, tiedProj);
@@ -3563,7 +3601,7 @@ async function sweepScanBatch({ base, token, cursor }) {
         }
         if (seen === "review") { out.alreadyFiled++; continue; } // thread already queued once this run
       }
-      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
+      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())), filterId);
       if (verdict.action === "skip") { out.skip++; continue; }
       if (verdict.action === "file") {
         if (item.convId) _sweepConvoSeen.set(item.convId, verdict.project.id);
@@ -3575,7 +3613,8 @@ async function sweepScanBatch({ base, token, cursor }) {
     }
     // Live progress so a deep scan doesn't look frozen — refreshes once per page (~250 msgs).
     const _se = document.getElementById("sweepStatus");
-    if (_se) _se.textContent = "⏳ Reading mailbox… " + out.scanned + " scanned · " +
+    const _scope = _sweepProjectFilter ? " · only " + _sweepProjectFilter.label : "";
+    if (_se) _se.textContent = "⏳ Reading mailbox" + _scope + "… " + out.scanned + " scanned · " +
       out.file.length + " to file · " + out.review.length + " to review…";
     const next = data?.["@odata.nextLink"] || null;
     out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
