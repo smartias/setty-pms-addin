@@ -3465,10 +3465,16 @@ const sweepEsc = (s) => String(s == null ? "" : s)
 // Empty field (or your own address) → "/me"; a colleague's address → "/users/{addr}"
 // so the same scan code can target a departed PM's shared mailbox.
 function sweepResolveMailbox() {
-  // Shared-mailbox entry retired (the box was removed) — the sweep always scans
-  // your own mailbox. To bulk-file a colleague's mail, open their mailbox in
-  // Outlook and file those emails directly.
-  return { base: "/me", shared: false, label: "your mailbox" };
+  // Restored 2026-06-24. Blank (or "me") → scan your own mailbox via /me.
+  // A colleague's address → scan THEIR mailbox via /users/{addr}; shared:true makes
+  // sweepResolveScan + sweepFileItems route a Mail.Read.Shared token (not /me's).
+  // Needed because the per-item "open their mailbox and file manually" path is
+  // blocked by Outlook's "add-in unavailable on shared items" rule.
+  const raw = (document.getElementById("sweepMailbox")?.value || "").trim();
+  if (!raw || raw.toLowerCase() === "me") {
+    return { base: "/me", shared: false, label: "your mailbox" };
+  }
+  return { base: "/users/" + encodeURIComponent(raw), shared: true, label: raw };
 }
 // Module-level scan source + cursor, shared across Preview / Run & file / Load more.
 // _sweepSource carries the messages-collection base ("/me" or "/users/{addr}") and
