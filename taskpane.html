@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-24-sweep-defer-inline";</script>
+  <script>window.__appVersion = "2026-06-24-sweep-clear-stop";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -1006,6 +1006,7 @@
             <button type="button" id="sweepFileBtn" class="watchlist-refresh" title="Scan your mailbox: file confident matches and queue the rest for review (one batch)">Run &amp; file</button>
             <button type="button" id="sweepRunAllBtn" class="watchlist-refresh" title="Scan and file all the way through your mailbox in one go — stop anytime">⏩ Run to end</button>
             <button type="button" id="sweepStopBtn" class="watchlist-refresh" style="display:none;" title="Stop the auto-run after the current page">⏹ Stop</button>
+            <button type="button" id="sweepClearBtn" class="watchlist-refresh" title="Clear the on-screen results &amp; review list and start fresh — your filed emails stay safe, and your mailbox/project boxes are kept. (Saves closing and reopening the pane.)">↺ Clear</button>
           </span>
         </div>
         <input type="text" id="sweepMailbox" autocomplete="off" spellcheck="false"

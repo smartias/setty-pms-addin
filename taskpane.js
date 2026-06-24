@@ -220,6 +220,8 @@ function setupEventListeners() {
     const s = document.getElementById("sweepStatus");
     if (s) s.textContent += "  ·  ⏹ stopping after this page…";
   };
+  const sweepClearBtn = document.getElementById("sweepClearBtn");
+  if (sweepClearBtn) sweepClearBtn.onclick = () => sweepClearResults();
   const sweepMoreBtn = document.getElementById("sweepMoreBtn");
   if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
@@ -3742,6 +3744,10 @@ async function sweepRunAndFile(reset = true) {
   const moreBtn = document.getElementById("sweepMoreBtn");
   const statusEl = document.getElementById("sweepStatus");
   if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return { ok: false }; }
+  // Standalone "Run & file" (not inside a Run-to-end): show Stop so a long scan can be
+  // halted — the scan loop already checks _sweepAutoStop between pages.
+  const standalone = !_sweepAutoRunning;
+  if (standalone) { _sweepAutoStop = false; _setSweepAutoUI(true); }
   if (btn) btn.disabled = true;
   if (moreBtn) moreBtn.disabled = true;
   if (statusEl) statusEl.textContent = reset ? "⏳ Scanning and filing confident matches…" : "⏳ Loading the next batch…";
@@ -3765,6 +3771,7 @@ async function sweepRunAndFile(reset = true) {
     return { ok: false };
   } finally {
     if (btn) btn.disabled = false;
+    if (standalone) _setSweepAutoUI(false);
     updateSweepMoreBtn();
   }
 }
@@ -3778,12 +3785,28 @@ function updateSweepMoreBtn() {
 
 // Swap the run/more buttons for a Stop button while an auto-run is going.
 function _setSweepAutoUI(running) {
-  for (const id of ["sweepFileBtn", "sweepRunAllBtn", "sweepMoreBtn"]) {
+  for (const id of ["sweepFileBtn", "sweepRunAllBtn", "sweepMoreBtn", "sweepClearBtn"]) {
     const el = document.getElementById(id);
     if (el) el.style.display = running ? "none" : "";
   }
   const stop = document.getElementById("sweepStopBtn");
   if (stop) stop.style.display = running ? "" : "none";
+}
+
+// Clear the on-screen sweep results + review list and reset the batch cursor, WITHOUT
+// touching the mailbox/project boxes or anything already filed (those are safe in
+// pms_project_emails). Replaces "close and reopen the pane for a fresh slate".
+function sweepClearResults() {
+  if (_sweepAutoRunning) return; // never yank state out from under a live run
+  _sweepReview = [];
+  _sweepCursor = null;
+  _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+  _sweepConvoSeen = new Map();
+  const results = document.getElementById("sweepResults");
+  if (results) results.innerHTML = "";
+  const status = document.getElementById("sweepStatus");
+  if (status) status.textContent = "";
+  updateSweepMoreBtn();
 }
 
 // "Run to end" — keep filing batches until the mailbox is exhausted or the user
