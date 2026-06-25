@@ -3670,6 +3670,12 @@ async function sweepFileItems(items) {
       try {
         const d = await graphFetch("GET", base + "/messages/" + it.gid + "?$select=body", null, token);
         bodyHtml = d?.body?.content || "";
+        // Restore inline photos: resolve cid: refs to data: URIs so they render
+        // in the PMS email log (the single-email path did this; bulk filing did not).
+        if (bodyHtml && /src\s*=\s*["']cid:/i.test(bodyHtml)) {
+          const imgs = await getInlineImagesForMessageId(base, it.gid, token);
+          bodyHtml = await embedInlineImagesFromMap(bodyHtml, imgs);
+        }
       } catch (_) { /* body fetch is best-effort */ }
       const rec = {
         id: uid(), msgId: it.msgId,
@@ -4915,6 +4921,57 @@ async function embedInlineImagesAsDataUris(html, token) {
   if (!html || !/src\s*=\s*["']cid:/i.test(html)) return html;
   const imgs = await getInlineImagesForEmail(token);
   if (!imgs || imgs.size === 0) return html;
+  let total = 0;
+  const done = new Map();
+  return await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (done.has(cid)) return done.get(cid);
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > INLINE_LOG_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const rep = `src=${q}data:${ds.contentType};base64,${_bytesToBase64(ds.bytes)}${q}`;
+    done.set(cid, rep);
+    return rep;
+  });
+}
+
+// Sweep variant of the inline-image resolver: works on an ARBITRARY message
+// (base + Graph id), not the currently-open Office item, so bulk filing can
+// restore inline photos too. Skips tiny images (signature logos, <10KB) — they
+// only clutter and would slow a big backfill (most emails carry a cid: logo).
+// Bodies land in pms_project_emails (the table), not the slimmed inline blob,
+// so this stays clear of the write-contention path the defer fix solved.
+const INLINE_IMG_MIN_BYTES = 10000;
+async function getInlineImagesForMessageId(base, gid, token) {
+  const map = new Map();
+  try {
+    const attData = await graphFetch("GET", base + "/messages/" + gid + "/attachments", null, token);
+    for (const att of (attData?.value || [])) {
+      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
+      if (!att.isInline || !(att.contentType || "").startsWith("image/")) continue;
+      if ((att.size || 0) <= INLINE_IMG_MIN_BYTES) continue;   // skip tiny logos
+      const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
+      if (!cid) continue;
+      let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
+      if (!bytes && att.id) {
+        const r = await fetchWithRetry(
+          "https://graph.microsoft.com/v1.0" + base + "/messages/" + gid + "/attachments/" + att.id + "/$value",
+          { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img (sweep)" });
+        if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
+      }
+      if (bytes) map.set(cid, { contentType: att.contentType, bytes });
+    }
+  } catch (e) { console.warn("[inline-img sweep] fetch failed:", e.message); }
+  return map;
+}
+
+// Embed a pre-fetched cid->bytes map into HTML as downscaled data: URIs. Same
+// cap/downscale rules as embedInlineImagesAsDataUris, but takes the map so the
+// sweep fetches once per message. cid refs without a (substantial) image stay as-is.
+async function embedInlineImagesFromMap(html, imgs) {
+  if (!html || !imgs || imgs.size === 0 || !/src\s*=\s*["']cid:/i.test(html)) return html;
   let total = 0;
   const done = new Map();
   return await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
