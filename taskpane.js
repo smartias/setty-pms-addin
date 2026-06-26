@@ -5468,14 +5468,17 @@ function _markFirstSaveDone() {
 }
 
 // ── PMS "filed" category chips ────────────────────────────────────────────────
-// Stamp the OPEN email with an Outlook category named for the project it was just
-// filed to (e.g. "📁 Homeport II"), so filed mail is visible at a glance in the
-// inbox — desktop + web — like the Dynamics "Tracked to" chip. Uses the add-in's
-// existing ReadWriteMailbox permission (no Graph, no extra consent); open-item
-// only. Needs Mailbox requirement set 1.8; no-ops on older clients. Bulk-sweep
-// tagging (arbitrary messages → Graph → Mail.ReadWrite re-consent) is a follow-up.
-const PMS_CATEGORY_PREFIX = "📁 ";
-const PMS_CATEGORY_COLOR = "Preset7"; // blue (matches the add-in primary); one color = all PMS chips read as a group
+// Stamp the OPEN email with TWO Outlook categories when it's filed — a generic
+// "Tracked to PMS" status chip + a per-project "📁 <Project>" chip — mirroring the
+// Dynamics "Tracked to Dynamics 365" + regarding-record look. Filed mail is then
+// visible at a glance in the inbox (desktop + web). Uses the add-in's existing
+// ReadWriteMailbox permission (no Graph, no extra consent); open-item only. Needs
+// Mailbox requirement set 1.8; no-ops on older clients. Bulk-sweep tagging
+// (arbitrary messages → Graph → Mail.ReadWrite re-consent) is a follow-up.
+const PMS_TRACKED_CATEGORY = "Tracked to PMS"; // generic status chip
+const PMS_TRACKED_COLOR = "Preset7";           // blue
+const PMS_PROJECT_PREFIX = "📁 ";              // per-project chip, e.g. "📁 Homeport II"
+const PMS_PROJECT_COLOR = "Preset5";           // teal
 function _categoriesSupported() {
   try {
     return !!(Office.context.mailbox.item
@@ -5495,23 +5498,25 @@ function _officeP(fn) {
     } catch (e) { reject(e); }
   });
 }
+async function _ensureAndAddCategory(catName, color) {
+  const onItem = await _officeP(cb => Office.context.mailbox.item.categories.getAsync(cb));
+  if ((onItem || []).some(c => c.displayName === catName)) return; // already on this item
+  const master = await _officeP(cb => Office.context.mailbox.masterCategories.getAsync(cb));
+  if (!(master || []).some(c => c.displayName === catName)) {
+    // Must exist in the master list (with a color) or newer Outlook won't render it.
+    try {
+      await _officeP(cb => Office.context.mailbox.masterCategories.addAsync(
+        [{ displayName: catName, color: Office.MailboxEnums.CategoryColor[color] }], cb));
+    } catch (e) { /* added concurrently / already exists — fine */ }
+  }
+  await _officeP(cb => Office.context.mailbox.item.categories.addAsync([catName], cb));
+}
 async function stampProjectCategory(project) {
   if (!project || !_categoriesSupported()) return;
   const label = (project.name || project.projectNumber || "").trim();
-  if (!label) return;
-  const catName = PMS_CATEGORY_PREFIX + label;
   try {
-    const onItem = await _officeP(cb => Office.context.mailbox.item.categories.getAsync(cb));
-    if ((onItem || []).some(c => c.displayName === catName)) return; // already tagged
-    const master = await _officeP(cb => Office.context.mailbox.masterCategories.getAsync(cb));
-    if (!(master || []).some(c => c.displayName === catName)) {
-      // Must exist in the master list (with a color) or newer Outlook won't render it.
-      try {
-        await _officeP(cb => Office.context.mailbox.masterCategories.addAsync(
-          [{ displayName: catName, color: Office.MailboxEnums.CategoryColor[PMS_CATEGORY_COLOR] }], cb));
-      } catch (e) { /* added concurrently / already exists — fine */ }
-    }
-    await _officeP(cb => Office.context.mailbox.item.categories.addAsync([catName], cb));
+    await _ensureAndAddCategory(PMS_TRACKED_CATEGORY, PMS_TRACKED_COLOR);                    // "Tracked to PMS"
+    if (label) await _ensureAndAddCategory(PMS_PROJECT_PREFIX + label, PMS_PROJECT_COLOR);   // "📁 <Project>"
   } catch (e) {
     console.warn("[pms-category] stamp failed:", e.message);
   }
