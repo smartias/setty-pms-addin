@@ -1271,6 +1271,11 @@ function refreshEmailSavedIndicator(animate = false) {
     try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
+  // The open email is filed to selectedProject → stamp the "filed" chips. Idempotent
+  // + guarded so it runs once per item/project; covers the quiet auto-save-on-tag path
+  // (which skips recordSaveAndCelebrate), explicit saves, and re-opening filed mail.
+  const _stampKey = emailItem.itemId + "|" + selectedProject.id;
+  if (_stampKey !== _lastStampedKey) { _lastStampedKey = _stampKey; void stampProjectCategory(selectedProject); }
 
   // Record is logged. Keep the Save to SharePoint button ONLY when there are
   // attachments not yet filed there; otherwise collapse to the "✓ logged" card.
@@ -5479,6 +5484,7 @@ const PMS_TRACKED_CATEGORY = "Tracked to PMS"; // generic status chip
 const PMS_TRACKED_COLOR = "Preset7";           // blue
 const PMS_PROJECT_PREFIX = "📁 ";              // per-project chip, e.g. "📁 Homeport II"
 const PMS_PROJECT_COLOR = "Preset5";           // teal
+let _lastStampedKey = ""; // guards the stamp from re-running per item/project view
 function _categoriesSupported() {
   try {
     return !!(Office.context.mailbox.item
