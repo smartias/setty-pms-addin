@@ -10359,7 +10359,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","actionItemView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","actionItemView","rfiView","subView","rfiResponseView","subReviewView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
