@@ -5467,7 +5467,58 @@ function _markFirstSaveDone() {
   try { localStorage.setItem(FIRST_SAVE_KEY, "1"); } catch {}
 }
 
+// ── PMS "filed" category chips ────────────────────────────────────────────────
+// Stamp the OPEN email with an Outlook category named for the project it was just
+// filed to (e.g. "📁 Homeport II"), so filed mail is visible at a glance in the
+// inbox — desktop + web — like the Dynamics "Tracked to" chip. Uses the add-in's
+// existing ReadWriteMailbox permission (no Graph, no extra consent); open-item
+// only. Needs Mailbox requirement set 1.8; no-ops on older clients. Bulk-sweep
+// tagging (arbitrary messages → Graph → Mail.ReadWrite re-consent) is a follow-up.
+const PMS_CATEGORY_PREFIX = "📁 ";
+const PMS_CATEGORY_COLOR = "Preset7"; // blue (matches the add-in primary); one color = all PMS chips read as a group
+function _categoriesSupported() {
+  try {
+    return !!(Office.context.mailbox.item
+      && Office.context.requirements
+      && Office.context.requirements.isSetSupported("Mailbox", "1.8")
+      && Office.context.mailbox.item.categories
+      && Office.context.mailbox.masterCategories);
+  } catch (e) { return false; }
+}
+function _officeP(fn) {
+  return new Promise((resolve, reject) => {
+    try {
+      fn(res => {
+        if (res && res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
+        else reject(new Error(res && res.error ? res.error.message : "Office async failed"));
+      });
+    } catch (e) { reject(e); }
+  });
+}
+async function stampProjectCategory(project) {
+  if (!project || !_categoriesSupported()) return;
+  const label = (project.name || project.projectNumber || "").trim();
+  if (!label) return;
+  const catName = PMS_CATEGORY_PREFIX + label;
+  try {
+    const onItem = await _officeP(cb => Office.context.mailbox.item.categories.getAsync(cb));
+    if ((onItem || []).some(c => c.displayName === catName)) return; // already tagged
+    const master = await _officeP(cb => Office.context.mailbox.masterCategories.getAsync(cb));
+    if (!(master || []).some(c => c.displayName === catName)) {
+      // Must exist in the master list (with a color) or newer Outlook won't render it.
+      try {
+        await _officeP(cb => Office.context.mailbox.masterCategories.addAsync(
+          [{ displayName: catName, color: Office.MailboxEnums.CategoryColor[PMS_CATEGORY_COLOR] }], cb));
+      } catch (e) { /* added concurrently / already exists — fine */ }
+    }
+    await _officeP(cb => Office.context.mailbox.item.categories.addAsync([catName], cb));
+  } catch (e) {
+    console.warn("[pms-category] stamp failed:", e.message);
+  }
+}
+
 function recordSaveAndCelebrate() {
+  void stampProjectCategory(selectedProject); // tag the just-filed email with its project chip
   // Check first-save BEFORE bumping the weekly counter so the welcome fires
   // even if this is also weekly-count #1.
   const isFirstEver = _isFirstSaveEver();
