@@ -9653,22 +9653,22 @@ function renderBillableSchedule() {
     ? (selectedProject.milestones || []).filter(m => m.type === "billable" && !m.cancelled)
     : [];
   if (ms.length === 0) {
-    body.innerHTML = `<p style="color:#64748b;font-size:12px;margin:0;">No billable milestones. Finalize the fee schedule in PMS first.</p>`;
+    body.innerHTML = `<p style="color:var(--text-soft);font-size:12px;margin:0;">No billable milestones. Finalize the fee schedule in PMS first.</p>`;
     return;
   }
   ms.sort((a, b) => String(a.dueDate || "").localeCompare(String(b.dueDate || "")));
-  const inStyle = "background:#0d1326;border:1px solid #2d3452;border-radius:5px;color:#e2e8f0;padding:4px 6px;font-size:12px;";
+  const inStyle = "background:var(--bg);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);padding:4px 6px;font-size:12px;margin:0;";
   body.innerHTML = ms.map(m => {
     const idAttr = String(m.id).replace(/"/g, "&quot;");
     const name = String(m.name || m.phase || "Billable").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const fee = m.fee ? "$" + Number(m.fee).toLocaleString() : "";
     const pct = Number(m.pctComplete || 0);
     const due = m.dueDate || "";
-    return `<div data-mid="${idAttr}" style="margin-bottom:8px;padding:8px;background:#151b2e;border:1px solid #2d3452;border-radius:6px;">
-      <div style="font-size:12px;font-weight:600;color:#e2e8f0;margin-bottom:6px;">${name}${fee ? ` <span style="color:#22c55e;font-weight:700;">${fee}</span>` : ""}</div>
+    return `<div data-mid="${idAttr}" style="margin-bottom:8px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+      <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:6px;">${name}${fee ? ` <span style="color:var(--success);font-weight:700;">${fee}</span>` : ""}</div>
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
-        <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px;">Due <input type="date" data-field="dueDate" value="${due}" style="${inStyle}"/></label>
-        <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px;">% Complete <input type="number" min="0" max="100" step="5" data-field="pctComplete" value="${pct}" style="width:58px;${inStyle}"/></label>
+        <label style="font-size:11px;color:var(--text-soft);display:flex;align-items:center;gap:4px;">Due <input type="date" data-field="dueDate" value="${due}" style="width:140px;${inStyle}"/></label>
+        <label style="font-size:11px;color:var(--text-soft);display:flex;align-items:center;gap:4px;">% Complete <input type="number" min="0" max="100" step="5" data-field="pctComplete" value="${pct}" style="width:64px;${inStyle}"/></label>
       </div>
     </div>`;
   }).join("");

@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-25-filed-chips-v2";</script>
+  <script>window.__appVersion = "2026-06-25-billable-light";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
@@ -1276,8 +1276,8 @@
 
   <!-- Billable schedule — adjust due dates + % complete on billable milestones.
        Sits below New Milestone, collapsed by default to stay out of the way. -->
-  <div id="billableScheduleSection" style="margin-top:22px;border-top:1px solid #2d3452;padding-top:12px;">
-    <button id="billableScheduleToggle" style="background:none;border:none;color:#94a3b8;font-size:12px;font-weight:600;cursor:pointer;padding:0;">▸ Billable Schedule</button>
+  <div id="billableScheduleSection" style="margin-top:22px;border-top:1px solid var(--border);padding-top:12px;">
+    <button id="billableScheduleToggle" style="background:none;border:none;color:var(--primary);font-size:13px;font-weight:600;cursor:pointer;padding:0;">▸ Billable Schedule</button>
     <div id="billableScheduleBody" style="display:none;margin-top:10px;"></div>
     <div id="billableScheduleStatus" class="status-msg" style="margin-top:6px;"></div>
   </div>
@@ -1327,6 +1327,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-06-25-filed-chips-v2"></script>
+<script src="taskpane.js?v=2026-06-25-billable-light"></script>
 </body>
 </html>
