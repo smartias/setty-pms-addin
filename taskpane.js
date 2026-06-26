@@ -300,6 +300,7 @@ function setupEventListeners() {
   document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
   document.getElementById("addParticipantBtn").onclick = onAddParticipantClick;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
+  document.getElementById("billableScheduleToggle").onclick = toggleBillableSchedule;
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveActionItemBtn").onclick = doSaveActionItem;
   document.getElementById("saveRfiBtn").onclick     = () => { void saveArtifactThen("rfi", false); };
@@ -1109,6 +1110,7 @@ function _applyChipPresenceUiToggles(hasChips) {
   }
 }
 function refreshLoggedArtifactChips() {
+  try { refreshOpenActionItemChips(); } catch (e) { console.warn("[action-chips]", e.message); }
   const container = document.getElementById("loggedAsArtifactChips");
   if (!container) return;
   if (!selectedProject || !emailItem?.itemId) {
@@ -1181,6 +1183,63 @@ function refreshLoggedArtifactChips() {
     else if (action === "log-sub-review") openSubReviewView(id);
   };
 }
+// ── Open action items (project-level) ────────────────────────────────────────
+// Surfaces the tagged project's open action items as chips with a "Mark Done"
+// button — mirrors refreshLoggedArtifactChips so the user can close items from
+// the email they're working. Capped so it stays compact.
+const OPEN_ACTION_ITEM_CHIP_CAP = 5;
+function isOpenActionItem(n) {
+  return !!n && (n.actionItem || n.category === "Action Item") && (n.actionStatus || "open") !== "done";
+}
+function refreshOpenActionItemChips() {
+  const container = document.getElementById("openActionItemChips");
+  if (!container) return;
+  const open = selectedProject ? (selectedProject.notes || []).filter(isOpenActionItem) : [];
+  if (open.length === 0) { container.innerHTML = ""; container.style.display = "none"; return; }
+  container.style.display = "flex";
+  const shown = open.slice(0, OPEN_ACTION_ITEM_CHIP_CAP);
+  const rows = shown.map(n => {
+    const task = ((n.body || "").split("\n")[0] || "Action item").slice(0, 56);
+    const owner = n.actionOwner || n.owner || "";
+    const due = n.actionDueDate || n.dueDate || "";
+    const meta = [owner, due].filter(Boolean).join(" · ");
+    const label = ("✅ " + task + (meta ? "  (" + meta + ")" : "")).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const idAttr = String(n.id).replace(/"/g, "&quot;");
+    const chip = `<span style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;font-size:11px;font-weight:600;">${label}</span>`;
+    const btn = `<button data-action="mark-action-done" data-id="${idAttr}" style="align-self:flex-start;background:#b45309;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">✓ Mark Done</button>`;
+    return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chip}${btn}</div>`;
+  });
+  if (open.length > shown.length) {
+    rows.push(`<div style="font-size:11px;color:#64748b;padding-left:4px;">+${open.length - shown.length} more open (manage in PMS)</div>`);
+  }
+  container.innerHTML = rows.join("");
+  container.onclick = (ev) => {
+    const btn = ev.target.closest("button[data-action='mark-action-done']");
+    if (btn) void markActionItemDone(btn.getAttribute("data-id"));
+  };
+}
+async function markActionItemDone(noteId) {
+  if (!selectedProject || !noteId) return;
+  if (saveInFlight) { setStatus("actionStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
+  setStatus("actionStatus", "info", "⏳ Closing action item…");
+  try {
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      notes: (fresh.notes || []).map(n =>
+        n.id === noteId
+          ? { ...n, actionStatus: "done", status: "Done", updatedAt: new Date().toISOString() }
+          : n),
+    }));
+    setStatus("actionStatus", "success", "✓ Action item closed.");
+    refreshOpenActionItemChips();
+  } catch (e) {
+    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+  } finally {
+    saveInFlight = false;
+  }
+}
+
 function refreshEmailSavedIndicator(animate = false) {
   const btnSharePoint = document.getElementById("saveSpBtn");
   const btnRecordOnly = document.getElementById("saveRecordBtn");
@@ -9520,8 +9579,92 @@ function prefillMilestone(iso) {
   form.style.display = "block";
   form.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
+// ── Billable schedule (add-in) ───────────────────────────────────────────────
+// Lists the project's billable milestones below New Milestone and lets the user
+// adjust due date + % complete (fee is read-only — editing fee amounts belongs to
+// the PMS fee-schedule lock). A manual date edit pins dueDateManual so a later PMS
+// rebuild won't clobber it, matching the PMS convention.
+function renderBillableSchedule() {
+  const body = document.getElementById("billableScheduleBody");
+  if (!body) return;
+  const ms = selectedProject
+    ? (selectedProject.milestones || []).filter(m => m.type === "billable" && !m.cancelled)
+    : [];
+  if (ms.length === 0) {
+    body.innerHTML = `<p style="color:#64748b;font-size:12px;margin:0;">No billable milestones. Finalize the fee schedule in PMS first.</p>`;
+    return;
+  }
+  ms.sort((a, b) => String(a.dueDate || "").localeCompare(String(b.dueDate || "")));
+  const inStyle = "background:#0d1326;border:1px solid #2d3452;border-radius:5px;color:#e2e8f0;padding:4px 6px;font-size:12px;";
+  body.innerHTML = ms.map(m => {
+    const idAttr = String(m.id).replace(/"/g, "&quot;");
+    const name = String(m.name || m.phase || "Billable").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const fee = m.fee ? "$" + Number(m.fee).toLocaleString() : "";
+    const pct = Number(m.pctComplete || 0);
+    const due = m.dueDate || "";
+    return `<div data-mid="${idAttr}" style="margin-bottom:8px;padding:8px;background:#151b2e;border:1px solid #2d3452;border-radius:6px;">
+      <div style="font-size:12px;font-weight:600;color:#e2e8f0;margin-bottom:6px;">${name}${fee ? ` <span style="color:#22c55e;font-weight:700;">${fee}</span>` : ""}</div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px;">Due <input type="date" data-field="dueDate" value="${due}" style="${inStyle}"/></label>
+        <label style="font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px;">% Complete <input type="number" min="0" max="100" step="5" data-field="pctComplete" value="${pct}" style="width:58px;${inStyle}"/></label>
+      </div>
+    </div>`;
+  }).join("");
+  body.onchange = (ev) => {
+    const input = ev.target.closest("input[data-field]");
+    if (!input) return;
+    const row = input.closest("[data-mid]");
+    const mid = row && row.getAttribute("data-mid");
+    if (!mid) return;
+    const field = input.getAttribute("data-field");
+    let value = input.value;
+    if (field === "pctComplete") value = Math.max(0, Math.min(100, Number(value) || 0));
+    void saveBillableMilestoneField(mid, field, value);
+  };
+}
+async function saveBillableMilestoneField(mid, field, value) {
+  if (!selectedProject || !mid) return;
+  if (saveInFlight) { setStatus("billableScheduleStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
+  setStatus("billableScheduleStatus", "info", "⏳ Saving…");
+  try {
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      milestones: (fresh.milestones || []).map(m =>
+        m.id === mid
+          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}) }
+          : m),
+    }));
+    setStatus("billableScheduleStatus", "success", "✓ Updated.");
+  } catch (e) {
+    setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
+    renderBillableSchedule(); // revert inputs to last saved state
+  } finally {
+    saveInFlight = false;
+  }
+}
+function toggleBillableSchedule() {
+  const body = document.getElementById("billableScheduleBody");
+  const toggle = document.getElementById("billableScheduleToggle");
+  if (!body || !toggle) return;
+  const isOpen = body.style.display !== "none";
+  if (isOpen) {
+    body.style.display = "none";
+    toggle.textContent = "▸ Billable Schedule";
+  } else {
+    renderBillableSchedule();
+    body.style.display = "block";
+    toggle.textContent = "▾ Billable Schedule";
+  }
+}
+
 function showManualMilestoneForm() {
   showView("datesView");
+  // Billable schedule starts collapsed each time (clutter-free); expand to edit.
+  const _bsBody = document.getElementById("billableScheduleBody");
+  const _bsTog = document.getElementById("billableScheduleToggle");
+  if (_bsBody) _bsBody.style.display = "none";
+  if (_bsTog) _bsTog.textContent = "▸ Billable Schedule";
   const list = document.getElementById("datesList");
   if (list) list.innerHTML = '<p style="color:#64748b;font-size:12px;text-align:center;padding:16px 0;">Manual mode: enter milestone details below.</p>';
   const defaultDate = new Date();

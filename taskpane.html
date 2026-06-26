@@ -935,6 +935,7 @@
        refreshLoggedArtifactChips() based on RFI/Submittal records whose
        sourceItemId matches the current email. Empty by default. -->
   <div id="loggedAsArtifactChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;"></div>
+  <div id="openActionItemChips" style="display:none;flex-direction:column;gap:6px;margin-bottom:8px;"></div>
 
   <!-- Optional link target: when the selected project has open RFIs or
        Submittals, this dropdown lets the user link the current email to one.
@@ -1271,6 +1272,14 @@
     <input type="date" id="milestoneDate"/>
     <div id="milestoneStatus" class="status-msg"></div>
     <button class="btn btn-blue" id="saveMilestoneBtn">💾 Save Milestone to Project</button>
+  </div>
+
+  <!-- Billable schedule — adjust due dates + % complete on billable milestones.
+       Sits below New Milestone, collapsed by default to stay out of the way. -->
+  <div id="billableScheduleSection" style="margin-top:22px;border-top:1px solid #2d3452;padding-top:12px;">
+    <button id="billableScheduleToggle" style="background:none;border:none;color:#94a3b8;font-size:12px;font-weight:600;cursor:pointer;padding:0;">▸ Billable Schedule</button>
+    <div id="billableScheduleBody" style="display:none;margin-top:10px;"></div>
+    <div id="billableScheduleStatus" class="status-msg" style="margin-top:6px;"></div>
   </div>
 </div>
 
