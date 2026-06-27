@@ -7536,6 +7536,7 @@ function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
     <p>Please review the attached RFI and respond by the due date.</p>
+    <p style="background:#eff6ff;border-left:3px solid #2563eb;padding:8px 12px;margin:12px 0;"><strong>📩 To respond:</strong> reply directly to this email with your answer.</p>
     <p><strong>Project:</strong> ${esc(projLabel)}<br>
        <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
        <strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
@@ -7558,6 +7559,7 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
     <p>Please review the attached submittal and return with stamp/comments by the due date.</p>
+    <p style="background:#f5f3ff;border-left:3px solid #7c3aed;padding:8px 12px;margin:12px 0;"><strong>📩 To return:</strong> reply directly to this email with your stamp + comments.</p>
     <p><strong>Project:</strong> ${esc(projLabel)}<br>
        <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
        <strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
@@ -8820,7 +8822,7 @@ function _buildRfiResponseEmailHtml({ rfi, project, response, dateResponded, out
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
     <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
     ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 RFI Response folder (OUT) — cover sheet DOCX</a></p>` : ""}
-    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original RFI folder (IN)</a></p>` : ""}
+    ${""/* client does not need a link back to what they sent — IN folder still created, just not linked here */}
   ` : ""}
 
 </div>
@@ -9303,7 +9305,7 @@ function _buildSubReviewEmailHtml({ sub, project, stamp, comments, dateReturned,
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
     <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
     ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 Submittal Review folder (OUT) — cover sheet DOCX</a></p>` : ""}
-    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original submittal folder (IN)</a></p>` : ""}
+    ${""/* client does not need a link back to what they sent — IN folder still created, just not linked here */}
   ` : ""}
 
 </div>
