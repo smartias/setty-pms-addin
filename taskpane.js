@@ -9413,6 +9413,40 @@ async function createMilestoneCalendarEvent(milestone, project) {
     return { success: false, error: e.message };
   }
 }
+// Create OR move a milestone's NYC-shared calendar event to its dueDate, from pure
+// milestone data (no email body — unlike createMilestoneCalendarEvent, which files
+// FROM an email). Used by the billable-schedule editor. Returns {success, eventId}.
+async function syncMilestoneCalendar(milestone, project) {
+  if (!milestone.dueDate) return { success: false, error: "no due date" };
+  try {
+    const endD = new Date(milestone.dueDate + "T12:00:00");
+    endD.setDate(endD.getDate() + 1);
+    const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
+    const start = { dateTime: milestone.dueDate + "T00:00:00", timeZone: "Eastern Standard Time" };
+    const end   = { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" };
+    const token = await getToken();
+    const calId = await getNYCCalendarId();
+    if (milestone.calendarEventId) {
+      // Move the existing event in place — keep its subject/body, just shift dates.
+      const path = (calId ? "/me/calendars/" + calId + "/events/" : "/me/events/") + milestone.calendarEventId;
+      await graphFetch("PATCH", path, { isAllDay: true, start, end }, token);
+      return { success: true, eventId: milestone.calendarEventId };
+    }
+    const prefix = project.projectNumber ? project.projectNumber + " " : "";
+    const pmName = (project.settyPm || "").trim();
+    const event = {
+      subject: prefix + project.name + " — " + milestone.name,
+      isAllDay: true,
+      ...(pmName ? { location: { displayName: "PM: " + pmName } } : {}),
+      isReminderOn: false,
+      start, end,
+      categories: ["PMS Milestone"],
+    };
+    const path = calId ? "/me/calendars/" + calId + "/events" : "/me/events";
+    const res = await graphFetch("POST", path, event, token);
+    return { success: true, eventId: res?.id };
+  } catch (e) { return { success: false, error: e.message }; }
+}
 // ─── DUE DATE EXTRACTOR ───────────────────────────────────────────────────────
 // Strip Outlook reply chains so we don't surface dates from older messages
 // quoted inside a forward. First marker past the first ~50 chars wins —
@@ -9690,14 +9724,23 @@ async function saveBillableMilestoneField(mid, field, value) {
   saveInFlight = true;
   setStatus("billableScheduleStatus", "info", "⏳ Saving…");
   try {
+    let extra = {}, calNote = "";
+    if (field === "dueDate" && value) {
+      // Keep the NYC Shared calendar in step — create the event if missing, else move it.
+      setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
+      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
+      const calRes = await syncMilestoneCalendar({ ...m, dueDate: value }, selectedProject);
+      if (calRes.success && calRes.eventId) extra.calendarEventId = calRes.eventId;
+      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
+    }
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: (fresh.milestones || []).map(m =>
         m.id === mid
-          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}) }
+          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}), ...extra }
           : m),
     }));
-    setStatus("billableScheduleStatus", "success", "✓ Updated.");
+    setStatus("billableScheduleStatus", "success", "✓ Updated" + calNote + ".");
   } catch (e) {
     setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
     renderBillableSchedule(); // revert inputs to last saved state
