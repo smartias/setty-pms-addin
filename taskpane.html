@@ -503,9 +503,9 @@
       letter-spacing: 0.6px;
       margin: 4px 0 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView, #rfiResponseView, #subReviewView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active { display: block; }
+    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active, #rfiResponseView.active, #subReviewView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -1212,7 +1212,7 @@
      still Open. Generates a DOCX cover sheet, uploads it to the RFI's /OUT
      folder, opens a prefilled draft email back to the RFI sender, and flips
      status to Responded. -->
-<div id="rfiResponseView" style="display:none;">
+<div id="rfiResponseView">
   <button class="back-btn" id="rfiResponseBack">← Back</button>
   <div class="section-title">Log RFI Response</div>
   <div id="rfiResponseHeader" style="font-size:13px;color:#1e293b;background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
@@ -1233,7 +1233,7 @@
 <!-- Submittal Review View — same pattern as RFI Response, but with stamp
      (Approved / Approved as Noted / Revise and Resubmit / Rejected) and
      review comments instead of a free-form response. -->
-<div id="subReviewView" style="display:none;">
+<div id="subReviewView">
   <button class="back-btn" id="subReviewBack">← Back</button>
   <div class="section-title">Log Submittal Review</div>
   <div id="subReviewHeader" style="font-size:13px;color:#1e293b;background:#ede9fe;border:1px solid #c4b5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>

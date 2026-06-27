@@ -4330,6 +4330,16 @@ async function isThreadAwaitingReply(conversationId) {
 // Classify-on-open hook. Runs when a client email is viewed: scores it, and if
 // it looks like it needs a reply, adds it to the watchlist. Best-effort and
 // silent — any failure here must never block the rest of the taskpane.
+// True when the open email is an RFI/submittal notification or is already logged as
+// one — keeps that mail off the response watchlist (it's tracked elsewhere).
+function isRfiOrSubmittalEmail() {
+  const from = (emailFromAddress || "").toLowerCase();
+  if (/procoretech\.com|forma\.autodesk|@kahua\.|e-?builder\.net|newforma/.test(from)) return true;
+  const subj = (typeof emailItem?.subject === "string" ? emailItem.subject : "").toLowerCase();
+  if (/\brfi\b|\bsubmittal\b|\btransmittal\b|\bsub[\s#-]*\d/.test(subj)) return true;
+  try { if (selectedProject && getLoggedRfiSubArtifacts(selectedProject).length > 0) return true; } catch (e) {}
+  return false;
+}
 async function maybeAddToWatchlist(myGen) {
   try {
     if (currentItemKind !== "message" || !emailItem) return;
@@ -4347,6 +4357,9 @@ async function maybeAddToWatchlist(myGen) {
     // contact address or shared email domain.
     const client = getClientByEmail(emailFromAddress);
     if (!client) return;
+    // RFI/submittal mail has its own tracking (logged artifacts + the RFI/Submittal
+    // Tracker), so it must never land on the response watchlist — even from a client.
+    if (isRfiOrSubmittalEmail()) return;
 
     const token = await getToken();
     const html  = await getEmailBodyHtml(token);
