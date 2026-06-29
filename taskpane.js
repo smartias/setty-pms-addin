@@ -265,7 +265,7 @@ function setupEventListeners() {
   // URL/permissions logic stays in one place (openSelectedProjectInPms).
   const spHintLink = document.getElementById("spFolderHintLink");
   if (spHintLink) spHintLink.onclick = (e) => { e.preventDefault(); openSelectedProjectInPms(); };
-  document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
+  document.getElementById("logNoteBtn").onclick    = () => { resetNoteView(); showView("noteView"); };
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -7363,6 +7363,22 @@ async function doSaveNote() {
   } finally {
     saveInFlight = false;
   }
+}
+
+// Clear the note view's transient save state every time it's opened. Without
+// this, the "✓ Note saved" status, the 📓 OneNote link, and the disabled Save
+// button all survive from the previous project — so opening the note view for a
+// new project shows it as already-saved, with a link pointing at the old note.
+// (The sibling RFI/Sub/Action forms avoid this via their own prefill* resets.)
+// The note BODY is intentionally left untouched: it's seeded by loadItemContext
+// from the open email/appointment, and clearing it would wipe text the user may
+// have typed before navigating away.
+function resetNoteView() {
+  setStatus("noteStatus", "", "");
+  const linkEl = document.getElementById("noteOneNoteLink");
+  if (linkEl) linkEl.innerHTML = "";
+  const saveNoteBtn = document.getElementById("saveNoteBtn");
+  if (saveNoteBtn) saveNoteBtn.disabled = false;
 }
 
 function prefillActionItem() {
