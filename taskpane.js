@@ -1402,8 +1402,20 @@ let _customSpFolderName = "";
 // rename UI is an inline input that appears inside the pane.
 let _renamingSpFolder = false;
 
+// Resolve the current item's subject to a plain STRING. In compose-mode
+// appointments (the organizer editing their own meeting) item.subject is an
+// async Subject object, not a string — calling string methods on it throws
+// "…replace is not a function". loadItemContext resolves the value into the
+// #emailSubject element via getAsync, so read that as the source of truth and
+// only trust item.subject directly when it's already a string.
+function getResolvedItemSubject() {
+  if (typeof emailItem?.subject === "string") return emailItem.subject;
+  const el = document.getElementById("emailSubject")?.textContent || "";
+  return (el && el !== "(Loading…)" && el !== "(No subject)") ? el : "";
+}
+
 function _getDefaultSpFolderSubject() {
-  return (emailItem?.subject || "No Subject")
+  return (getResolvedItemSubject() || "No Subject")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -6530,7 +6542,9 @@ if (existingRecord) {
   // date, sender, or attachments into the current project's folder. The
   // generation counter alone can't protect later sync reads of `emailItem.*`.
   const snapItem = emailItem;
-  const snapSubject = snapItem?.subject || "";
+  // Guard against compose-mode appointments where subject is an async object,
+  // not a string — a raw object here would blow up the later safeSubject.replace().
+  const snapSubject = (typeof snapItem?.subject === "string") ? snapItem.subject : getResolvedItemSubject();
   const snapDate = await getEmailDateReliable();
   const snapFromName = snapItem?.from?.displayName || "";
   const snapFromAddr = snapItem?.from?.emailAddress || "";
@@ -7395,6 +7409,11 @@ function prefillActionItem() {
     ownerSelect.value = defaultOwner;
   }
   if (dueDate) dueDate.value = addBizDays(new Date(), 5);
+  // Re-enable the Save button on every entry. doSaveActionItem disables it on
+  // save and only re-enables on error, so without this a second action item
+  // (re-entered via "New action item") would hit a dead button.
+  const saveBtn = document.getElementById("saveActionItemBtn");
+  if (saveBtn) saveBtn.disabled = false;
   setStatus("actionItemStatus", "", "");
 }
 
@@ -7448,6 +7467,12 @@ async function doSaveActionItem() {
     document.getElementById("actionItemBody").value = "";
     document.getElementById("actionItemOwner").value = "";
     document.getElementById("actionItemDueDate").value = "";
+    // Mirror the note-save flow: after a successful save, return the user to
+    // the main view (where the open-action-item chips now reflect the new
+    // item) instead of stranding them on the entry form. Brief delay so the
+    // success status flashes as confirmation before the view changes.
+    refreshOpenActionItemChips();
+    setTimeout(() => showView("mainView"), 700);
   } catch (e) {
     setStatus("actionItemStatus", "error", "✗ " + humanizeError(e));
     if (saveBtn) saveBtn.disabled = false;
