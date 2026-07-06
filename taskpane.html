@@ -1065,6 +1065,12 @@
     <option value="Internal">Internal</option>
     <option value="General">General</option>
   </select>
+  <!-- Site Visit only: record which staff attended. Shown/hidden by
+       toggleSiteVisitStaffField() based on the category above. -->
+  <div id="siteVisitStaffRow" style="display:none">
+    <label>Staff on site visit</label>
+    <input type="text" id="siteVisitStaff" placeholder="Who attended, e.g. Sara Arias, Danny Kang" />
+  </div>
   <label>Note Body</label>
   <textarea id="noteBody" rows="4" placeholder="Summary, decisions, action items…"></textarea>
   <div id="noteStatus" class="status-msg"></div>
@@ -1327,6 +1333,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-07-06-action-item-autoreturn"></script>
+<script src="taskpane.js?v=2026-07-06-site-visit-staff"></script>
 </body>
 </html>

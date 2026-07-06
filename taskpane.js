@@ -266,6 +266,8 @@ function setupEventListeners() {
   const spHintLink = document.getElementById("spFolderHintLink");
   if (spHintLink) spHintLink.onclick = (e) => { e.preventDefault(); openSelectedProjectInPms(); };
   document.getElementById("logNoteBtn").onclick    = () => { resetNoteView(); showView("noteView"); };
+  // Show the "Staff on site visit" field only when the Site Visit category is picked.
+  document.getElementById("noteCategory").onchange = toggleSiteVisitStaffField;
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -6931,7 +6933,7 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
   return ""
     + "<div style='max-width:7.5in;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:" + TEXT_DARK + ";line-height:1.5'>"
     + projSubtitle
-    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>Meeting Minutes</h1>"
+    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>" + (category === "Site Visit" ? "Site Visit" : "Meeting Minutes") + "</h1>"
     + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
     // Bordered box for meeting details — same visual treatment as the PMS
     // importer. No Notes label / no grey side panel; just a clean polished
@@ -7261,11 +7263,21 @@ async function doSaveNote() {
   if (!selectedProject) { setStatus("noteStatus", "error", "No project selected."); return; }
   if (saveInFlight) { setStatus("noteStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const category = document.getElementById("noteCategory").value;
-  const body = document.getElementById("noteBody").value.trim();
+  let body = document.getElementById("noteBody").value.trim();
   const isMeeting = isMeetingNoteCategory(category);
-  // Meeting categories require a typed note body — that's the meeting minutes.
-  // Non-meeting categories use the email body as the OneNote content, so a
-  // typed note becomes optional context above the email body.
+  // Site Visit: fold the "staff on site" field into the top of the body so it
+  // is recorded on the PMS note AND rendered on the OneNote page (which draws
+  // its content from the body). Only read the field for the Site Visit
+  // category so a stale value can't leak onto other note types.
+  const siteVisitStaff = category === "Site Visit"
+    ? (document.getElementById("siteVisitStaff")?.value || "").trim()
+    : "";
+  if (siteVisitStaff) {
+    body = "Staff on site: " + siteVisitStaff + (body ? "\n\n" + body : "");
+  }
+  // Meeting categories require content — either typed minutes or, for a site
+  // visit, the recorded staff. Non-meeting categories use the email body as
+  // the OneNote content, so a typed note is optional context above it.
   if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
   // Snapshot per-item identity SYNCHRONOUSLY before any await. If the user
@@ -7387,12 +7399,24 @@ async function doSaveNote() {
 // The note BODY is intentionally left untouched: it's seeded by loadItemContext
 // from the open email/appointment, and clearing it would wipe text the user may
 // have typed before navigating away.
+// Reveal the "Staff on site visit" field only for the Site Visit category.
+// Called on note-view open and whenever the category dropdown changes.
+function toggleSiteVisitStaffField() {
+  const row = document.getElementById("siteVisitStaffRow");
+  if (!row) return;
+  const cat = document.getElementById("noteCategory")?.value;
+  row.style.display = cat === "Site Visit" ? "" : "none";
+}
+
 function resetNoteView() {
   setStatus("noteStatus", "", "");
   const linkEl = document.getElementById("noteOneNoteLink");
   if (linkEl) linkEl.innerHTML = "";
   const saveNoteBtn = document.getElementById("saveNoteBtn");
   if (saveNoteBtn) saveNoteBtn.disabled = false;
+  const staff = document.getElementById("siteVisitStaff");
+  if (staff) staff.value = "";
+  toggleSiteVisitStaffField();
 }
 
 function prefillActionItem() {
