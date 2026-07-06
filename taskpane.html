@@ -623,6 +623,8 @@
       line-height: 1;
       padding: 0 2px;
     }
+    /* Spin the ↻ glyph while a refresh is in flight. */
+    .watchlist-refresh.spinning { display: inline-block; animation: spin 0.8s linear infinite; }
     .wl-item {
       display: flex;
       align-items: flex-start;
@@ -888,7 +890,10 @@
   </div>
 
   <div class="project-search-wrapper" id="projectSearchWrapper">
-    <label>Project</label>
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <label>Project</label>
+      <button type="button" id="refreshProjectsBtn" class="watchlist-refresh" title="Refresh projects & schedules from PMS (no need to reload the pane)">↻</button>
+    </div>
     <input type="text" id="projectSearch" placeholder="Search by name or number…" autocomplete="off"/>
     <div id="projectDropdown"></div>
   </div>
@@ -1333,6 +1338,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-07-06-site-visit-staff"></script>
+<script src="taskpane.js?v=2026-07-06-project-refresh"></script>
 </body>
 </html>

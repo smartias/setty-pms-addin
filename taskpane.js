@@ -268,6 +268,9 @@ function setupEventListeners() {
   document.getElementById("logNoteBtn").onclick    = () => { resetNoteView(); showView("noteView"); };
   // Show the "Staff on site visit" field only when the Site Visit category is picked.
   document.getElementById("noteCategory").onchange = toggleSiteVisitStaffField;
+  // Manual "pull latest from PMS" — new projects / schedule edits made elsewhere
+  // don't appear mid-session otherwise (project data is loaded once at open).
+  document.getElementById("refreshProjectsBtn").onclick = () => refreshProjectData();
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -439,6 +442,9 @@ function loadItemContext() {
     emailItem = null;
     return;
   }
+  // Leaving the pane pinned all day? Quietly pull the latest projects/schedules
+  // on email switch (throttled) so the data doesn't silently go stale.
+  maybeAutoRefreshProjects();
   // Bump the generation. All async work below captures `myGen` at start and
   // bails out before writing module state if the generation has advanced
   // (= user clicked a different email mid-fetch).
@@ -1979,6 +1985,57 @@ async function loadProjects() {
     console.error("Failed to load projects:", e);
   }
 }
+
+// Project data is loaded once when the pane opens (onSignedIn → loadProjects).
+// While the pane stays open — pinned across emails — new projects or schedule
+// edits made in PMS (or by teammates) never appear until a full reload. These
+// two hooks fix that without a reload:
+//   • the ↻ button calls refreshProjectData() explicitly, and
+//   • loadItemContext() calls maybeAutoRefreshProjects() on each email switch,
+//     throttled so rapid switching can't hammer the DB.
+// Seeded to "now" at module load so the initial onSignedIn fetch counts as the
+// baseline and the first few email switches don't trigger a redundant re-fetch.
+let _lastProjectsRefreshAt = Date.now();
+let _projectRefreshInFlight = false;
+const PROJECTS_AUTO_REFRESH_MS = 3 * 60 * 1000; // silent re-fetch at most once per 3 min
+
+async function refreshProjectData({ silent = false } = {}) {
+  if (_projectRefreshInFlight) return;
+  _projectRefreshInFlight = true;
+  const btn = document.getElementById("refreshProjectsBtn");
+  if (btn) btn.classList.add("spinning");
+  if (!silent) setStatus("actionStatus", "info", "⏳ Refreshing from PMS…");
+  try {
+    await loadProjects();               // fresh Supabase fetch; overwrites allProjects + cache
+    _lastProjectsRefreshAt = Date.now();
+    // Re-point the current selection at the freshly-fetched object so the
+    // jobcard, schedule and directory reflect the latest data. Don't re-persist
+    // the mapping (second arg false) — we're refreshing data, not re-tagging.
+    if (selectedProject) {
+      const fresh = getProjectById(selectedProject.id);
+      if (fresh) setSelectedProject(fresh, false);
+    } else {
+      await restoreProjectSelectionForCurrentEmail();
+    }
+    updateProjectQuickLinks();
+    try { updatePeopleButtonBadge(); } catch {}
+    if (!silent) setStatus("actionStatus", "success", "✓ Updated from PMS");
+  } catch (e) {
+    if (!silent) setStatus("actionStatus", "error", "✗ Refresh failed: " + humanizeError(e));
+  } finally {
+    _projectRefreshInFlight = false;
+    if (btn) btn.classList.remove("spinning");
+  }
+}
+
+// Fire a silent refresh on email switch, but only if it's been a while — keeps
+// the pane current for someone who leaves it pinned all day without adding a
+// network round-trip to every single email they open.
+function maybeAutoRefreshProjects() {
+  if (Date.now() - _lastProjectsRefreshAt < PROJECTS_AUTO_REFRESH_MS) return;
+  refreshProjectData({ silent: true });
+}
+
 async function saveToSupabase(updatedProjects) {
   await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
     method: "PATCH",
