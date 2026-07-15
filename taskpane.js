@@ -730,9 +730,16 @@ function getCurrentSharedMessageId() {
 async function getCurrentConversationId() {
   if (currentConversationId) return currentConversationId;
   try {
+    // Stale-result guard: loadItemContext resets currentConversationId on item
+    // switch, but a fetch started for the PREVIOUS item can resolve after that
+    // reset and stamp the old thread's id onto the new item's context. A tag
+    // written against that id lands in pms_email_thread_tags under the WRONG
+    // conversation — and that table drives auto-tagging for the whole firm.
+    const myGen = itemContextGeneration;
     const restId = getCurrentMessageRestId();
     if (!restId) return "";
     const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=conversationId", null);
+    if (myGen !== itemContextGeneration) return ""; // user moved on — don't stamp
     currentConversationId = data?.conversationId || "";
     return currentConversationId;
   } catch {
@@ -756,8 +763,12 @@ async function getCurrentSharedKey() {
     // iCalUId not yet loaded — fetch synchronously now
     if (emailItem?.itemId) {
       try {
+        // Same stale-result guard as getCurrentConversationId: never stamp a
+        // previous item's iCalUId onto the current context after an item switch.
+        const myGen = itemContextGeneration;
         const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
         const ev = await graphFetch("GET", "/me/events/" + restId + "?$select=iCalUId", null);
+        if (myGen !== itemContextGeneration) return ""; // user moved on — don't stamp
         currentItemICalUId = ev?.iCalUId || "";
         return currentItemICalUId;
       } catch {
@@ -2971,6 +2982,13 @@ function refreshCalendarStatus() {
   }
 }
 async function restoreProjectSelectionForCurrentEmail() {
+  // Stale-restore guard: this function awaits Graph + Supabase, and its result
+  // APPLIES a selection (which auto-files the open email via setSelectedProject
+  // → autoSaveEmailToRecord). If the user has arrowed to a different email while
+  // we were fetching, applying the old email's project would silently file the
+  // NEW email into the OLD email's project. Capture the generation and bail
+  // after every await — the new item runs its own restore.
+  const myGen = itemContextGeneration;
   const msgId = getCurrentMessageRestId();
   if (!allProjects.length) return;
   let projectId = "";
@@ -2985,12 +3003,14 @@ async function restoreProjectSelectionForCurrentEmail() {
     // Use shared key — iCalUId for appointments, conversationId for emails.
     // Awaits the iCalUId Graph fetch internally for appointments.
     const sharedKey = await getCurrentSharedKey();
+    if (myGen !== itemContextGeneration) return; // user moved on
     if (sharedKey) {
       const convoMap = getConversationProjectMap();
       projectId = convoMap[sharedKey] || "";
       if (projectId) restoredVia = "localStorage-sharedKey";
       if (!projectId) {
         const tag = await getSharedConversationTag(sharedKey);
+        if (myGen !== itemContextGeneration) return; // user moved on
         projectId = tag?.project_id || "";
         if (projectId) {
           restoredVia = "cloud-sharedKey";
@@ -3034,6 +3054,7 @@ async function restoreProjectSelectionForCurrentEmail() {
             localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
           }
           const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
+          if (myGen !== itemContextGeneration) return; // user moved on — don't tag the wrong thread
           if (sharedKey) {
             const convoMap = getConversationProjectMap();
             convoMap[sharedKey] = projectId;
@@ -3047,6 +3068,10 @@ async function restoreProjectSelectionForCurrentEmail() {
     }
   }
 
+  // Final stale check before APPLYING anything to the UI/selection. This is
+  // the line that matters most: setSelectedProject auto-files the currently
+  // open email, so a stale application = wrong-project filing.
+  if (myGen !== itemContextGeneration) return;
   if (!projectId) {
     // No tag exists for this thread — surface ranked suggestions instead so
     // users don't always have to type/search. The chip area is hidden by
@@ -4981,31 +5006,67 @@ async function getEmailBodyHtml(token) {
 // parts) and the PMS log needs them as data: URIs — both start from this fetch.
 // Everything here is best-effort: on any failure callers keep the original body.
 const _inlineImgCache = new Map(); // itemId -> Map<cidLower, {contentType, bytes}>
+
+// List an item's attachments WITHOUT payloads, then fetch bytes for just the
+// inline images. The naive `GET /attachments` returns contentBytes — the full
+// base64 of EVERY attachment, including the 20MB PDFs that get uploaded
+// separately — which was the main cause of slow SharePoint saves ("download
+// everything twice"). $select here uses base-attachment properties only;
+// contentId lives on the fileAttachment derived type and can't be reliably
+// $selected on the base collection, so it comes back with the per-attachment
+// GET below (small: inline images only).
+const ATT_LIST_SELECT = "?$select=id,name,contentType,size,isInline";
+const INLINE_FETCH_CONCURRENCY = 4;
+// candidates: [{id}] from the listing. fetchOne(attId) -> full fileAttachment
+// (contentBytes + contentId) or null. Returns cid->{contentType,bytes} map.
+async function _fetchInlineImageMap(candidates, fetchOne, valueUrlFor, token) {
+  const map = new Map();
+  for (let i = 0; i < candidates.length; i += INLINE_FETCH_CONCURRENCY) {
+    const batch = candidates.slice(i, i + INLINE_FETCH_CONCURRENCY);
+    await Promise.all(batch.map(async (c) => {
+      try {
+        const att = await fetchOne(c.id);
+        if (!att) return;
+        const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
+        if (!cid) return;
+        let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
+        if (!bytes) {
+          const r = await fetchWithRetry(valueUrlFor(c.id),
+            { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img $value" });
+          if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
+        }
+        if (bytes) map.set(cid, { contentType: att.contentType, bytes });
+      } catch (e) { console.warn("[inline-img] single fetch failed:", e.message); }
+    }));
+  }
+  return map;
+}
+
 async function getInlineImagesForEmail(token) {
   const item = Office.context.mailbox.item;
   const itemId = item?.itemId;
   if (itemId && _inlineImgCache.has(itemId)) return _inlineImgCache.get(itemId);
-  const map = new Map();
   try {
     const restId = Office.context.mailbox.convertToRestId(itemId, Office.MailboxEnums.RestVersion.v2_0);
-    const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments", null, token);
-    for (const att of (attData?.value || [])) {
-      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
-      if (!att.isInline || !(att.contentType || "").startsWith("image/")) continue;
-      const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
-      if (!cid) continue;
-      let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
-      if (!bytes && att.id) {
-        const r = await fetchWithRetry(
-          "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + att.id + "/$value",
-          { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img" });
-        if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
-      }
-      if (bytes) map.set(cid, { contentType: att.contentType, bytes });
-    }
-  } catch (e) { console.warn("[inline-img] fetch failed:", e.message); }
-  if (itemId) _inlineImgCache.set(itemId, map);
-  return map;
+    const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments" + ATT_LIST_SELECT, null, token);
+    const candidates = (attData?.value || []).filter(att =>
+      att["@odata.type"] === "#microsoft.graph.fileAttachment" &&
+      att.isInline && (att.contentType || "").startsWith("image/"));
+    const map = await _fetchInlineImageMap(
+      candidates,
+      (attId) => graphFetch("GET", "/me/messages/" + restId + "/attachments/" + attId, null, token),
+      (attId) => "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + attId + "/$value",
+      token
+    );
+    // Cache ONLY on a successful listing. Caching the empty map from a
+    // transient failure used to strip inline images from every subsequent
+    // save of this email for the rest of the session.
+    if (itemId) _inlineImgCache.set(itemId, map);
+    return map;
+  } catch (e) {
+    console.warn("[inline-img] fetch failed:", e.message);
+    return new Map();
+  }
 }
 
 // Best-effort raster downscale to keep the email log light + fit OneNote's 4MB
@@ -5093,26 +5154,24 @@ async function embedInlineImagesAsDataUris(html, token) {
 // so this stays clear of the write-contention path the defer fix solved.
 const INLINE_IMG_MIN_BYTES = 10000;
 async function getInlineImagesForMessageId(base, gid, token) {
-  const map = new Map();
   try {
-    const attData = await graphFetch("GET", base + "/messages/" + gid + "/attachments", null, token);
-    for (const att of (attData?.value || [])) {
-      if (att["@odata.type"] !== "#microsoft.graph.fileAttachment") continue;
-      if (!att.isInline || !(att.contentType || "").startsWith("image/")) continue;
-      if ((att.size || 0) <= INLINE_IMG_MIN_BYTES) continue;   // skip tiny logos
-      const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
-      if (!cid) continue;
-      let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
-      if (!bytes && att.id) {
-        const r = await fetchWithRetry(
-          "https://graph.microsoft.com/v1.0" + base + "/messages/" + gid + "/attachments/" + att.id + "/$value",
-          { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img (sweep)" });
-        if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
-      }
-      if (bytes) map.set(cid, { contentType: att.contentType, bytes });
-    }
-  } catch (e) { console.warn("[inline-img sweep] fetch failed:", e.message); }
-  return map;
+    // Same $select strategy as getInlineImagesForEmail — never pull every
+    // attachment's contentBytes just to find the inline photos.
+    const attData = await graphFetch("GET", base + "/messages/" + gid + "/attachments" + ATT_LIST_SELECT, null, token);
+    const candidates = (attData?.value || []).filter(att =>
+      att["@odata.type"] === "#microsoft.graph.fileAttachment" &&
+      att.isInline && (att.contentType || "").startsWith("image/") &&
+      (att.size || 0) > INLINE_IMG_MIN_BYTES);   // skip tiny logos
+    return await _fetchInlineImageMap(
+      candidates,
+      (attId) => graphFetch("GET", base + "/messages/" + gid + "/attachments/" + attId, null, token),
+      (attId) => "https://graph.microsoft.com/v1.0" + base + "/messages/" + gid + "/attachments/" + attId + "/$value",
+      token
+    );
+  } catch (e) {
+    console.warn("[inline-img sweep] fetch failed:", e.message);
+    return new Map();
+  }
 }
 
 // Embed a pre-fetched cid->bytes map into HTML as downscaled data: URIs. Same
@@ -7108,7 +7167,7 @@ async function sendToTeamsChannel() {
   }
   setStatus("actionStatus", "info", "⏳ Posting to Teams channel…");
   try {
-    const subject = emailItem.subject || "(no subject)";
+    const subject = getResolvedItemSubject() || "(no subject)";
     const fromName  = emailItem.from?.displayName  || "";
     const fromEmail = emailItem.from?.emailAddress || "";
     const fromStr   = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
@@ -7481,7 +7540,9 @@ function prefillActionItem() {
   const ownerSelect = document.getElementById("actionItemOwner");
   const dueDate = document.getElementById("actionItemDueDate");
   const teamMembers = getProjectTeamMembers(selectedProject);
-  if (body) body.value = (emailItem?.subject || "").trim();
+  // getResolvedItemSubject: compose-mode appointments expose subject as an
+  // async object — a raw .trim() on it throws.
+  if (body) body.value = getResolvedItemSubject().trim();
   if (ownerSelect) {
     refreshActionItemOwnerOptions();
     const defaultOwner = [msalAccount?.name, msalAccount?.username, emailFrom]
@@ -8499,7 +8560,9 @@ function defaultAssigneeToPm(selectId) {
 }
 
 function prefillRfi() {
-  document.getElementById("rfiTitle").value = emailItem?.subject || "";
+  // getResolvedItemSubject guards against the compose-mode async Subject object
+  // (a raw emailItem.subject here saved "[object Object]" as the RFI title).
+  document.getElementById("rfiTitle").value = getResolvedItemSubject();
   document.getElementById("rfiNumber").value = nextAutoRfiNumber();
   document.getElementById("rfiDescription").value = "";
   document.getElementById("rfiNotes").value = "";
@@ -8680,7 +8743,13 @@ async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath,
   const datePart = dateObj.getFullYear() + "-" +
                    String(dateObj.getMonth() + 1).padStart(2, "0") + "-" +
                    String(dateObj.getDate()).padStart(2, "0");
-  const subject = (snapItem?.subject || "Email")
+  // snapItem.subject can be an async Subject object on compose-mode
+  // appointments — an unguarded .replace() here crashed mid-RFI-filing AFTER
+  // the folder tree was created. Fall back to the resolved live subject.
+  const rawSubject = (typeof snapItem?.subject === "string")
+    ? snapItem.subject
+    : getResolvedItemSubject();
+  const subject = (rawSubject || "Email")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -9048,7 +9117,8 @@ function nextAutoSubNumber() {
 }
 
 function prefillSub() {
-  document.getElementById("subDesc").value = emailItem?.subject || "";
+  // Same compose-mode guard as prefillRfi.
+  document.getElementById("subDesc").value = getResolvedItemSubject();
   document.getElementById("subNumber").value = nextAutoSubNumber();
   document.getElementById("subFullDescription").value = "";
   document.getElementById("subNotes").value = "";
@@ -9805,7 +9875,7 @@ async function showDatesView() {
 }
 function prefillMilestone(iso) {
   document.getElementById("milestoneDate").value = iso;
-  document.getElementById("milestoneName").value = (emailItem?.subject || "").slice(0, 80);
+  document.getElementById("milestoneName").value = getResolvedItemSubject().slice(0, 80);
   document.getElementById("milestoneStatus").className = "status-msg";
   document.getElementById("milestoneStatus").textContent = "";
   const form = document.getElementById("milestoneForm");
@@ -9935,7 +10005,7 @@ async function doSaveMilestone() {
       dueDate,
       pctComplete: 0,
       fee:         0,
-      notes:       "From email: " + (emailItem?.subject || ""),
+      notes:       "From email: " + getResolvedItemSubject(),
       cancelled:   false,
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
       ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
