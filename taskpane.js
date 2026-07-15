@@ -3431,8 +3431,11 @@ async function sweepLoadFiledIds() {
   try {
     const PAGE = 1000;
     for (let offset = 0; offset < 500000; offset += PAGE) {
+      // order= gives Postgres a stable row order across pages. Without it,
+      // page boundaries can shift under concurrent inserts (the sweep itself
+      // inserts rows) and msg_ids silently fall between pages → dedup misses.
       const res = await fetchWithRetry(
-        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&limit=" + PAGE + "&offset=" + offset,
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
         { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
       if (!res.ok) break;
       const rows = await res.json();
@@ -3452,8 +3455,9 @@ async function sweepLoadConvoProjectMap() {
     const byConv = new Map();
     const PAGE = 1000;                          // page past the 1000-row PostgREST cap
     for (let offset = 0; offset < 500000; offset += PAGE) {
+      // Same stable-order rule as sweepLoadFiledIds.
       const res = await fetchWithRetry(
-        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&limit=" + PAGE + "&offset=" + offset,
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
         { headers: SB_HEADERS }, { label: "sb sweep convo map" });
       if (!res.ok) break;
       const rows = await res.json();
@@ -3592,6 +3596,12 @@ async function sweepRecentMail() {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
     if (btn) btn.disabled = false;
+    // Preview is stateless: it advanced the shared cursor without filing
+    // anything, so a leftover "Load more" would resume PAST the previewed
+    // pages and their unfiled matches would be silently skipped. Reset the
+    // cursor so the next Run & file starts from the top.
+    _sweepCursor = null;
+    updateSweepMoreBtn();
   }
 }
 
@@ -3695,6 +3705,12 @@ let _sweepAutoStop = false;
 // array → row-lock pile-up that wedged the DB on big backfills (2026-06-24). null =
 // sync inline immediately (single Run & file / review-confirm — one batch, no churn).
 let _sweepInlineQueue = null;
+// Dedup datasets (filed msg_ids, thread→project map, sender signal), loaded ONCE
+// per run instead of at the start of every batch. The per-batch reload was both
+// slow (each set is N/1000 sequential paged requests — hundreds of round trips
+// on a deep Run-to-end) and racy (the sweep's own inserts shift page boundaries
+// mid-run). sweepFileItems keeps the in-memory sets current as it files.
+let _sweepDedup = null;
 
 // Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
 // run from the chosen mailbox; reset=false continues the saved cursor (Load more).
@@ -3706,6 +3722,13 @@ async function sweepResolveScan(reset) {
     _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
     _sweepConvoSeen = new Map();
     _sweepProjectFilter = sweepResolveProjectFilter(); // null = whole mailbox; else {id,label}
+    _sweepDedup = null; // fresh run → fresh dedup snapshot
+  }
+  if (!_sweepDedup) {
+    const [filed, senderMap, convoMap] = await Promise.all([
+      sweepLoadFiledIds(), sweepLoadSenderMap(), sweepLoadConvoProjectMap(),
+    ]);
+    _sweepDedup = { filed, senderMap, convoMap };
   }
   // Refresh the token at the start of EVERY batch (incl. Load more) so a long
   // backfill never carries a stale token into graphFetch's 401 path — which would
@@ -3725,9 +3748,9 @@ async function sweepResolveScan(reset) {
 // mailbox is exhausted, or the per-batch page cap is hit. Scans ALL folders
 // (incl. Sent): no Focused filter, since a backfill wants the whole mailbox.
 async function sweepScanBatch({ base, token, cursor }) {
-  const filed = await sweepLoadFiledIds();
-  const senderMap = await sweepLoadSenderMap();
-  const convoMap = await sweepLoadConvoProjectMap();
+  // Run-scoped dedup snapshot — loaded once in sweepResolveScan, kept current
+  // by sweepFileItems as emails file. (Was reloaded here every batch.)
+  const { filed, senderMap, convoMap } = _sweepDedup || { filed: new Set(), senderMap: new Map(), convoMap: new Map() };
   const filterId = _sweepProjectFilter?.id || null; // scoped run → only file/queue this one job
   const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
   // First page builds the query; later pages follow the (base-stripped) nextLink.
@@ -3741,7 +3764,12 @@ async function sweepScanBatch({ base, token, cursor }) {
       const sender = m.from?.emailAddress?.address || "";
       if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
       const mid = m.internetMessageId || "";
-      if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
+      // No internetMessageId = a draft (the sweep walks ALL folders). These
+      // could never be filed properly: saveProjectEmailRow no-ops without a
+      // msgId, yet the item was still counted "filed" and re-appended a slim
+      // inline rec to the project row on EVERY run (unbounded drift). Skip.
+      if (!mid) { out.skip++; continue; }
+      if (filed.has(mid)) { out.alreadyFiled++; continue; }
       const item = {
         gid: m.id, convId: m.conversationId || "", msgId: mid,
         subject: m.subject || "(no subject)",
@@ -3810,22 +3838,34 @@ function stripHtmlToText(html) {
 
 // File sweep items to item.projectId: writes the search-index row (with stripped
 // body_text) and dual-writes project.emails[] grouped per project. {filed, failed}.
-async function sweepFileItems(items) {
+async function sweepFileItems(items, opts = {}) {
   if (!items.length) return { filed: 0, failed: 0 };
-  // Read bodies from whatever mailbox this batch was scanned from — a colleague's
-  // shared mailbox needs its Mail.Read.Shared token + /users/{addr} message path.
-  // Acquire fresh (silent, cached) so a later review-confirm can't fail on a stale
-  // token routing through graphFetch's own-mailbox 401 fallback.
-  const token = _sweepSource?.shared ? await getSharedMailToken() : await getToken();
-  const base = _sweepSource?.base || "/me";
+  // Read bodies from whatever mailbox each item was SCANNED from (it._src,
+  // snapshotted by sweepRunAndFile) — not whatever the mailbox box says now.
+  // Review items can be confirmed long after the run, after the user has
+  // changed the box; filing them against the current source 404'd the body
+  // fetch and silently saved empty-body records. Tokens are acquired lazily
+  // per scope (own vs shared) and cached for the call.
+  let _ownTok = null, _sharedTok = null;
+  const tokenFor = async (shared) => shared
+    ? (_sharedTok || (_sharedTok = await getSharedMailToken()))
+    : (_ownTok || (_ownTok = await getToken()));
   const byProject = new Map();
   let filed = 0, failed = 0;
   let done = 0;
   for (const it of items) {
+    // Honor Stop mid-filing (opts.honorStop — set by the run flows, NOT by
+    // review-confirm, where a stale flag from a previously stopped run would
+    // abort a single-item file). Unfiled remainder is safe: dedup lets the
+    // next full run pick these emails up again.
+    if (opts.honorStop && _sweepAutoStop) break;
     done++;
     const _fe = document.getElementById("sweepStatus");
     if (_fe) _fe.textContent = "⏳ Filing email " + done + " of " + items.length + "… (" + filed + " saved)";
     try {
+      const src = it._src || _sweepSource || { base: "/me", shared: false };
+      const base = src.base || "/me";
+      const token = await tokenFor(!!src.shared);
       let bodyHtml = "";
       try {
         const d = await graphFetch("GET", base + "/messages/" + it.gid + "?$select=body", null, token);
@@ -3857,6 +3897,17 @@ async function sweepFileItems(items) {
       const slim = { ...rec }; delete slim.bodyHtmlCompressed; delete slim.bodyText;
       byProject.get(it.projectId).push(slim);
       filed++;
+      // Keep the run-scoped dedup snapshot current (it's no longer reloaded per
+      // batch): mark the msg filed, and keep the thread map honest — filing the
+      // same thread to a SECOND project makes it ambiguous, so drop it.
+      if (_sweepDedup) {
+        if (it.msgId) _sweepDedup.filed.add(it.msgId);
+        if (it.convId) {
+          const existing = _sweepDedup.convoMap.get(it.convId);
+          if (existing && existing !== it.projectId) _sweepDedup.convoMap.delete(it.convId);
+          else _sweepDedup.convoMap.set(it.convId, it.projectId);
+        }
+      }
     } catch (e) {
       console.warn("sweep file failed:", e);
       failed++;
@@ -3920,8 +3971,12 @@ async function sweepRunAndFile(reset = true) {
   try {
     if (reset) _sweepReview = [];
     const r = await sweepResolveScan(reset);
-    for (const it of r.file) it.projectId = it.project.id;
-    const { filed, failed } = await sweepFileItems(r.file);
+    // Snapshot the scan source onto every item — review items can be confirmed
+    // after the mailbox box changes, and must file from where they were found.
+    const src = { base: _sweepSource.base, shared: _sweepSource.shared };
+    for (const it of r.file)   { it.projectId = it.project.id; it._src = src; }
+    for (const it of r.review) { it._src = src; }
+    const { filed, failed } = await sweepFileItems(r.file, { honorStop: true });
     _sweepTotals.filed += filed;
     _sweepReview.push(...r.review);
     const pending = _sweepReview.filter((e) => !e._done && !(e._filedTo && e._filedTo.length)).length;
@@ -3968,6 +4023,7 @@ function sweepClearResults() {
   _sweepCursor = null;
   _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
   _sweepConvoSeen = new Map();
+  _sweepDedup = null; // next run reloads a fresh dedup snapshot
   const results = document.getElementById("sweepResults");
   if (results) results.innerHTML = "";
   const status = document.getElementById("sweepStatus");
@@ -4110,7 +4166,15 @@ async function sweepConfirmReview(i, ci) {
   if (e._filedTo.some((f) => f.id === proj.id)) return; // don't double-file the same job
   e._done = "filing";
   renderSweepReviewQueue();
-  const { filed } = await sweepFileItems([{ ...e, projectId: proj.id }]);
+  // try/catch so a thrown error (e.g. token acquisition popup blocked) can't
+  // leave the row stuck on "⏳ filing…" forever — the _done guard above would
+  // then block every retry click until the pane reloads.
+  let filed = 0;
+  try {
+    ({ filed } = await sweepFileItems([{ ...e, projectId: proj.id }]));
+  } catch (err) {
+    console.warn("review confirm failed:", err);
+  }
   e._done = null;
   if (filed) {
     e._filedTo.push({ id: proj.id, name: (proj.name || proj.projectNumber || "project") });
