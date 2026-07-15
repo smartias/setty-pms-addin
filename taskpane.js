@@ -103,7 +103,15 @@ Office.onReady(async (info) => {
       Office.EventType.ItemChanged,
       // ItemChanged only ever fires while the pane is pinned, so the first one
       // we receive doubles as proof the user found the pin — hide the hint.
-      () => { markPanePinned(); showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
+      // Signed-out guard: without it, a pinned-but-signed-out user landed on a
+      // non-functional main view with no sign-in button.
+      () => {
+        markPanePinned();
+        applyComposeModeUiGuard();
+        if (!msalAccount) { showView("signInView"); return; }
+        showView("mainView");
+        loadItemContext();
+      }
     );
     loadItemContext();
   } catch (e) {
@@ -356,9 +364,9 @@ function setupEventListeners() {
       ).slice(0, 10);
       if (!matches.length) { dropdown.style.display = "none"; return; }
       dropdown.innerHTML = matches.map(p => `
-        <div class="proj-option" data-id="${p.id}">
-          <div class="proj-num">${p.projectNumber || ""}</div>
-          <div class="proj-name">${p.name || ""}</div>
+        <div class="proj-option" data-id="${escHtml(p.id)}">
+          <div class="proj-num">${escHtml(p.projectNumber || "")}</div>
+          <div class="proj-name">${escHtml(p.name || "")}</div>
         </div>
       `).join("");
       dropdown.style.display = "block";
@@ -1032,34 +1040,36 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
 // first so there's an id to cross-link.
 async function linkSelectedArtifactFromMain() {
   const sel = document.getElementById("linkToTarget");
-  const btn = document.getElementById("linkArtifactBtn");
   const linkValue = sel?.value || "";
   if (!selectedProject) { setStatus("actionStatus", "error", "Pick a project first."); return; }
   if (!linkValue) { setStatus("actionStatus", "info", "Choose an RFI or Submittal from the dropdown first."); return; }
-  if (btn) btn.disabled = true;
-  try {
-    await ensureInternetMessageId();
-    let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
-    if (!rec) {
-      await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
-      rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+  // withSaveGuard: this flow writes the project row (via the record save +
+  // linkEmailToArtifact) and used to bypass the process-wide save lock — a
+  // click during a slow auto-save raced the version counter and produced a
+  // phantom "Save conflict" for the user.
+  return withSaveGuard("link-artifact", async () => {
+    try {
+      await ensureInternetMessageId();
+      let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      if (!rec) {
+        await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
+        rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      }
+      if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
+      setStatus("actionStatus", "info", "⏳ Linking…");
+      const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
+      if (result.ok) {
+        setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
+        if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
+        try { refreshLinkToTargetDropdown(); } catch {}
+        try { refreshLoggedArtifactChips(); } catch {}
+      } else {
+        setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
+      }
+    } catch (e) {
+      setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     }
-    if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
-    setStatus("actionStatus", "info", "⏳ Linking…");
-    const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
-    if (result.ok) {
-      setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
-      if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
-      try { refreshLinkToTargetDropdown(); } catch {}
-      try { refreshLoggedArtifactChips(); } catch {}
-    } else {
-      setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
-    }
-  } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
-  } finally {
-    if (btn) btn.disabled = false;
-  }
+  }, ["linkArtifactBtn"]);
 }
 
 function refreshLinkToTargetDropdown() {
@@ -1658,6 +1668,21 @@ async function onSignedIn() {
   // Surface any saves that didn't complete on a previous session.
   try { showPendingFilingBanner(); } catch (e) { console.warn("[filing-queue] banner render failed:", e.message); }
 }
+// Only escalate a failed silent token acquisition to a popup when MSAL says
+// the user actually has to interact (expired session, consent needed). A bare
+// catch here used to popup on ANY silent failure — including transient network
+// errors — so background flows (auto-save, chip refreshes) could spawn an
+// unprompted MSAL popup with no user gesture, or fail cryptically when the
+// webview blocked it. Genuine interaction cases (first-time consent for the
+// Teams/shared-mail scopes, expired refresh token) still get the popup.
+function _msalNeedsInteraction(e) {
+  try {
+    if (typeof msal !== "undefined" && msal.InteractionRequiredAuthError &&
+        e instanceof msal.InteractionRequiredAuthError) return true;
+  } catch { /* msal global not exposed — fall through to code check */ }
+  const code = String(e?.errorCode || e?.code || "") + " " + String(e?.message || "");
+  return /interaction_required|consent_required|login_required|no_tokens_found|no_account_error/i.test(code);
+}
 async function getToken(forceRefresh = false) {
   const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
   if (!account) throw new Error("Not signed in");
@@ -1668,7 +1693,8 @@ async function getToken(forceRefresh = false) {
     // cache thinks are still valid.
     const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account, forceRefresh });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
     return r.accessToken;
   }
@@ -1683,7 +1709,8 @@ async function getChannelMessageToken() {
   try {
     const r = await msalApp.acquireTokenSilent({ scopes: CHANNEL_MESSAGE_SCOPES, account });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     // First call → consent popup. Subsequent silent calls succeed because
     // the consent is cached on the user's MSAL account.
     const r = await msalApp.acquireTokenPopup({ scopes: CHANNEL_MESSAGE_SCOPES, account });
@@ -1699,7 +1726,8 @@ async function getSharedMailToken() {
   try {
     const r = await msalApp.acquireTokenSilent({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     const r = await msalApp.acquireTokenPopup({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
   }
@@ -2089,6 +2117,16 @@ async function fetchFreshProjectV2(projectId) {
   return { project: rows[0].project, version: rows[0].version };
 }
 
+// Canonical JSON for value-equality across a Postgres jsonb round-trip (jsonb
+// normalizes key order, so plain stringify comparison would false-negative).
+// Mirrors JSON.stringify semantics: undefined-valued keys are dropped.
+function _canonicalJson(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return "[" + v.map(x => _canonicalJson(x === undefined ? null : x)).join(",") + "]";
+  return "{" + Object.keys(v).filter(k => v[k] !== undefined).sort()
+    .map(k => JSON.stringify(k) + ":" + _canonicalJson(v[k])).join(",") + "}";
+}
+
 async function saveProjectRowV2(project, expectedVersion) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(project.id) +
               "&version=eq." + expectedVersion;
@@ -2106,6 +2144,18 @@ async function saveProjectRowV2(project, expectedVersion) {
   if (!result || result.length === 0) {
     // version mismatch — re-fetch to give caller something to merge
     const fresh = await fetchFreshProjectV2(project.id);
+    // False-conflict detection: this PATCH goes through fetchWithRetry, which
+    // retries on network errors — including a connection dropped AFTER the
+    // server committed. The retry then matches 0 rows (version already bumped)
+    // and looks exactly like a real conflict, telling the user their save
+    // failed when it succeeded (and inviting a duplicate re-save). If the
+    // cloud is at exactly expected+1 AND holds byte-for-byte what we sent,
+    // that "conflict" was our own write landing — treat as success.
+    if (fresh && fresh.version === expectedVersion + 1 &&
+        _canonicalJson(fresh.project) === _canonicalJson(project)) {
+      _projectVersionCache.set(project.id, fresh.version);
+      return fresh.version;
+    }
     throw new AddinConflictError(
       "Project " + project.id + " was modified by someone else (cloud v" +
       (fresh?.version ?? "?") + ", you had v" + expectedVersion + ")",
@@ -2207,32 +2257,22 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
   // write a stale shadow copy that no one reads. In that case we surface a
   // clear error rather than silently writing to a dead-end table.
   const migrationDone = await _checkAddinMigrationStatus();
-  if (migrationDone && !fresh) {
-    // V2 migration is complete but this project doesn't have a V2 row. Either
-    // the project was added in legacy and never migrated (unlikely), or this
-    // is a brand-new add via the add-in. Treat as INSERT.
-    try {
-      const mutated = mutateProject({ id: projectId });
-      if (!mutated?.id) throw new Error("mutator returned invalid project");
-      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects", {
-        method: "POST",
-        headers: SB_HEADERS,
-        body: JSON.stringify({ id: projectId, project: mutated, version: 1, updated_at: new Date().toISOString() }),
-      }, { label: "sb pms_projects insert" });
-      if (!res.ok) throw new Error("pms_projects POST HTTP " + res.status);
-      _projectVersionCache.set(projectId, 1);
-      allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
-      if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
-      return mutated;
-    } catch (insertErr) {
-      throw new Error("Could not save: V2 row missing for project " + projectId + " and INSERT failed: " + insertErr.message);
-    }
-  }
+  // ORDER MATTERS: v2FetchFailed implies fresh === undefined, so this check
+  // must come before the missing-row check — previously the INSERT branch
+  // below shadowed it and this "try again" path was unreachable.
   if (migrationDone && v2FetchFailed) {
     // Migration is done but our V2 fetch failed transiently. Don't fall back
     // to legacy — surface the error so the user retries instead of writing
     // to a dead-end table.
     throw new Error("Cloud temporarily unreachable. Wait a few seconds and try again. (V2 fetch failed; not falling back to legacy because the data layer has migrated.)");
+  }
+  if (migrationDone && !fresh) {
+    // Fetch SUCCEEDED but returned no row: the project doesn't exist in V2.
+    // The add-in never creates projects, so there is no legitimate INSERT
+    // case — this used to POST a skeleton row built from a bare {id}, which
+    // resurrected projects deleted in PMS as ghost rows containing only the
+    // new note/email (name, number, folder URL, milestones all missing).
+    throw new Error("This project no longer exists in PMS (it may have been deleted). Refresh the pane and pick another project.");
   }
 
   // Pre-migration: legacy path is still authoritative
@@ -2542,8 +2582,24 @@ function getConversationProjectMap() {
     return {};
   }
 }
+// Cap the per-email/per-thread tag maps. They accumulate one entry per tagged
+// email forever (~150-char REST-id keys) and were never pruned — months of
+// heavy filing eventually crowds the localStorage quota the projects cache
+// needs, and the only symptom is pane opens quietly getting slow again.
+// Plain-object string keys keep insertion order (and JSON round-trips preserve
+// it), so the FIRST keys are the oldest tags — drop those. Cloud thread tags
+// (pms_email_thread_tags) still restore anything pruned here.
+function _pruneMapToCap(map, cap) {
+  const keys = Object.keys(map);
+  if (keys.length <= cap) return map;
+  for (const k of keys.slice(0, keys.length - cap)) delete map[k];
+  return map;
+}
+function saveEmailProjectMap(map) {
+  localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 2000)));
+}
 function saveConversationProjectMap(map) {
-  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map || {}));
+  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 3000)));
 }
 async function saveSharedConversationProjectTag(conversationId, projectId) {
   if (!conversationId || !projectId) return;
@@ -2654,8 +2710,6 @@ function applyPipelineUiRules() {
       hint.style.display = "none";
     }
   }
-  if (!isPipeline) return;
-
   const keepEnabled = new Set([
     "saveRecordBtn",
     "openPmsBtn",
@@ -2676,10 +2730,14 @@ function applyPipelineUiRules() {
     "manualMilestoneBtn",
     "addParticipantBtn",
   ];
+  // Runs UNCONDITIONALLY (no early return on awarded projects): this function
+  // is the only thing that re-enables these buttons after a pipeline project
+  // disabled them. Previously, switching pipeline → awarded left "Log as
+  // Note" and friends dead until the user left and re-opened the email.
   actionButtons.forEach(id => {
     const btn = document.getElementById(id);
     if (!btn) return;
-    btn.disabled = !keepEnabled.has(id);
+    btn.disabled = isPipeline && !keepEnabled.has(id);
   });
 }
 
@@ -2746,7 +2804,7 @@ async function clearProjectTagForCurrentEmail() {
     const map = getEmailProjectMap();
     if (map[msgId]) {
       delete map[msgId];
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
   }
   // Use shared key (handles both emails and appointments) so the cross-device
@@ -2909,7 +2967,7 @@ function setSelectedProject(project, persistForEmail = false) {
     if (msgId) {
       const map = getEmailProjectMap();
       map[msgId] = selectedProject.id;
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
     void (async () => {
       // Use the shared key (iCalUId for appointments, conversationId for emails)
@@ -2947,14 +3005,28 @@ async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
     if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
+    const myGen = itemContextGeneration;
     await ensureInternetMessageId(); // resolve the STABLE id before keying the record (prevents re-log drift)
     const msgId = getCurrentMessageRecordId();
     if (!msgId) return;
     if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
     if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
+    // Respect the process-wide save lock. Auto-save used to bypass it and
+    // race user-initiated saves on the version counter — both fetch v10, one
+    // PATCHes to v11, the other's version=eq.10 matches 0 rows → a phantom
+    // "Save conflict" for a save the user did nothing wrong on. Wait for the
+    // in-flight save (bounded), then re-check everything that may have changed.
+    for (let waited = 0; saveInFlight && waited < 20000; waited += 500) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (saveInFlight) return;                    // still busy — skip; re-attempted on next open
+    if (myGen !== itemContextGeneration) return; // user moved on while we waited
+    if (!selectedProject) return;
+    if (findSavedEmailRecord(selectedProject, msgId)) return; // the save we waited on logged it
     _autoSavingMsgId = msgId;
+    saveInFlight = true; // hold the lock so a user click can't race US either
     try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
-    finally { _autoSavingMsgId = null; }
+    finally { saveInFlight = false; _autoSavingMsgId = null; }
   } catch (e) {
     console.warn("auto-save failed:", e);
   }
@@ -3051,7 +3123,7 @@ async function restoreProjectSelectionForCurrentEmail() {
           if (msgId) {
             const map = getEmailProjectMap();
             map[msgId] = projectId;
-            localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+            saveEmailProjectMap(map);
           }
           const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
           if (myGen !== itemContextGeneration) return; // user moved on — don't tag the wrong thread
@@ -3431,8 +3503,11 @@ async function sweepLoadFiledIds() {
   try {
     const PAGE = 1000;
     for (let offset = 0; offset < 500000; offset += PAGE) {
+      // order= gives Postgres a stable row order across pages. Without it,
+      // page boundaries can shift under concurrent inserts (the sweep itself
+      // inserts rows) and msg_ids silently fall between pages → dedup misses.
       const res = await fetchWithRetry(
-        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&limit=" + PAGE + "&offset=" + offset,
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
         { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
       if (!res.ok) break;
       const rows = await res.json();
@@ -3452,8 +3527,9 @@ async function sweepLoadConvoProjectMap() {
     const byConv = new Map();
     const PAGE = 1000;                          // page past the 1000-row PostgREST cap
     for (let offset = 0; offset < 500000; offset += PAGE) {
+      // Same stable-order rule as sweepLoadFiledIds.
       const res = await fetchWithRetry(
-        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&limit=" + PAGE + "&offset=" + offset,
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
         { headers: SB_HEADERS }, { label: "sb sweep convo map" });
       if (!res.ok) break;
       const rows = await res.json();
@@ -3592,6 +3668,12 @@ async function sweepRecentMail() {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
     if (btn) btn.disabled = false;
+    // Preview is stateless: it advanced the shared cursor without filing
+    // anything, so a leftover "Load more" would resume PAST the previewed
+    // pages and their unfiled matches would be silently skipped. Reset the
+    // cursor so the next Run & file starts from the top.
+    _sweepCursor = null;
+    updateSweepMoreBtn();
   }
 }
 
@@ -3695,6 +3777,12 @@ let _sweepAutoStop = false;
 // array → row-lock pile-up that wedged the DB on big backfills (2026-06-24). null =
 // sync inline immediately (single Run & file / review-confirm — one batch, no churn).
 let _sweepInlineQueue = null;
+// Dedup datasets (filed msg_ids, thread→project map, sender signal), loaded ONCE
+// per run instead of at the start of every batch. The per-batch reload was both
+// slow (each set is N/1000 sequential paged requests — hundreds of round trips
+// on a deep Run-to-end) and racy (the sweep's own inserts shift page boundaries
+// mid-run). sweepFileItems keeps the in-memory sets current as it files.
+let _sweepDedup = null;
 
 // Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
 // run from the chosen mailbox; reset=false continues the saved cursor (Load more).
@@ -3706,6 +3794,13 @@ async function sweepResolveScan(reset) {
     _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
     _sweepConvoSeen = new Map();
     _sweepProjectFilter = sweepResolveProjectFilter(); // null = whole mailbox; else {id,label}
+    _sweepDedup = null; // fresh run → fresh dedup snapshot
+  }
+  if (!_sweepDedup) {
+    const [filed, senderMap, convoMap] = await Promise.all([
+      sweepLoadFiledIds(), sweepLoadSenderMap(), sweepLoadConvoProjectMap(),
+    ]);
+    _sweepDedup = { filed, senderMap, convoMap };
   }
   // Refresh the token at the start of EVERY batch (incl. Load more) so a long
   // backfill never carries a stale token into graphFetch's 401 path — which would
@@ -3725,9 +3820,9 @@ async function sweepResolveScan(reset) {
 // mailbox is exhausted, or the per-batch page cap is hit. Scans ALL folders
 // (incl. Sent): no Focused filter, since a backfill wants the whole mailbox.
 async function sweepScanBatch({ base, token, cursor }) {
-  const filed = await sweepLoadFiledIds();
-  const senderMap = await sweepLoadSenderMap();
-  const convoMap = await sweepLoadConvoProjectMap();
+  // Run-scoped dedup snapshot — loaded once in sweepResolveScan, kept current
+  // by sweepFileItems as emails file. (Was reloaded here every batch.)
+  const { filed, senderMap, convoMap } = _sweepDedup || { filed: new Set(), senderMap: new Map(), convoMap: new Map() };
   const filterId = _sweepProjectFilter?.id || null; // scoped run → only file/queue this one job
   const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
   // First page builds the query; later pages follow the (base-stripped) nextLink.
@@ -3741,7 +3836,12 @@ async function sweepScanBatch({ base, token, cursor }) {
       const sender = m.from?.emailAddress?.address || "";
       if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
       const mid = m.internetMessageId || "";
-      if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
+      // No internetMessageId = a draft (the sweep walks ALL folders). These
+      // could never be filed properly: saveProjectEmailRow no-ops without a
+      // msgId, yet the item was still counted "filed" and re-appended a slim
+      // inline rec to the project row on EVERY run (unbounded drift). Skip.
+      if (!mid) { out.skip++; continue; }
+      if (filed.has(mid)) { out.alreadyFiled++; continue; }
       const item = {
         gid: m.id, convId: m.conversationId || "", msgId: mid,
         subject: m.subject || "(no subject)",
@@ -3810,22 +3910,34 @@ function stripHtmlToText(html) {
 
 // File sweep items to item.projectId: writes the search-index row (with stripped
 // body_text) and dual-writes project.emails[] grouped per project. {filed, failed}.
-async function sweepFileItems(items) {
+async function sweepFileItems(items, opts = {}) {
   if (!items.length) return { filed: 0, failed: 0 };
-  // Read bodies from whatever mailbox this batch was scanned from — a colleague's
-  // shared mailbox needs its Mail.Read.Shared token + /users/{addr} message path.
-  // Acquire fresh (silent, cached) so a later review-confirm can't fail on a stale
-  // token routing through graphFetch's own-mailbox 401 fallback.
-  const token = _sweepSource?.shared ? await getSharedMailToken() : await getToken();
-  const base = _sweepSource?.base || "/me";
+  // Read bodies from whatever mailbox each item was SCANNED from (it._src,
+  // snapshotted by sweepRunAndFile) — not whatever the mailbox box says now.
+  // Review items can be confirmed long after the run, after the user has
+  // changed the box; filing them against the current source 404'd the body
+  // fetch and silently saved empty-body records. Tokens are acquired lazily
+  // per scope (own vs shared) and cached for the call.
+  let _ownTok = null, _sharedTok = null;
+  const tokenFor = async (shared) => shared
+    ? (_sharedTok || (_sharedTok = await getSharedMailToken()))
+    : (_ownTok || (_ownTok = await getToken()));
   const byProject = new Map();
   let filed = 0, failed = 0;
   let done = 0;
   for (const it of items) {
+    // Honor Stop mid-filing (opts.honorStop — set by the run flows, NOT by
+    // review-confirm, where a stale flag from a previously stopped run would
+    // abort a single-item file). Unfiled remainder is safe: dedup lets the
+    // next full run pick these emails up again.
+    if (opts.honorStop && _sweepAutoStop) break;
     done++;
     const _fe = document.getElementById("sweepStatus");
     if (_fe) _fe.textContent = "⏳ Filing email " + done + " of " + items.length + "… (" + filed + " saved)";
     try {
+      const src = it._src || _sweepSource || { base: "/me", shared: false };
+      const base = src.base || "/me";
+      const token = await tokenFor(!!src.shared);
       let bodyHtml = "";
       try {
         const d = await graphFetch("GET", base + "/messages/" + it.gid + "?$select=body", null, token);
@@ -3857,6 +3969,17 @@ async function sweepFileItems(items) {
       const slim = { ...rec }; delete slim.bodyHtmlCompressed; delete slim.bodyText;
       byProject.get(it.projectId).push(slim);
       filed++;
+      // Keep the run-scoped dedup snapshot current (it's no longer reloaded per
+      // batch): mark the msg filed, and keep the thread map honest — filing the
+      // same thread to a SECOND project makes it ambiguous, so drop it.
+      if (_sweepDedup) {
+        if (it.msgId) _sweepDedup.filed.add(it.msgId);
+        if (it.convId) {
+          const existing = _sweepDedup.convoMap.get(it.convId);
+          if (existing && existing !== it.projectId) _sweepDedup.convoMap.delete(it.convId);
+          else _sweepDedup.convoMap.set(it.convId, it.projectId);
+        }
+      }
     } catch (e) {
       console.warn("sweep file failed:", e);
       failed++;
@@ -3920,8 +4043,12 @@ async function sweepRunAndFile(reset = true) {
   try {
     if (reset) _sweepReview = [];
     const r = await sweepResolveScan(reset);
-    for (const it of r.file) it.projectId = it.project.id;
-    const { filed, failed } = await sweepFileItems(r.file);
+    // Snapshot the scan source onto every item — review items can be confirmed
+    // after the mailbox box changes, and must file from where they were found.
+    const src = { base: _sweepSource.base, shared: _sweepSource.shared };
+    for (const it of r.file)   { it.projectId = it.project.id; it._src = src; }
+    for (const it of r.review) { it._src = src; }
+    const { filed, failed } = await sweepFileItems(r.file, { honorStop: true });
     _sweepTotals.filed += filed;
     _sweepReview.push(...r.review);
     const pending = _sweepReview.filter((e) => !e._done && !(e._filedTo && e._filedTo.length)).length;
@@ -3968,6 +4095,7 @@ function sweepClearResults() {
   _sweepCursor = null;
   _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
   _sweepConvoSeen = new Map();
+  _sweepDedup = null; // next run reloads a fresh dedup snapshot
   const results = document.getElementById("sweepResults");
   if (results) results.innerHTML = "";
   const status = document.getElementById("sweepStatus");
@@ -4110,7 +4238,15 @@ async function sweepConfirmReview(i, ci) {
   if (e._filedTo.some((f) => f.id === proj.id)) return; // don't double-file the same job
   e._done = "filing";
   renderSweepReviewQueue();
-  const { filed } = await sweepFileItems([{ ...e, projectId: proj.id }]);
+  // try/catch so a thrown error (e.g. token acquisition popup blocked) can't
+  // leave the row stuck on "⏳ filing…" forever — the _done guard above would
+  // then block every retry click until the pane reloads.
+  let filed = 0;
+  try {
+    ({ filed } = await sweepFileItems([{ ...e, projectId: proj.id }]));
+  } catch (err) {
+    console.warn("review confirm failed:", err);
+  }
   e._done = null;
   if (filed) {
     e._filedTo.push({ id: proj.id, name: (proj.name || proj.projectNumber || "project") });
@@ -4967,8 +5103,12 @@ async function getEmailDateReliable() {
   return emailItem?.dateTimeCreated || null;
 }
 
-async function getEmailBodyHtml(token) {
-  const item = Office.context.mailbox.item;
+// `itemSnapshot` (optional): the mailbox item captured by the caller before any
+// awaits. The save paths pass their snapshot so a fast item-switch mid-save
+// can't put a different email's body under the snapshotted header/folder.
+// Callers without a snapshot (watchlist, Teams share, date scan) read live.
+async function getEmailBodyHtml(token, itemSnapshot) {
+  const item = itemSnapshot || Office.context.mailbox.item;
   const msgId = item?.itemId;
   if (msgId && _emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
 
@@ -5801,15 +5941,21 @@ function encodeDrivePath(path) {
     .map(p => encodeURIComponent(p))
     .join("/");
 }
-// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders)
+// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders).
+// Retries transient failures and logs non-OK responses — a silently failed
+// create used to surface later as confusing 404s on the uploads into it.
+// Still never throws: the subsequent upload is the authoritative failure signal.
 async function ensureSpFolder(driveId, token, parentPath, name) {
   try {
-    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
+    const res = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
-    });
-  } catch {}
+    }, { label: "graph ensure folder" });
+    if (!res.ok && res.status !== 409) {
+      console.warn("[sp-folder] create HTTP", res.status, "for", parentPath + "/" + name);
+    }
+  } catch (e) { console.warn("[sp-folder] create failed:", name, e.message); }
   return parentPath + "/" + name;
 }
 // Extract the drive-relative path from a full SharePoint web URL
@@ -5847,7 +5993,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
   // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
   // sha256 + verified once read-back lands.
   lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [] };
-  const bodyHtml = await getEmailBodyHtml(token);
+  const bodyHtml = await getEmailBodyHtml(token, item); // snapshot — see header comment
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
   const emailHtmlPromise = fetch(
@@ -6055,18 +6201,29 @@ async function getOfficeFileAttachments(item) {
     });
   });
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
-  const out = [];
-  for (const att of fileAtts) {
-    const content = await new Promise((resolve, reject) => {
+  // Fetch attachment bytes with bounded concurrency. This used to be a serial
+  // for..await loop — with several attachments (esp. in Outlook on the web,
+  // where getAttachmentContentAsync is a network call) the byte fetch was the
+  // bottleneck even though the uploads downstream run 3-wide. Results are
+  // collected by index so `out` keeps fileAtts order (the uploader's
+  // name-uniquifying assumes stable ordering).
+  const FETCH_CONCURRENCY = 3;
+  const contents = new Array(fileAtts.length).fill(null);
+  for (let i = 0; i < fileAtts.length; i += FETCH_CONCURRENCY) {
+    const batch = fileAtts.slice(i, i + FETCH_CONCURRENCY);
+    await Promise.all(batch.map((att, bi) => new Promise((resolve, reject) => {
       // CRITICAL: use the captured `item`, not the live module global.
       item.getAttachmentContentAsync(att.id, (res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
         else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
       });
-    }).catch((e) => {
-      console.warn("Office attachment content failed:", att.name, e.message);
-      return null;
-    });
+    }).then(content => { contents[i + bi] = content; })
+      .catch((e) => { console.warn("Office attachment content failed:", att.name, e.message); })));
+  }
+  const out = [];
+  for (let idx = 0; idx < fileAtts.length; idx++) {
+    const att = fileAtts[idx];
+    const content = contents[idx];
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
     const bytes = toBytesFromBase64(content.content);
     // Skip small inline images (signature logos, social icons, banners) — same
@@ -6094,7 +6251,11 @@ async function getOfficeFileAttachments(item) {
 // returns 413 (or in some corner cases, just hangs) and the file fails to
 // upload. We auto-dispatch to the upload-session API for anything > threshold.
 const SP_SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024;          // 4 MiB
-const SP_UPLOAD_CHUNK_SIZE = 5 * 320 * 1024;           // 1.6 MiB — multiple of 320 KiB (Graph requirement)
+const SP_UPLOAD_CHUNK_SIZE = 32 * 320 * 1024;          // 10 MiB — multiple of 320 KiB (Graph requirement).
+// Graph recommends 5–10 MiB chunks; the old 1.6 MiB made a 40MB file take ~25
+// serial round-trip PUTs. Bigger chunks = far fewer round trips on big files,
+// and the per-chunk retry in uploadLargeAttachmentToSharePoint still bounds
+// how much a transient failure re-sends.
 
 // ─── INTEGRITY HASHING ───────────────────────────────────────────────────────
 // SHA-256 of the local bytes via Web Crypto. Used by the read-back verification
@@ -6109,156 +6270,6 @@ async function sha256Hex(bytes) {
   return hex;
 }
 
-// Microsoft Graph's QuickXorHash — a custom XOR-with-rotation digest used by
-// OneDrive/SharePoint. We only need this when sha256Hash isn't present on the
-// DriveItem (SharePoint's `file.hashes` facet usually returns quickXorHash by
-// default, sometimes sha1Hash; sha256Hash requires explicit enablement).
-// Spec: https://learn.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash
-// Implementation translated from the reference C# / Python.
-async function quickXorHashBase64(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const BITS_IN_LAST_CELL = 32;
-  const SHIFT = 11;
-  const WIDTH_BITS = 160;
-  const WIDTH_BYTES = 20;
-  // We maintain 160 bits as 5 × 32-bit lanes (little-endian inside each lane).
-  const lanes = new Uint32Array(5);
-  let shiftSoFar = 0;
-  let lengthSoFar = 0;
-
-  // Rotate-left of the lanes array by `bits`. Done by streaming each input byte
-  // into a moving 8-bit window. For performance + readability we operate on
-  // 8-bit groups and recompute the destination bit/lane each step.
-  for (let i = 0; i < bytes.length; i++) {
-    const currentShift = shiftSoFar;
-    const vectorArrayIndex = Math.floor(currentShift / 32) % 5;
-    const vectorOffset = currentShift % 32;
-    const nextVectorIndex = (vectorArrayIndex + 1) % 5;
-    const xoredByte = bytes[i];
-    // Lower bits of the byte XOR into the current lane shifted into position.
-    lanes[vectorArrayIndex] = (lanes[vectorArrayIndex] ^ (xoredByte << vectorOffset)) >>> 0;
-    // Bits that overflow the lane go into the next lane.
-    if (vectorOffset > 24) {
-      lanes[nextVectorIndex] = (lanes[nextVectorIndex] ^ (xoredByte >>> (32 - vectorOffset))) >>> 0;
-    }
-    shiftSoFar = (shiftSoFar + SHIFT) % WIDTH_BITS;
-    lengthSoFar++;
-  }
-
-  // Finalize by XORing the message length (8 bytes, little-endian) into the
-  // last 64 bits of the 160-bit state.
-  const out = new Uint8Array(WIDTH_BYTES);
-  for (let i = 0; i < 5; i++) {
-    out[i * 4 + 0] = (lanes[i] >>>  0) & 0xff;
-    out[i * 4 + 1] = (lanes[i] >>>  8) & 0xff;
-    out[i * 4 + 2] = (lanes[i] >>> 16) & 0xff;
-    out[i * 4 + 3] = (lanes[i] >>> 24) & 0xff;
-  }
-  // XOR the message length (in bytes, as 8-byte LE) into the last 8 bytes
-  let len = lengthSoFar;
-  for (let i = 0; i < 8; i++) {
-    out[WIDTH_BYTES - 8 + i] ^= (len & 0xff);
-    len = Math.floor(len / 256);
-  }
-  // base64 of the 20 bytes
-  let bin = "";
-  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i]);
-  return btoa(bin);
-}
-
-// SHA-1 (still occasionally surfaced by Graph). Web Crypto handles it.
-async function sha1Hex(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const digest = await crypto.subtle.digest("SHA-1", bytes);
-  const view = new Uint8Array(digest);
-  let hex = "";
-  for (let i = 0; i < view.length; i++) hex += view[i].toString(16).padStart(2, "0");
-  return hex.toUpperCase(); // Graph reports SHA-1 in uppercase hex
-}
-
-// Fetch metadata for a just-uploaded file. Returns { size, hashes } or null.
-async function fetchSpFileMetadata(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName) +
-      "?select=size,file";
-    const res = await fetchWithRetry(url, {
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph verify GET", maxAttempts: 3 });
-    if (!res.ok) return null;
-    const item = await res.json();
-    return {
-      size:   item?.size ?? null,
-      hashes: item?.file?.hashes || {},
-    };
-  } catch (e) {
-    console.warn("[verify] metadata GET failed:", safeName, e.message);
-    return null;
-  }
-}
-
-// Verify a just-uploaded file matches the local bytes we tried to send.
-// Returns:
-//   { ok: true,  algo, localHash, remoteHash } — verified clean
-//   { ok: false, reason } — mismatch or unable to verify
-async function verifyUploadedFile(driveId, token, targetPath, safeName, bytes) {
-  const meta = await fetchSpFileMetadata(driveId, token, targetPath, safeName);
-  if (!meta) return { ok: false, reason: "metadata GET failed" };
-
-  // Size check — fastest, most important. Any mismatch here is a hard fail
-  // regardless of which hash algorithm the server reports.
-  if (typeof meta.size === "number" && meta.size !== bytes.length) {
-    return {
-      ok: false,
-      reason: `size mismatch: local=${bytes.length} remote=${meta.size}`,
-    };
-  }
-
-  const hashes = meta.hashes || {};
-  // Prefer SHA-256 (only present if the tenant has it enabled), then SHA-1
-  // (deprecated but widely present), then quickXorHash (the SharePoint default).
-  if (hashes.sha256Hash) {
-    const local = (await sha256Hex(bytes)).toUpperCase();
-    const remote = String(hashes.sha256Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha256", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha256 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.sha1Hash) {
-    const local = await sha1Hex(bytes);
-    const remote = String(hashes.sha1Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha1", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha1 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.quickXorHash) {
-    const local = await quickXorHashBase64(bytes);
-    const remote = String(hashes.quickXorHash);
-    return local === remote
-      ? { ok: true,  algo: "quickXor", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `quickXor mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  // Server returned no hashes — fall back to size-only (already checked above
-  // and matched). Better than nothing.
-  return { ok: true, algo: "size-only", localHash: String(bytes.length), remoteHash: String(meta.size) };
-}
-
-// Delete an item at a path. Used by the verify-then-retry path when the
-// first upload landed corrupt and we need to clear the bad file before re-PUT.
-async function deleteSpFile(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName);
-    const res = await fetchWithRetry(url, {
-      method: "DELETE",
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph delete bad file", maxAttempts: 2 });
-    return res.ok || res.status === 404;
-  } catch (e) {
-    console.warn("[verify] delete failed:", safeName, e.message);
-    return false;
-  }
-}
 
 // Upload + verify. Strategy (corrected — see comment block below):
 //   1. PUT bytes
@@ -6695,7 +6706,7 @@ if (existingRecord) {
     // Track body-fetch failure separately so we can surface it in the success
     // message — previously a silent "" fallback meant the user thought everything
     // worked but the email record had no readable body.
-    let bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token, snapItem);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     // Inline images arrive as cid: refs (bytes live as inline attachments) and
     // don't render in the PMS log — re-embed them as downscaled data: URIs so they
@@ -7073,35 +7084,6 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
     + "</div>";
 }
 
-// In-memory cache so a second click on Send-to-Teams doesn't re-hit Graph
-// for the channel email. Keyed by teamsChannelId. Reset on page reload —
-// no need to persist beyond a single Outlook session.
-const _channelEmailCache = {};
-
-// READ-ONLY channel email resolution. PMS deliberately doesn't request the
-// ChannelSettings.ReadWrite.All scope needed for `provisionEmail`, so we
-// only read here. If a channel hasn't had its email provisioned yet, the
-// user does it once via Teams ("⋯" menu → "Get email address"); after
-// that the read path returns the address every time.
-async function resolveChannelEmailAddin(project) {
-  const channelId = project?.teamsChannelId;
-  if (!channelId) return "";
-  if (_channelEmailCache[channelId]) return _channelEmailCache[channelId];
-  if (project.teamsChannelEmail) {
-    _channelEmailCache[channelId] = project.teamsChannelEmail;
-    return project.teamsChannelEmail;
-  }
-  try {
-    const ch = await graphFetch("GET", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}?$select=email`);
-    if (ch?.email) { _channelEmailCache[channelId] = ch.email; return ch.email; }
-    throw new Error("__NO_EMAIL__");
-  } catch (e) {
-    if (e.message === "__NO_EMAIL__") {
-      throw new Error('Channel has no email yet. In Teams, click "⋯" next to the channel name → "Get email address" → "Copy". That provisions it; the next click here will work.');
-    }
-    throw new Error("Graph: " + e.message);
-  }
-}
 
 // Fetch the current Outlook email's HTML body for forwarding. Returns ""
 // if no email is selected or the API errors.
@@ -7396,11 +7378,16 @@ async function doSaveNote() {
   // the OneNote content, so a typed note is optional context above it.
   if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
-  // Snapshot per-item identity SYNCHRONOUSLY before any await. If the user
-  // switches items during the OneNote round-trip, these are the values that
-  // should land on the saved note — not whatever item is selected when the
-  // save completes.
-  const snapItemId = emailItem?.itemId || "";
+  // Snapshot per-item identity AND the project/item SYNCHRONOUSLY before any
+  // await. The OneNote round-trip can run ~45s (retry backoff); during that
+  // window the user can switch projects or emails. Without the snapshots the
+  // note record landed on the NEW project while the OneNote page was created
+  // in the OLD project's notebook, and the page could embed a different
+  // email's body than the note's sourceItemId claims.
+  const snapProject = selectedProject;
+  const snapItem = emailItem;
+  const snapKind = currentItemKind;
+  const snapItemId = snapItem?.itemId || "";
   const snapSharedMsgId = getCurrentSharedMessageId() || "";
   const snapICalUId = currentItemICalUId || "";
   const saveGen = itemContextGeneration;
@@ -7413,7 +7400,7 @@ async function doSaveNote() {
   // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
   let oneNoteErr = "";
-  const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
+  const notebookId = snapProject.teamsOneNoteNotebookId || snapProject.oneNoteNotebookId || "";
   if (!notebookId) {
     oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
   } else {
@@ -7422,14 +7409,14 @@ async function doSaveNote() {
         // Use the subject element text as fallback — already resolved even in compose mode
         const subjectEl = document.getElementById("emailSubject").textContent;
         const resolvedSubject = (subjectEl && subjectEl !== "(Loading…)") ? subjectEl : null;
-        const title = (typeof emailItem?.subject === "string" ? emailItem.subject : resolvedSubject)
+        const title = (typeof snapItem?.subject === "string" ? snapItem.subject : resolvedSubject)
           || body.split("\n")[0].slice(0, 80) || category;
 
-        // In compose mode emailItem.start is an async Time object — fall back to now
-        const apptStart = emailItem?.start && !emailItem.start?.getAsync ? emailItem.start : null;
-        const dateStr = currentItemKind === "appointment"
+        // In compose mode snapItem.start is an async Time object — fall back to now
+        const apptStart = snapItem?.start && !snapItem.start?.getAsync ? snapItem.start : null;
+        const dateStr = snapKind === "appointment"
           ? new Date(apptStart || Date.now()).toISOString()
-          : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
+          : new Date(snapItem?.dateTimeCreated || Date.now()).toISOString();
 
         // For non-meeting categories, the email body IS the OneNote page
         // content. Fetched once here so embedded data:-URI images and inline
@@ -7440,13 +7427,13 @@ async function doSaveNote() {
         if (!isMeeting) {
           try {
             const token = await getToken();
-            emailBodyHtml = await getEmailBodyHtml(token);
+            emailBodyHtml = await getEmailBodyHtml(token, snapItem);
           } catch (e) {
             console.warn("[note] body fetch failed:", e.message);
           }
         }
 
-        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr, emailBodyHtml);
+        const page = await createAddinOneNotePage(snapProject, title, body, category, dateStr, emailBodyHtml);
         oneNoteUrl = page.webUrl || "";
       } catch (e) {
         oneNoteErr = e.message;
@@ -7467,12 +7454,17 @@ async function doSaveNote() {
       ...(snapICalUId ? { sourceCalendarUId: snapICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+    await applyLocalChangeAndSave(snapProject.id, fresh => ({
       ...fresh,
       notes: [...(fresh.notes || []), note],
     }));
     // Persist the appointment → project mapping so it auto-restores on next open.
-    setSelectedProject(selectedProject, true);
+    // Only when the user is still on the SAME item (this is what saveGen is
+    // for): the persist path tags the LIVE item's msgId/conversation, so doing
+    // it after an item switch would tag a different email with this project.
+    if (saveGen === itemContextGeneration) {
+      setSelectedProject(snapProject, true);
+    }
     const linkEl = document.getElementById("noteOneNoteLink");
     if (oneNoteUrl) {
       setStatus("noteStatus", "success", "✓ Note saved · OneNote page created");
@@ -7622,17 +7614,6 @@ async function doSaveActionItem() {
     saveInFlight = false;
   }
 }
-// ─── SHARED: file email+attachments into a project subfolder ─────────────────
-// `itemSnapshot` is the captured Office mailbox item — required to prevent
-// attachment-bytes corruption from item-switch races. Callers MUST capture
-// emailItem synchronously before any await and pass it in here.
-async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null, itemSnapshot = null) {
-  const subPath    = await ensureSpFolder(driveId, token, projFolderName, subfolder);
-  const recordPath = await ensureSpFolder(driveId, token, subPath, recordFolderName);
-  await uploadEmailAndAttachments(driveId, token, recordPath, itemSnapshot);
-  if (metadata) await writeSpMetadataSidecar(driveId, token, recordPath, metadata);
-  return SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
-}
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
 function setRfiMode(mode) {
   document.getElementById("rfiNewForm").style.display      = mode === "new"      ? "" : "none";
@@ -7649,15 +7630,18 @@ function setSubMode(mode) {
 function renderRfiPicker() {
   const sel  = document.getElementById("rfiExistingSelect");
   const rfis = selectedProject?.rfis || [];
+  // escHtml on title: RFI titles are prefilled from external email subjects,
+  // which can carry & < > " and corrupt the <option> markup unescaped.
   sel.innerHTML = rfis.length
-    ? rfis.map(r => `<option value="${r.id}">${r.number}${r.title ? " — " + r.title.slice(0, 45) : ""}</option>`).join("")
+    ? rfis.map(r => `<option value="${escHtml(r.id)}">${escHtml(r.number)}${r.title ? " — " + escHtml(r.title.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No RFIs on this project</option>';
 }
 function renderSubPicker() {
   const sel  = document.getElementById("subExistingSelect");
   const subs = selectedProject?.submittals || [];
+  // Same escaping rationale as renderRfiPicker.
   sel.innerHTML = subs.length
-    ? subs.map(s => `<option value="${s.id}">${s.number}${s.description ? " — " + s.description.slice(0, 45) : ""}</option>`).join("")
+    ? subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.number)}${s.description ? " — " + escHtml(s.description.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No submittals on this project</option>';
 }
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
@@ -8033,7 +8017,10 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
       width: { size: w, type: WidthType.DXA },
       children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
     });
-    const docxFileName = `${rfiId} Response ${dateSent.replace(/-/g, "")}.pdf`;
+    // Must match the ACTUAL uploaded artifact (submitRfiResponse's safeName) —
+    // this table is an auditable transmittal record; it used to reference a
+    // "<id> Response <date>.pdf" that never existed.
+    const docxFileName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
     return new Table({
       width: { size: 9360, type: WidthType.DXA },
       columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -8339,7 +8326,9 @@ async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned,
   }
   const toTable = new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [2200, 2200, 3300, 1660], rows: toRows });
 
-  const docxFileName = `${subId} Review ${dateSent.replace(/-/g, "")}.pdf`;
+  // Must match the ACTUAL uploaded artifact (submitSubReview's safeName) —
+  // same audit-record rationale as the RFI transmittal table.
+  const docxFileName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
   const contentsTable = new Table({
     width: { size: 9360, type: WidthType.DXA },
     columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -9564,8 +9553,11 @@ async function getNYCCalendarId() {
   try {
     const token = await getToken();
     const data  = await graphFetch("GET", "/me/calendars?$top=50", null, token);
+    // (c.name || ""): one null-named calendar in the list used to throw inside
+    // this swallowed try → null return → milestones silently landed on the
+    // user's PERSONAL calendar while the UI implied the shared one.
     const nyc   = (data?.value || []).find(c =>
-      c.name.toLowerCase().includes("nyc") || c.name.toLowerCase().includes("shared")
+      (c.name || "").toLowerCase().includes("nyc") || (c.name || "").toLowerCase().includes("shared")
     );
     if (nyc) {
       _nycCalendarId = nyc.id;
@@ -9839,9 +9831,9 @@ function extractDueDates(rawText, emailReceivedDate) {
     return a.iso.localeCompare(b.iso);
   });
 }
-function escHtml(s) {
-  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-}
+// (A duplicate, weaker escHtml used to live here — function-declaration
+// hoisting made it silently WIN over the 5-char version defined earlier,
+// removing single-quote escaping file-wide. Deleted; one escHtml now.)
 async function showDatesView() {
   showView("datesView");
   document.getElementById("milestoneForm").style.display = "none";
@@ -9931,22 +9923,37 @@ async function saveBillableMilestoneField(mid, field, value) {
   saveInFlight = true;
   setStatus("billableScheduleStatus", "info", "⏳ Saving…");
   try {
-    let extra = {}, calNote = "";
-    if (field === "dueDate" && value) {
-      // Keep the NYC Shared calendar in step — create the event if missing, else move it.
-      setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
-      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
-      const calRes = await syncMilestoneCalendar({ ...m, dueDate: value }, selectedProject);
-      if (calRes.success && calRes.eventId) extra.calendarEventId = calRes.eventId;
-      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
-    }
+    // Save the field FIRST, then sync the calendar. The old order created the
+    // event before the save — a save failure (version conflict during sweep
+    // churn) lost the fresh eventId, so the next date edit created a DUPLICATE
+    // event on the firm-wide NYC calendar instead of moving the first one.
+    if (field === "dueDate") setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: (fresh.milestones || []).map(m =>
         m.id === mid
-          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}), ...extra }
+          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}) }
           : m),
     }));
+    let calNote = "";
+    if (field === "dueDate" && value) {
+      // selectedProject was refreshed by the save above, so this milestone
+      // already carries the new date (and its calendarEventId if it has one).
+      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
+      const calRes = await syncMilestoneCalendar(m, selectedProject);
+      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
+      if (calRes.success && calRes.eventId && !m.calendarEventId) {
+        // New event — record its id so future edits MOVE it instead of
+        // creating another. Best-effort: the milestone itself is saved.
+        try {
+          await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+            ...fresh,
+            milestones: (fresh.milestones || []).map(x =>
+              x.id === mid ? { ...x, calendarEventId: calRes.eventId } : x),
+          }));
+        } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+      }
+    }
     setStatus("billableScheduleStatus", "success", "✓ Updated" + calNote + ".");
   } catch (e) {
     setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
@@ -10010,15 +10017,29 @@ async function doSaveMilestone() {
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
       ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
     };
-    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
-    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
-    if (calResult.success) milestone.calendarEventId = calResult.eventId;
-
+    // Save FIRST, then create the calendar event, then patch the eventId in.
+    // The old order (event first) meant a save failure + user retry produced
+    // duplicate all-day events on the firm-wide NYC calendar.
     setStatus("milestoneStatus", "info", "⏳ Saving to project…");
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: [...(fresh.milestones || []), milestone],
     }));
+
+    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
+    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
+    if (calResult.success && calResult.eventId) {
+      milestone.calendarEventId = calResult.eventId;
+      // Best-effort: record the event id so later date edits MOVE this event
+      // rather than creating another. The milestone itself is already saved.
+      try {
+        await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+          ...fresh,
+          milestones: (fresh.milestones || []).map(m =>
+            m.id === milestone.id ? { ...m, calendarEventId: calResult.eventId } : m),
+        }));
+      } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+    }
 
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
     const pep = pickQuip(NEW_MILESTONE_QUIPS);
