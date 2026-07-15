@@ -358,6 +358,19 @@ async function refreshSpPickerForProject() {
   // library, so the user can browse to ANY folder from here.
   spProjectRootPath = spDrivePath(selectedProject.projectFolderUrl || "") || "";
   spCurrentPath     = spProjectRootPath;
+  // Formal documents default into the project's "Project Management" subfolder
+  // when one exists (names vary, e.g. "01 📋 Project Management" — match by
+  // contains). Falls back to the project root when the probe finds nothing.
+  if (spProjectRootPath && !(draftSaved && draftFolderPath)) {
+    try {
+      const token = await getToken();
+      const kids = await fetchAllChildFolders(token, spProjectRootPath);
+      const pm = kids.find(n => n.toLowerCase().includes("project management"));
+      if (pm) spCurrentPath = spProjectRootPath + "/" + pm;
+    } catch (e) {
+      console.warn("PM-folder probe failed, defaulting to project root:", e.message);
+    }
+  }
   // Once a draft has been filed, default to the folder it went to so the next
   // save lands next to it.
   if (draftSaved && draftFolderPath) spCurrentPath = draftFolderPath;
