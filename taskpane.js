@@ -103,7 +103,15 @@ Office.onReady(async (info) => {
       Office.EventType.ItemChanged,
       // ItemChanged only ever fires while the pane is pinned, so the first one
       // we receive doubles as proof the user found the pin — hide the hint.
-      () => { markPanePinned(); showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
+      // Signed-out guard: without it, a pinned-but-signed-out user landed on a
+      // non-functional main view with no sign-in button.
+      () => {
+        markPanePinned();
+        applyComposeModeUiGuard();
+        if (!msalAccount) { showView("signInView"); return; }
+        showView("mainView");
+        loadItemContext();
+      }
     );
     loadItemContext();
   } catch (e) {
@@ -1032,34 +1040,36 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
 // first so there's an id to cross-link.
 async function linkSelectedArtifactFromMain() {
   const sel = document.getElementById("linkToTarget");
-  const btn = document.getElementById("linkArtifactBtn");
   const linkValue = sel?.value || "";
   if (!selectedProject) { setStatus("actionStatus", "error", "Pick a project first."); return; }
   if (!linkValue) { setStatus("actionStatus", "info", "Choose an RFI or Submittal from the dropdown first."); return; }
-  if (btn) btn.disabled = true;
-  try {
-    await ensureInternetMessageId();
-    let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
-    if (!rec) {
-      await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
-      rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+  // withSaveGuard: this flow writes the project row (via the record save +
+  // linkEmailToArtifact) and used to bypass the process-wide save lock — a
+  // click during a slow auto-save raced the version counter and produced a
+  // phantom "Save conflict" for the user.
+  return withSaveGuard("link-artifact", async () => {
+    try {
+      await ensureInternetMessageId();
+      let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      if (!rec) {
+        await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
+        rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      }
+      if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
+      setStatus("actionStatus", "info", "⏳ Linking…");
+      const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
+      if (result.ok) {
+        setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
+        if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
+        try { refreshLinkToTargetDropdown(); } catch {}
+        try { refreshLoggedArtifactChips(); } catch {}
+      } else {
+        setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
+      }
+    } catch (e) {
+      setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     }
-    if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
-    setStatus("actionStatus", "info", "⏳ Linking…");
-    const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
-    if (result.ok) {
-      setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
-      if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
-      try { refreshLinkToTargetDropdown(); } catch {}
-      try { refreshLoggedArtifactChips(); } catch {}
-    } else {
-      setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
-    }
-  } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
-  } finally {
-    if (btn) btn.disabled = false;
-  }
+  }, ["linkArtifactBtn"]);
 }
 
 function refreshLinkToTargetDropdown() {
@@ -1658,6 +1668,21 @@ async function onSignedIn() {
   // Surface any saves that didn't complete on a previous session.
   try { showPendingFilingBanner(); } catch (e) { console.warn("[filing-queue] banner render failed:", e.message); }
 }
+// Only escalate a failed silent token acquisition to a popup when MSAL says
+// the user actually has to interact (expired session, consent needed). A bare
+// catch here used to popup on ANY silent failure — including transient network
+// errors — so background flows (auto-save, chip refreshes) could spawn an
+// unprompted MSAL popup with no user gesture, or fail cryptically when the
+// webview blocked it. Genuine interaction cases (first-time consent for the
+// Teams/shared-mail scopes, expired refresh token) still get the popup.
+function _msalNeedsInteraction(e) {
+  try {
+    if (typeof msal !== "undefined" && msal.InteractionRequiredAuthError &&
+        e instanceof msal.InteractionRequiredAuthError) return true;
+  } catch { /* msal global not exposed — fall through to code check */ }
+  const code = String(e?.errorCode || e?.code || "") + " " + String(e?.message || "");
+  return /interaction_required|consent_required|login_required|no_tokens_found|no_account_error/i.test(code);
+}
 async function getToken(forceRefresh = false) {
   const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
   if (!account) throw new Error("Not signed in");
@@ -1668,7 +1693,8 @@ async function getToken(forceRefresh = false) {
     // cache thinks are still valid.
     const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account, forceRefresh });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
     return r.accessToken;
   }
@@ -1683,7 +1709,8 @@ async function getChannelMessageToken() {
   try {
     const r = await msalApp.acquireTokenSilent({ scopes: CHANNEL_MESSAGE_SCOPES, account });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     // First call → consent popup. Subsequent silent calls succeed because
     // the consent is cached on the user's MSAL account.
     const r = await msalApp.acquireTokenPopup({ scopes: CHANNEL_MESSAGE_SCOPES, account });
@@ -1699,7 +1726,8 @@ async function getSharedMailToken() {
   try {
     const r = await msalApp.acquireTokenSilent({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     const r = await msalApp.acquireTokenPopup({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
   }
@@ -2089,6 +2117,16 @@ async function fetchFreshProjectV2(projectId) {
   return { project: rows[0].project, version: rows[0].version };
 }
 
+// Canonical JSON for value-equality across a Postgres jsonb round-trip (jsonb
+// normalizes key order, so plain stringify comparison would false-negative).
+// Mirrors JSON.stringify semantics: undefined-valued keys are dropped.
+function _canonicalJson(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return "[" + v.map(x => _canonicalJson(x === undefined ? null : x)).join(",") + "]";
+  return "{" + Object.keys(v).filter(k => v[k] !== undefined).sort()
+    .map(k => JSON.stringify(k) + ":" + _canonicalJson(v[k])).join(",") + "}";
+}
+
 async function saveProjectRowV2(project, expectedVersion) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(project.id) +
               "&version=eq." + expectedVersion;
@@ -2106,6 +2144,18 @@ async function saveProjectRowV2(project, expectedVersion) {
   if (!result || result.length === 0) {
     // version mismatch — re-fetch to give caller something to merge
     const fresh = await fetchFreshProjectV2(project.id);
+    // False-conflict detection: this PATCH goes through fetchWithRetry, which
+    // retries on network errors — including a connection dropped AFTER the
+    // server committed. The retry then matches 0 rows (version already bumped)
+    // and looks exactly like a real conflict, telling the user their save
+    // failed when it succeeded (and inviting a duplicate re-save). If the
+    // cloud is at exactly expected+1 AND holds byte-for-byte what we sent,
+    // that "conflict" was our own write landing — treat as success.
+    if (fresh && fresh.version === expectedVersion + 1 &&
+        _canonicalJson(fresh.project) === _canonicalJson(project)) {
+      _projectVersionCache.set(project.id, fresh.version);
+      return fresh.version;
+    }
     throw new AddinConflictError(
       "Project " + project.id + " was modified by someone else (cloud v" +
       (fresh?.version ?? "?") + ", you had v" + expectedVersion + ")",
@@ -2207,32 +2257,22 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
   // write a stale shadow copy that no one reads. In that case we surface a
   // clear error rather than silently writing to a dead-end table.
   const migrationDone = await _checkAddinMigrationStatus();
-  if (migrationDone && !fresh) {
-    // V2 migration is complete but this project doesn't have a V2 row. Either
-    // the project was added in legacy and never migrated (unlikely), or this
-    // is a brand-new add via the add-in. Treat as INSERT.
-    try {
-      const mutated = mutateProject({ id: projectId });
-      if (!mutated?.id) throw new Error("mutator returned invalid project");
-      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects", {
-        method: "POST",
-        headers: SB_HEADERS,
-        body: JSON.stringify({ id: projectId, project: mutated, version: 1, updated_at: new Date().toISOString() }),
-      }, { label: "sb pms_projects insert" });
-      if (!res.ok) throw new Error("pms_projects POST HTTP " + res.status);
-      _projectVersionCache.set(projectId, 1);
-      allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
-      if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
-      return mutated;
-    } catch (insertErr) {
-      throw new Error("Could not save: V2 row missing for project " + projectId + " and INSERT failed: " + insertErr.message);
-    }
-  }
+  // ORDER MATTERS: v2FetchFailed implies fresh === undefined, so this check
+  // must come before the missing-row check — previously the INSERT branch
+  // below shadowed it and this "try again" path was unreachable.
   if (migrationDone && v2FetchFailed) {
     // Migration is done but our V2 fetch failed transiently. Don't fall back
     // to legacy — surface the error so the user retries instead of writing
     // to a dead-end table.
     throw new Error("Cloud temporarily unreachable. Wait a few seconds and try again. (V2 fetch failed; not falling back to legacy because the data layer has migrated.)");
+  }
+  if (migrationDone && !fresh) {
+    // Fetch SUCCEEDED but returned no row: the project doesn't exist in V2.
+    // The add-in never creates projects, so there is no legitimate INSERT
+    // case — this used to POST a skeleton row built from a bare {id}, which
+    // resurrected projects deleted in PMS as ghost rows containing only the
+    // new note/email (name, number, folder URL, milestones all missing).
+    throw new Error("This project no longer exists in PMS (it may have been deleted). Refresh the pane and pick another project.");
   }
 
   // Pre-migration: legacy path is still authoritative
@@ -2654,8 +2694,6 @@ function applyPipelineUiRules() {
       hint.style.display = "none";
     }
   }
-  if (!isPipeline) return;
-
   const keepEnabled = new Set([
     "saveRecordBtn",
     "openPmsBtn",
@@ -2676,10 +2714,14 @@ function applyPipelineUiRules() {
     "manualMilestoneBtn",
     "addParticipantBtn",
   ];
+  // Runs UNCONDITIONALLY (no early return on awarded projects): this function
+  // is the only thing that re-enables these buttons after a pipeline project
+  // disabled them. Previously, switching pipeline → awarded left "Log as
+  // Note" and friends dead until the user left and re-opened the email.
   actionButtons.forEach(id => {
     const btn = document.getElementById(id);
     if (!btn) return;
-    btn.disabled = !keepEnabled.has(id);
+    btn.disabled = isPipeline && !keepEnabled.has(id);
   });
 }
 
@@ -2947,14 +2989,28 @@ async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
     if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
+    const myGen = itemContextGeneration;
     await ensureInternetMessageId(); // resolve the STABLE id before keying the record (prevents re-log drift)
     const msgId = getCurrentMessageRecordId();
     if (!msgId) return;
     if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
     if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
+    // Respect the process-wide save lock. Auto-save used to bypass it and
+    // race user-initiated saves on the version counter — both fetch v10, one
+    // PATCHes to v11, the other's version=eq.10 matches 0 rows → a phantom
+    // "Save conflict" for a save the user did nothing wrong on. Wait for the
+    // in-flight save (bounded), then re-check everything that may have changed.
+    for (let waited = 0; saveInFlight && waited < 20000; waited += 500) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (saveInFlight) return;                    // still busy — skip; re-attempted on next open
+    if (myGen !== itemContextGeneration) return; // user moved on while we waited
+    if (!selectedProject) return;
+    if (findSavedEmailRecord(selectedProject, msgId)) return; // the save we waited on logged it
     _autoSavingMsgId = msgId;
+    saveInFlight = true; // hold the lock so a user click can't race US either
     try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
-    finally { _autoSavingMsgId = null; }
+    finally { saveInFlight = false; _autoSavingMsgId = null; }
   } catch (e) {
     console.warn("auto-save failed:", e);
   }
@@ -7479,11 +7535,16 @@ async function doSaveNote() {
   // the OneNote content, so a typed note is optional context above it.
   if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
-  // Snapshot per-item identity SYNCHRONOUSLY before any await. If the user
-  // switches items during the OneNote round-trip, these are the values that
-  // should land on the saved note — not whatever item is selected when the
-  // save completes.
-  const snapItemId = emailItem?.itemId || "";
+  // Snapshot per-item identity AND the project/item SYNCHRONOUSLY before any
+  // await. The OneNote round-trip can run ~45s (retry backoff); during that
+  // window the user can switch projects or emails. Without the snapshots the
+  // note record landed on the NEW project while the OneNote page was created
+  // in the OLD project's notebook, and the page could embed a different
+  // email's body than the note's sourceItemId claims.
+  const snapProject = selectedProject;
+  const snapItem = emailItem;
+  const snapKind = currentItemKind;
+  const snapItemId = snapItem?.itemId || "";
   const snapSharedMsgId = getCurrentSharedMessageId() || "";
   const snapICalUId = currentItemICalUId || "";
   const saveGen = itemContextGeneration;
@@ -7496,7 +7557,7 @@ async function doSaveNote() {
   // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
   let oneNoteErr = "";
-  const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
+  const notebookId = snapProject.teamsOneNoteNotebookId || snapProject.oneNoteNotebookId || "";
   if (!notebookId) {
     oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
   } else {
@@ -7505,14 +7566,14 @@ async function doSaveNote() {
         // Use the subject element text as fallback — already resolved even in compose mode
         const subjectEl = document.getElementById("emailSubject").textContent;
         const resolvedSubject = (subjectEl && subjectEl !== "(Loading…)") ? subjectEl : null;
-        const title = (typeof emailItem?.subject === "string" ? emailItem.subject : resolvedSubject)
+        const title = (typeof snapItem?.subject === "string" ? snapItem.subject : resolvedSubject)
           || body.split("\n")[0].slice(0, 80) || category;
 
-        // In compose mode emailItem.start is an async Time object — fall back to now
-        const apptStart = emailItem?.start && !emailItem.start?.getAsync ? emailItem.start : null;
-        const dateStr = currentItemKind === "appointment"
+        // In compose mode snapItem.start is an async Time object — fall back to now
+        const apptStart = snapItem?.start && !snapItem.start?.getAsync ? snapItem.start : null;
+        const dateStr = snapKind === "appointment"
           ? new Date(apptStart || Date.now()).toISOString()
-          : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
+          : new Date(snapItem?.dateTimeCreated || Date.now()).toISOString();
 
         // For non-meeting categories, the email body IS the OneNote page
         // content. Fetched once here so embedded data:-URI images and inline
@@ -7523,13 +7584,13 @@ async function doSaveNote() {
         if (!isMeeting) {
           try {
             const token = await getToken();
-            emailBodyHtml = await getEmailBodyHtml(token);
+            emailBodyHtml = await getEmailBodyHtml(token, snapItem);
           } catch (e) {
             console.warn("[note] body fetch failed:", e.message);
           }
         }
 
-        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr, emailBodyHtml);
+        const page = await createAddinOneNotePage(snapProject, title, body, category, dateStr, emailBodyHtml);
         oneNoteUrl = page.webUrl || "";
       } catch (e) {
         oneNoteErr = e.message;
@@ -7550,12 +7611,17 @@ async function doSaveNote() {
       ...(snapICalUId ? { sourceCalendarUId: snapICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+    await applyLocalChangeAndSave(snapProject.id, fresh => ({
       ...fresh,
       notes: [...(fresh.notes || []), note],
     }));
     // Persist the appointment → project mapping so it auto-restores on next open.
-    setSelectedProject(selectedProject, true);
+    // Only when the user is still on the SAME item (this is what saveGen is
+    // for): the persist path tags the LIVE item's msgId/conversation, so doing
+    // it after an item switch would tag a different email with this project.
+    if (saveGen === itemContextGeneration) {
+      setSelectedProject(snapProject, true);
+    }
     const linkEl = document.getElementById("noteOneNoteLink");
     if (oneNoteUrl) {
       setStatus("noteStatus", "success", "✓ Note saved · OneNote page created");
@@ -10014,22 +10080,37 @@ async function saveBillableMilestoneField(mid, field, value) {
   saveInFlight = true;
   setStatus("billableScheduleStatus", "info", "⏳ Saving…");
   try {
-    let extra = {}, calNote = "";
-    if (field === "dueDate" && value) {
-      // Keep the NYC Shared calendar in step — create the event if missing, else move it.
-      setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
-      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
-      const calRes = await syncMilestoneCalendar({ ...m, dueDate: value }, selectedProject);
-      if (calRes.success && calRes.eventId) extra.calendarEventId = calRes.eventId;
-      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
-    }
+    // Save the field FIRST, then sync the calendar. The old order created the
+    // event before the save — a save failure (version conflict during sweep
+    // churn) lost the fresh eventId, so the next date edit created a DUPLICATE
+    // event on the firm-wide NYC calendar instead of moving the first one.
+    if (field === "dueDate") setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: (fresh.milestones || []).map(m =>
         m.id === mid
-          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}), ...extra }
+          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}) }
           : m),
     }));
+    let calNote = "";
+    if (field === "dueDate" && value) {
+      // selectedProject was refreshed by the save above, so this milestone
+      // already carries the new date (and its calendarEventId if it has one).
+      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
+      const calRes = await syncMilestoneCalendar(m, selectedProject);
+      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
+      if (calRes.success && calRes.eventId && !m.calendarEventId) {
+        // New event — record its id so future edits MOVE it instead of
+        // creating another. Best-effort: the milestone itself is saved.
+        try {
+          await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+            ...fresh,
+            milestones: (fresh.milestones || []).map(x =>
+              x.id === mid ? { ...x, calendarEventId: calRes.eventId } : x),
+          }));
+        } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+      }
+    }
     setStatus("billableScheduleStatus", "success", "✓ Updated" + calNote + ".");
   } catch (e) {
     setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
@@ -10093,15 +10174,29 @@ async function doSaveMilestone() {
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
       ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
     };
-    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
-    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
-    if (calResult.success) milestone.calendarEventId = calResult.eventId;
-
+    // Save FIRST, then create the calendar event, then patch the eventId in.
+    // The old order (event first) meant a save failure + user retry produced
+    // duplicate all-day events on the firm-wide NYC calendar.
     setStatus("milestoneStatus", "info", "⏳ Saving to project…");
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: [...(fresh.milestones || []), milestone],
     }));
+
+    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
+    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
+    if (calResult.success && calResult.eventId) {
+      milestone.calendarEventId = calResult.eventId;
+      // Best-effort: record the event id so later date edits MOVE this event
+      // rather than creating another. The milestone itself is already saved.
+      try {
+        await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+          ...fresh,
+          milestones: (fresh.milestones || []).map(m =>
+            m.id === milestone.id ? { ...m, calendarEventId: calResult.eventId } : m),
+        }));
+      } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+    }
 
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
     const pep = pickQuip(NEW_MILESTONE_QUIPS);
