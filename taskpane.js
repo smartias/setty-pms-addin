@@ -364,9 +364,9 @@ function setupEventListeners() {
       ).slice(0, 10);
       if (!matches.length) { dropdown.style.display = "none"; return; }
       dropdown.innerHTML = matches.map(p => `
-        <div class="proj-option" data-id="${p.id}">
-          <div class="proj-num">${p.projectNumber || ""}</div>
-          <div class="proj-name">${p.name || ""}</div>
+        <div class="proj-option" data-id="${escHtml(p.id)}">
+          <div class="proj-num">${escHtml(p.projectNumber || "")}</div>
+          <div class="proj-name">${escHtml(p.name || "")}</div>
         </div>
       `).join("");
       dropdown.style.display = "block";
@@ -2582,8 +2582,24 @@ function getConversationProjectMap() {
     return {};
   }
 }
+// Cap the per-email/per-thread tag maps. They accumulate one entry per tagged
+// email forever (~150-char REST-id keys) and were never pruned — months of
+// heavy filing eventually crowds the localStorage quota the projects cache
+// needs, and the only symptom is pane opens quietly getting slow again.
+// Plain-object string keys keep insertion order (and JSON round-trips preserve
+// it), so the FIRST keys are the oldest tags — drop those. Cloud thread tags
+// (pms_email_thread_tags) still restore anything pruned here.
+function _pruneMapToCap(map, cap) {
+  const keys = Object.keys(map);
+  if (keys.length <= cap) return map;
+  for (const k of keys.slice(0, keys.length - cap)) delete map[k];
+  return map;
+}
+function saveEmailProjectMap(map) {
+  localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 2000)));
+}
 function saveConversationProjectMap(map) {
-  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map || {}));
+  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 3000)));
 }
 async function saveSharedConversationProjectTag(conversationId, projectId) {
   if (!conversationId || !projectId) return;
@@ -2788,7 +2804,7 @@ async function clearProjectTagForCurrentEmail() {
     const map = getEmailProjectMap();
     if (map[msgId]) {
       delete map[msgId];
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
   }
   // Use shared key (handles both emails and appointments) so the cross-device
@@ -2951,7 +2967,7 @@ function setSelectedProject(project, persistForEmail = false) {
     if (msgId) {
       const map = getEmailProjectMap();
       map[msgId] = selectedProject.id;
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
     void (async () => {
       // Use the shared key (iCalUId for appointments, conversationId for emails)
@@ -3107,7 +3123,7 @@ async function restoreProjectSelectionForCurrentEmail() {
           if (msgId) {
             const map = getEmailProjectMap();
             map[msgId] = projectId;
-            localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+            saveEmailProjectMap(map);
           }
           const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
           if (myGen !== itemContextGeneration) return; // user moved on — don't tag the wrong thread
@@ -5925,15 +5941,21 @@ function encodeDrivePath(path) {
     .map(p => encodeURIComponent(p))
     .join("/");
 }
-// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders)
+// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders).
+// Retries transient failures and logs non-OK responses — a silently failed
+// create used to surface later as confusing 404s on the uploads into it.
+// Still never throws: the subsequent upload is the authoritative failure signal.
 async function ensureSpFolder(driveId, token, parentPath, name) {
   try {
-    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
+    const res = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
-    });
-  } catch {}
+    }, { label: "graph ensure folder" });
+    if (!res.ok && res.status !== 409) {
+      console.warn("[sp-folder] create HTTP", res.status, "for", parentPath + "/" + name);
+    }
+  } catch (e) { console.warn("[sp-folder] create failed:", name, e.message); }
   return parentPath + "/" + name;
 }
 // Extract the drive-relative path from a full SharePoint web URL
@@ -6248,156 +6270,6 @@ async function sha256Hex(bytes) {
   return hex;
 }
 
-// Microsoft Graph's QuickXorHash — a custom XOR-with-rotation digest used by
-// OneDrive/SharePoint. We only need this when sha256Hash isn't present on the
-// DriveItem (SharePoint's `file.hashes` facet usually returns quickXorHash by
-// default, sometimes sha1Hash; sha256Hash requires explicit enablement).
-// Spec: https://learn.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash
-// Implementation translated from the reference C# / Python.
-async function quickXorHashBase64(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const BITS_IN_LAST_CELL = 32;
-  const SHIFT = 11;
-  const WIDTH_BITS = 160;
-  const WIDTH_BYTES = 20;
-  // We maintain 160 bits as 5 × 32-bit lanes (little-endian inside each lane).
-  const lanes = new Uint32Array(5);
-  let shiftSoFar = 0;
-  let lengthSoFar = 0;
-
-  // Rotate-left of the lanes array by `bits`. Done by streaming each input byte
-  // into a moving 8-bit window. For performance + readability we operate on
-  // 8-bit groups and recompute the destination bit/lane each step.
-  for (let i = 0; i < bytes.length; i++) {
-    const currentShift = shiftSoFar;
-    const vectorArrayIndex = Math.floor(currentShift / 32) % 5;
-    const vectorOffset = currentShift % 32;
-    const nextVectorIndex = (vectorArrayIndex + 1) % 5;
-    const xoredByte = bytes[i];
-    // Lower bits of the byte XOR into the current lane shifted into position.
-    lanes[vectorArrayIndex] = (lanes[vectorArrayIndex] ^ (xoredByte << vectorOffset)) >>> 0;
-    // Bits that overflow the lane go into the next lane.
-    if (vectorOffset > 24) {
-      lanes[nextVectorIndex] = (lanes[nextVectorIndex] ^ (xoredByte >>> (32 - vectorOffset))) >>> 0;
-    }
-    shiftSoFar = (shiftSoFar + SHIFT) % WIDTH_BITS;
-    lengthSoFar++;
-  }
-
-  // Finalize by XORing the message length (8 bytes, little-endian) into the
-  // last 64 bits of the 160-bit state.
-  const out = new Uint8Array(WIDTH_BYTES);
-  for (let i = 0; i < 5; i++) {
-    out[i * 4 + 0] = (lanes[i] >>>  0) & 0xff;
-    out[i * 4 + 1] = (lanes[i] >>>  8) & 0xff;
-    out[i * 4 + 2] = (lanes[i] >>> 16) & 0xff;
-    out[i * 4 + 3] = (lanes[i] >>> 24) & 0xff;
-  }
-  // XOR the message length (in bytes, as 8-byte LE) into the last 8 bytes
-  let len = lengthSoFar;
-  for (let i = 0; i < 8; i++) {
-    out[WIDTH_BYTES - 8 + i] ^= (len & 0xff);
-    len = Math.floor(len / 256);
-  }
-  // base64 of the 20 bytes
-  let bin = "";
-  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i]);
-  return btoa(bin);
-}
-
-// SHA-1 (still occasionally surfaced by Graph). Web Crypto handles it.
-async function sha1Hex(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const digest = await crypto.subtle.digest("SHA-1", bytes);
-  const view = new Uint8Array(digest);
-  let hex = "";
-  for (let i = 0; i < view.length; i++) hex += view[i].toString(16).padStart(2, "0");
-  return hex.toUpperCase(); // Graph reports SHA-1 in uppercase hex
-}
-
-// Fetch metadata for a just-uploaded file. Returns { size, hashes } or null.
-async function fetchSpFileMetadata(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName) +
-      "?select=size,file";
-    const res = await fetchWithRetry(url, {
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph verify GET", maxAttempts: 3 });
-    if (!res.ok) return null;
-    const item = await res.json();
-    return {
-      size:   item?.size ?? null,
-      hashes: item?.file?.hashes || {},
-    };
-  } catch (e) {
-    console.warn("[verify] metadata GET failed:", safeName, e.message);
-    return null;
-  }
-}
-
-// Verify a just-uploaded file matches the local bytes we tried to send.
-// Returns:
-//   { ok: true,  algo, localHash, remoteHash } — verified clean
-//   { ok: false, reason } — mismatch or unable to verify
-async function verifyUploadedFile(driveId, token, targetPath, safeName, bytes) {
-  const meta = await fetchSpFileMetadata(driveId, token, targetPath, safeName);
-  if (!meta) return { ok: false, reason: "metadata GET failed" };
-
-  // Size check — fastest, most important. Any mismatch here is a hard fail
-  // regardless of which hash algorithm the server reports.
-  if (typeof meta.size === "number" && meta.size !== bytes.length) {
-    return {
-      ok: false,
-      reason: `size mismatch: local=${bytes.length} remote=${meta.size}`,
-    };
-  }
-
-  const hashes = meta.hashes || {};
-  // Prefer SHA-256 (only present if the tenant has it enabled), then SHA-1
-  // (deprecated but widely present), then quickXorHash (the SharePoint default).
-  if (hashes.sha256Hash) {
-    const local = (await sha256Hex(bytes)).toUpperCase();
-    const remote = String(hashes.sha256Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha256", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha256 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.sha1Hash) {
-    const local = await sha1Hex(bytes);
-    const remote = String(hashes.sha1Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha1", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha1 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.quickXorHash) {
-    const local = await quickXorHashBase64(bytes);
-    const remote = String(hashes.quickXorHash);
-    return local === remote
-      ? { ok: true,  algo: "quickXor", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `quickXor mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  // Server returned no hashes — fall back to size-only (already checked above
-  // and matched). Better than nothing.
-  return { ok: true, algo: "size-only", localHash: String(bytes.length), remoteHash: String(meta.size) };
-}
-
-// Delete an item at a path. Used by the verify-then-retry path when the
-// first upload landed corrupt and we need to clear the bad file before re-PUT.
-async function deleteSpFile(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName);
-    const res = await fetchWithRetry(url, {
-      method: "DELETE",
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph delete bad file", maxAttempts: 2 });
-    return res.ok || res.status === 404;
-  } catch (e) {
-    console.warn("[verify] delete failed:", safeName, e.message);
-    return false;
-  }
-}
 
 // Upload + verify. Strategy (corrected — see comment block below):
 //   1. PUT bytes
@@ -7212,35 +7084,6 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
     + "</div>";
 }
 
-// In-memory cache so a second click on Send-to-Teams doesn't re-hit Graph
-// for the channel email. Keyed by teamsChannelId. Reset on page reload —
-// no need to persist beyond a single Outlook session.
-const _channelEmailCache = {};
-
-// READ-ONLY channel email resolution. PMS deliberately doesn't request the
-// ChannelSettings.ReadWrite.All scope needed for `provisionEmail`, so we
-// only read here. If a channel hasn't had its email provisioned yet, the
-// user does it once via Teams ("⋯" menu → "Get email address"); after
-// that the read path returns the address every time.
-async function resolveChannelEmailAddin(project) {
-  const channelId = project?.teamsChannelId;
-  if (!channelId) return "";
-  if (_channelEmailCache[channelId]) return _channelEmailCache[channelId];
-  if (project.teamsChannelEmail) {
-    _channelEmailCache[channelId] = project.teamsChannelEmail;
-    return project.teamsChannelEmail;
-  }
-  try {
-    const ch = await graphFetch("GET", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}?$select=email`);
-    if (ch?.email) { _channelEmailCache[channelId] = ch.email; return ch.email; }
-    throw new Error("__NO_EMAIL__");
-  } catch (e) {
-    if (e.message === "__NO_EMAIL__") {
-      throw new Error('Channel has no email yet. In Teams, click "⋯" next to the channel name → "Get email address" → "Copy". That provisions it; the next click here will work.');
-    }
-    throw new Error("Graph: " + e.message);
-  }
-}
 
 // Fetch the current Outlook email's HTML body for forwarding. Returns ""
 // if no email is selected or the API errors.
@@ -7771,17 +7614,6 @@ async function doSaveActionItem() {
     saveInFlight = false;
   }
 }
-// ─── SHARED: file email+attachments into a project subfolder ─────────────────
-// `itemSnapshot` is the captured Office mailbox item — required to prevent
-// attachment-bytes corruption from item-switch races. Callers MUST capture
-// emailItem synchronously before any await and pass it in here.
-async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null, itemSnapshot = null) {
-  const subPath    = await ensureSpFolder(driveId, token, projFolderName, subfolder);
-  const recordPath = await ensureSpFolder(driveId, token, subPath, recordFolderName);
-  await uploadEmailAndAttachments(driveId, token, recordPath, itemSnapshot);
-  if (metadata) await writeSpMetadataSidecar(driveId, token, recordPath, metadata);
-  return SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
-}
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
 function setRfiMode(mode) {
   document.getElementById("rfiNewForm").style.display      = mode === "new"      ? "" : "none";
@@ -7798,15 +7630,18 @@ function setSubMode(mode) {
 function renderRfiPicker() {
   const sel  = document.getElementById("rfiExistingSelect");
   const rfis = selectedProject?.rfis || [];
+  // escHtml on title: RFI titles are prefilled from external email subjects,
+  // which can carry & < > " and corrupt the <option> markup unescaped.
   sel.innerHTML = rfis.length
-    ? rfis.map(r => `<option value="${r.id}">${r.number}${r.title ? " — " + r.title.slice(0, 45) : ""}</option>`).join("")
+    ? rfis.map(r => `<option value="${escHtml(r.id)}">${escHtml(r.number)}${r.title ? " — " + escHtml(r.title.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No RFIs on this project</option>';
 }
 function renderSubPicker() {
   const sel  = document.getElementById("subExistingSelect");
   const subs = selectedProject?.submittals || [];
+  // Same escaping rationale as renderRfiPicker.
   sel.innerHTML = subs.length
-    ? subs.map(s => `<option value="${s.id}">${s.number}${s.description ? " — " + s.description.slice(0, 45) : ""}</option>`).join("")
+    ? subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.number)}${s.description ? " — " + escHtml(s.description.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No submittals on this project</option>';
 }
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
@@ -8182,7 +8017,10 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
       width: { size: w, type: WidthType.DXA },
       children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
     });
-    const docxFileName = `${rfiId} Response ${dateSent.replace(/-/g, "")}.pdf`;
+    // Must match the ACTUAL uploaded artifact (submitRfiResponse's safeName) —
+    // this table is an auditable transmittal record; it used to reference a
+    // "<id> Response <date>.pdf" that never existed.
+    const docxFileName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
     return new Table({
       width: { size: 9360, type: WidthType.DXA },
       columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -8488,7 +8326,9 @@ async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned,
   }
   const toTable = new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [2200, 2200, 3300, 1660], rows: toRows });
 
-  const docxFileName = `${subId} Review ${dateSent.replace(/-/g, "")}.pdf`;
+  // Must match the ACTUAL uploaded artifact (submitSubReview's safeName) —
+  // same audit-record rationale as the RFI transmittal table.
+  const docxFileName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
   const contentsTable = new Table({
     width: { size: 9360, type: WidthType.DXA },
     columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -9713,8 +9553,11 @@ async function getNYCCalendarId() {
   try {
     const token = await getToken();
     const data  = await graphFetch("GET", "/me/calendars?$top=50", null, token);
+    // (c.name || ""): one null-named calendar in the list used to throw inside
+    // this swallowed try → null return → milestones silently landed on the
+    // user's PERSONAL calendar while the UI implied the shared one.
     const nyc   = (data?.value || []).find(c =>
-      c.name.toLowerCase().includes("nyc") || c.name.toLowerCase().includes("shared")
+      (c.name || "").toLowerCase().includes("nyc") || (c.name || "").toLowerCase().includes("shared")
     );
     if (nyc) {
       _nycCalendarId = nyc.id;
@@ -9988,9 +9831,9 @@ function extractDueDates(rawText, emailReceivedDate) {
     return a.iso.localeCompare(b.iso);
   });
 }
-function escHtml(s) {
-  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-}
+// (A duplicate, weaker escHtml used to live here — function-declaration
+// hoisting made it silently WIN over the 5-char version defined earlier,
+// removing single-quote escaping file-wide. Deleted; one escHtml now.)
 async function showDatesView() {
   showView("datesView");
   document.getElementById("milestoneForm").style.display = "none";
