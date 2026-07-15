@@ -4967,8 +4967,12 @@ async function getEmailDateReliable() {
   return emailItem?.dateTimeCreated || null;
 }
 
-async function getEmailBodyHtml(token) {
-  const item = Office.context.mailbox.item;
+// `itemSnapshot` (optional): the mailbox item captured by the caller before any
+// awaits. The save paths pass their snapshot so a fast item-switch mid-save
+// can't put a different email's body under the snapshotted header/folder.
+// Callers without a snapshot (watchlist, Teams share, date scan) read live.
+async function getEmailBodyHtml(token, itemSnapshot) {
+  const item = itemSnapshot || Office.context.mailbox.item;
   const msgId = item?.itemId;
   if (msgId && _emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
 
@@ -5847,7 +5851,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
   // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
   // sha256 + verified once read-back lands.
   lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [] };
-  const bodyHtml = await getEmailBodyHtml(token);
+  const bodyHtml = await getEmailBodyHtml(token, item); // snapshot — see header comment
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
   const emailHtmlPromise = fetch(
@@ -6055,18 +6059,29 @@ async function getOfficeFileAttachments(item) {
     });
   });
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
-  const out = [];
-  for (const att of fileAtts) {
-    const content = await new Promise((resolve, reject) => {
+  // Fetch attachment bytes with bounded concurrency. This used to be a serial
+  // for..await loop — with several attachments (esp. in Outlook on the web,
+  // where getAttachmentContentAsync is a network call) the byte fetch was the
+  // bottleneck even though the uploads downstream run 3-wide. Results are
+  // collected by index so `out` keeps fileAtts order (the uploader's
+  // name-uniquifying assumes stable ordering).
+  const FETCH_CONCURRENCY = 3;
+  const contents = new Array(fileAtts.length).fill(null);
+  for (let i = 0; i < fileAtts.length; i += FETCH_CONCURRENCY) {
+    const batch = fileAtts.slice(i, i + FETCH_CONCURRENCY);
+    await Promise.all(batch.map((att, bi) => new Promise((resolve, reject) => {
       // CRITICAL: use the captured `item`, not the live module global.
       item.getAttachmentContentAsync(att.id, (res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
         else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
       });
-    }).catch((e) => {
-      console.warn("Office attachment content failed:", att.name, e.message);
-      return null;
-    });
+    }).then(content => { contents[i + bi] = content; })
+      .catch((e) => { console.warn("Office attachment content failed:", att.name, e.message); })));
+  }
+  const out = [];
+  for (let idx = 0; idx < fileAtts.length; idx++) {
+    const att = fileAtts[idx];
+    const content = contents[idx];
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
     const bytes = toBytesFromBase64(content.content);
     // Skip small inline images (signature logos, social icons, banners) — same
@@ -6094,7 +6109,11 @@ async function getOfficeFileAttachments(item) {
 // returns 413 (or in some corner cases, just hangs) and the file fails to
 // upload. We auto-dispatch to the upload-session API for anything > threshold.
 const SP_SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024;          // 4 MiB
-const SP_UPLOAD_CHUNK_SIZE = 5 * 320 * 1024;           // 1.6 MiB — multiple of 320 KiB (Graph requirement)
+const SP_UPLOAD_CHUNK_SIZE = 32 * 320 * 1024;          // 10 MiB — multiple of 320 KiB (Graph requirement).
+// Graph recommends 5–10 MiB chunks; the old 1.6 MiB made a 40MB file take ~25
+// serial round-trip PUTs. Bigger chunks = far fewer round trips on big files,
+// and the per-chunk retry in uploadLargeAttachmentToSharePoint still bounds
+// how much a transient failure re-sends.
 
 // ─── INTEGRITY HASHING ───────────────────────────────────────────────────────
 // SHA-256 of the local bytes via Web Crypto. Used by the read-back verification
@@ -6695,7 +6714,7 @@ if (existingRecord) {
     // Track body-fetch failure separately so we can surface it in the success
     // message — previously a silent "" fallback meant the user thought everything
     // worked but the email record had no readable body.
-    let bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token, snapItem);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     // Inline images arrive as cid: refs (bytes live as inline attachments) and
     // don't render in the PMS log — re-embed them as downscaled data: URIs so they
