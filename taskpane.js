@@ -1739,6 +1739,21 @@ const SB_HEADERS = {
   "Content-Type": "application/json",
   "Prefer": "return=minimal",
 };
+
+// Shared suite sign-in (setty-auth.js, loaded cross-repo from /setty-pms/).
+// Shim keeps the pane fully functional if that script ever fails to load —
+// filing must never die on an auth nicety. SB_HEADERS is read at call time
+// everywhere, so mutating Authorization covers all ~30 call sites. Taskpanes
+// can't full-page redirect, so the pill uses the popup flow (same pattern as
+// the pane's existing MSAL popups).
+const _settyAuth = window.settyAuth || {
+  init: async () => null, onChange() {}, token: () => SUPABASE_ANON,
+  isSignedIn: () => false, mountPill() {}, signInPopup: async () => null,
+};
+const settyAuthReady = _settyAuth.init().catch(() => null).then(() => _syncSettyAuth());
+function _syncSettyAuth() { SB_HEADERS.Authorization = "Bearer " + _settyAuth.token(); }
+_settyAuth.onChange(_syncSettyAuth);
+_settyAuth.mountPill({ label: "🔐 Sign in", onClick: () => _settyAuth.signInPopup() });
 // localStorage cache for the projects/clients picker. Two changes vs prior
 // "v2" format:
 //   1. Strip projects + clients down to the fields the pane actually reads
@@ -1957,6 +1972,7 @@ async function sbFetchAllRows(pathQuery, label) {
 }
 
 async function loadProjects() {
+  await settyAuthReady;   // session header set before the first Supabase read
   // Hydrate from cache instantly (if available) so the pane is responsive
   // even before the fresh fetch returns. The cache holds the *projects array*
   // (post-archived-filter) and the version map; we'll overwrite both when

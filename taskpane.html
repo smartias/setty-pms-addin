@@ -8,9 +8,12 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-06-25-billable-cal";</script>
+  <script>window.__appVersion = "2026-07-16-supabase-auth";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
+  <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
+       repo on the same origin so the session is shared with the web apps). -->
+  <script src="https://smartias.github.io/setty-pms/setty-auth.js"></script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   <!-- docx: generates DOCX cover sheets for RFI Responses and Submittal Reviews
@@ -1338,6 +1341,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-07-15-review-batch-full"></script>
+<script src="taskpane.js?v=2026-07-16-supabase-auth"></script>
 </body>
 </html>
