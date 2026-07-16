@@ -20,6 +20,19 @@ const SP_BASE_URL = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Do
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
 const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtoeG1namlsd2hkZ3V1ZXBiaG5lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwNjg2MDYsImV4cCI6MjA4ODY0NDYwNn0.vtHt2eydU2iQ426iYOzLrqpH2WLXdRnicq-3sNfoNq8";
 const SB_HEADERS = { "apikey": SUPABASE_ANON, "Authorization": "Bearer " + SUPABASE_ANON };
+
+// Shared suite sign-in (setty-auth.js, loaded cross-repo). Shim keeps the pane
+// working if the script fails to load; popup flow because taskpanes can't
+// full-page redirect. SB_HEADERS is read at call time, so mutating it covers
+// every Supabase call below.
+const _settyAuth = window.settyAuth || {
+  init: async () => null, onChange() {}, token: () => SUPABASE_ANON,
+  isSignedIn: () => false, mountPill() {}, signInPopup: async () => null,
+};
+const settyAuthReady = _settyAuth.init().catch(() => null).then(() => _syncSettyAuth());
+function _syncSettyAuth() { SB_HEADERS.Authorization = "Bearer " + _settyAuth.token(); }
+_settyAuth.onChange(_syncSettyAuth);
+_settyAuth.mountPill({ label: "🔐 Sign in", onClick: () => _settyAuth.signInPopup() });
 const PROJECTS_CACHE_KEY = "settyPmsWord:projectsCache";
 const PROJECTS_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 const LAST_ACCOUNT_STORAGE_KEY = "settyPmsWord:lastMsalAccountHomeId";
@@ -584,6 +597,7 @@ function onDocMaybeChanged() {
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
 async function loadProjects() {
+  await settyAuthReady;   // session header set before the first Supabase read
   // Cache-first hydrate
   try {
     const raw = localStorage.getItem(PROJECTS_CACHE_KEY);

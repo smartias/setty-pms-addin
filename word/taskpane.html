@@ -6,6 +6,8 @@
   <title>Setty PMS Filer</title>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="../msal-browser.min.js"></script>
+  <!-- Shared suite sign-in (Supabase session layer, same origin as the web apps). -->
+  <script src="https://smartias.github.io/setty-pms/setty-auth.js"></script>
   <style>
     :root {
       --navy: #003865;
@@ -754,6 +756,6 @@
 
   </div>
 
-  <script src="taskpane.js?v=20260716-sendemail"></script>
+  <script src="taskpane.js?v=20260716-supabase-auth"></script>
 </body>
 </html>
