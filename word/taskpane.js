@@ -156,6 +156,7 @@ function setupListeners() {
   document.getElementById("openSpFolderBtn").onclick  = openSelectedProjectSpFolder;
   document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
   document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
+  document.getElementById("newVersionBtn").onclick    = doStartNewVersion;
   document.getElementById("titleInput").addEventListener("input", updateSavePreview);
   const spSearch = document.getElementById("spFolderSearch");
   if (spSearch) spSearch.addEventListener("input", () => renderSpFolderRows(spSearch.value));
@@ -293,7 +294,7 @@ function updateFiledCard() {
   // SharePoint copy — edits AutoSave and there's nothing to reopen. Show a calm
   // confirmation and hide the open action, so people aren't told to "open the
   // SharePoint copy" when they're already in it.
-  const inCloudCopy = /^https?:\/\//i.test(currentDocUrl || "");
+  const inCloudCopy = isEditingFiledCloudCopy();
   if (inCloudCopy) {
     if (inner) inner.classList.remove("is-dirty");
     if (headEl) headEl.textContent = "✓ Filed — AutoSave is on";
@@ -589,10 +590,25 @@ function registerChangeWatcher() {
 function onDocMaybeChanged() {
   if (isExporting) return;                                   // our own file/settings writes — not a user edit
   if (dirtySinceFiled || !draftSaved) return;                // already flagged, or nothing filed yet to drift from
-  if (/^https?:\/\//i.test(currentDocUrl || "")) return;     // cloud copy AutoSaves — never "unsynced"
+  if (isEditingFiledCloudCopy()) return;                     // cloud copy AutoSaves — never "unsynced"
   dirtySinceFiled = true;
   updateFiledCard();
   updateSaveButtons();   // reflect "● edits pending" on the update button
+}
+
+// True when the OPEN document is the same file the pane last filed — only then
+// does "the cloud copy AutoSaves" apply. After "Start a new version" (or a
+// rename-and-refile), the filed draft is a DIFFERENT file from the one open in
+// Word, so edits here no longer land in the filed copy.
+function isEditingFiledCloudCopy() {
+  if (!/^https?:\/\//i.test(currentDocUrl || "")) return false;
+  if (!draftFileName) return true;   // nothing filed to compare against — old behavior
+  try {
+    const urlName = decodeURIComponent(currentDocUrl).split(/[\\/]/).pop() || "";
+    return urlName.toLowerCase() === draftFileName.toLowerCase();
+  } catch {
+    return true;
+  }
 }
 
 // ─── PROJECTS ─────────────────────────────────────────────────────────────────
@@ -911,6 +927,9 @@ function updateSaveButtons() {
   pdfBtn.disabled = !spReady || saveInFlight;
   document.getElementById("savePdfLabel").textContent =
     "Export PDF to SharePoint" + (spReady ? projTag : "");
+
+  const nvBtn = document.getElementById("newVersionBtn");
+  if (nvBtn) nvBtn.disabled = !spReady || saveInFlight;
 
   const hasProject = !!selectedProject;
   document.getElementById("insertNameBtn").disabled      = !hasProject;
@@ -1311,6 +1330,10 @@ function renderStatusBar() {
   if (dot)  dot.style.background  = opt.dot;
   if (lbl)  lbl.textContent       = opt.label;
   if (hint) hint.textContent      = opt.hint;
+  // "Start a new version" only makes sense once the document has gone Final
+  // (PDF exported) — before that, plain editing and re-filing cover it.
+  const nvWrap = document.getElementById("newVersionWrap");
+  if (nvWrap) nvWrap.style.display = docStatus === "final" ? "block" : "none";
 }
 
 // ─── DONE-EDITING ─────────────────────────────────────────────────────────────
@@ -1541,6 +1564,94 @@ async function doSavePdf() {
     isExporting = false;
     saveInFlight = false;
     updateSaveButtons();
+  }
+}
+
+// ─── NEW VERSION ─────────────────────────────────────────────────────────────
+// "Report" → "Report v2"; "Report v2" → "Report v3". The printed original
+// counts as v1, so an unversioned name jumps straight to v2.
+function bumpVersionName(base) {
+  const m = base.match(/^(.*?)[ _-]*[vV](\d+)$/);
+  if (m) return m[1].replace(/[ _.-]+$/, "") + " v" + (parseInt(m[2], 10) + 1);
+  return base + " v2";
+}
+
+// After a PDF export marks the document Final, this starts the next round:
+// files the current content as a fresh "<name> v#.docx" in the SAME folder,
+// clears the sign-off list, and flips status back to Draft — both in this open
+// document and inside the uploaded copy (settings are flushed before the file
+// is read out, so the v# copy opens clean).
+async function doStartNewVersion() {
+  if (!selectedProject) { setStatus("newVersionStatus", "error", "Pick a project first."); return; }
+  if (saveInFlight) return;
+  saveInFlight = true;
+  updateSaveButtons();
+  const linkEl = document.getElementById("newVersionLink");
+  if (linkEl) linkEl.innerHTML = "";
+
+  const titleInput = document.getElementById("titleInput");
+  const currentBase = (titleInput?.value || "").trim().replace(/\.(docx|pdf)$/i, "")
+    || docFilename.replace(/\.[^.]+$/, "")
+    || "Document";
+  const newBase = bumpVersionName(currentBase);
+  const uploadFilename = newBase + ".docx";
+  // Same folder as the filed draft; a doc that was only ever PDF-exported falls
+  // back to the current picker folder (where that PDF just went).
+  const targetPath = (draftSaved && draftFolderPath) ? draftFolderPath : spCurrentPath;
+
+  // Snapshot so a failed upload can put the sign-offs and status back.
+  const prevStatus = docStatus;
+  const prevDone   = doneEditingList.slice();
+  const prevDraft  = { draftSaved, draftFolderPath, draftBaseName, draftFileName, draftWebUrl };
+  try {
+    isExporting = true;   // our own settings/file writes are not user edits
+    setStatus("newVersionStatus", "info", "⏳ Preparing " + uploadFilename + "…");
+    docStatus = "draft";
+    doneEditingList = [];
+    Office.context.document.settings.set(DOC_DONE_KEY, JSON.stringify(doneEditingList));
+    persistDocSettings();
+    await flushSettings();
+    const docxBlob = await getDocumentAsDocxBlob();
+    setStatus("newVersionStatus", "info", "⏳ Filing " + uploadFilename + " to SharePoint…");
+    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, targetPath, "rename");
+
+    // The new version is now the filed draft this pane tracks.
+    draftSaved      = true;
+    draftBaseName   = uploadFilename;
+    draftFileName   = item.name;
+    draftFolderPath = targetPath;
+    draftWebUrl     = item.webUrl || "";
+    dirtySinceFiled = false;
+    spCurrentPath   = targetPath;
+    persistDocSettings();
+    await flushSettings();
+    if (titleInput) titleInput.value = item.name.replace(/\.docx$/i, "");
+
+    setStatus("newVersionStatus", "success",
+      "✓ " + item.name + " created — sign-offs cleared, status back to Draft");
+    fxFileDrop(document.getElementById("newVersionBtn"), "📄");
+    if (linkEl && item.webUrl) {
+      const openUrl = item.webUrl;
+      linkEl.innerHTML = `<a href="#" id="openNewVersionLink">📝 Open ${escapeHtml(item.name)} to edit →</a>`;
+      document.getElementById("openNewVersionLink").onclick = (e) => { e.preventDefault(); openExternalUrl(openUrl); };
+    }
+  } catch (e) {
+    // The new version never landed — restore status and sign-offs untouched.
+    docStatus = prevStatus;
+    doneEditingList = prevDone;
+    ({ draftSaved, draftFolderPath, draftBaseName, draftFileName, draftWebUrl } = prevDraft);
+    Office.context.document.settings.set(DOC_DONE_KEY, JSON.stringify(doneEditingList));
+    persistDocSettings();
+    await flushSettings();
+    setStatus("newVersionStatus", "error", e.message);
+  } finally {
+    isExporting = false;
+    saveInFlight = false;
+    renderStatusBar();
+    renderDoneEditing();
+    updateSaveButtons();
+    updateFiledCard();
+    updateDestCard();
   }
 }
 

@@ -441,6 +441,10 @@
     #savePdfBtn { margin-top: 6px; }
     /* Send-in-Email button — hidden until a PDF export succeeds this session. */
     #sendEmailBtn { margin-top: 6px; display: none; width: 100%; }
+    /* New-version block — hidden until the document goes Final. */
+    #newVersionWrap { margin-bottom: 10px; }
+    #newVersionBtn  { width: 100%; }
+    .new-version-hint { font-size: 10px; color: var(--muted); margin-top: 4px; }
 
     /* ─── Brand-colored save buttons ────────────────────────────────────
        Each save button is tinted to its destination app, with a white
@@ -720,6 +724,19 @@
         <span class="status-dot" id="statusDot"></span>
         <span class="status-label-text" id="statusLabelText">Draft</span>
         <span class="status-hint" id="statusHint"></span>
+      </div>
+
+      <!-- Start a new version — appears once the doc is Final. Files the
+           current content as "<name> v#.docx" in the same folder, clears the
+           sign-off list, and resets status to Draft. -->
+      <div id="newVersionWrap" style="display:none">
+        <button id="newVersionBtn" class="brand-btn brand-word">
+          <span class="brand-ico">W</span>
+          <span class="brand-label">🔄 Start a new version</span>
+        </button>
+        <div class="new-version-hint">Copies this document as the next “v#”, clears sign-offs, and reopens editing.</div>
+        <div id="newVersionStatus" class="status"></div>
+        <div id="newVersionLink" class="footer-link"></div>
       </div>
 
       <!-- Done-editing checklist — kept as a sign-off record after Final -->
