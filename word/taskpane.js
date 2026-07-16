@@ -8,6 +8,11 @@ const MSAL_CONFIG = {
   cache: { cacheLocation: "localStorage" }
 };
 const GRAPH_SCOPES = ["User.Read", "Notes.ReadWrite", "Files.ReadWrite.All"];
+// Requested ON-DEMAND only (same pattern as the Outlook pane's shared-mail
+// scope): kept out of the default sign-in so first-run consent is unchanged.
+// The first click of "Send in Email" triggers a one-time per-user consent
+// popup; afterwards the token is acquired silently like any other.
+const MAIL_DRAFT_SCOPES = ["Mail.ReadWrite"];
 const TEAMS_TEAM_ID = "a4c48361-7991-43db-af83-4c854918a760";
 // SharePoint — same hardcoded drive ID the Outlook add-in uses (no admin consent needed).
 const SP_DRIVE_ID = "b!ZARYqukTtE6K1Mpv9bngAehneskb-yNKopp1Ol1X1BBnJPKsNGM-TaGmbGiL3ZaU";
@@ -54,6 +59,13 @@ let draftWebUrl = "";       // SharePoint webUrl of the filed .docx (for "open t
 let spCurrentPath = "";
 let spProjectRootPath = "";
 let _spFolders = [];   // folder names at the currently-browsed level (for the picker filter)
+// Last successful PDF export, kept in memory so "Send in Email" can attach it
+// without re-exporting. Session-only: the button hides on reload or when a new
+// export starts, and reappears once that export succeeds.
+let lastPdfBlob = null;
+let lastPdfName = "";
+let lastPdfWebUrl = "";
+let emailInFlight = false;
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 // Surface any unhandled error directly into the pane so a startup crash never
@@ -119,6 +131,7 @@ function setupListeners() {
   document.getElementById("saveOneNoteBtn").onclick   = doSaveToOneNote;
   document.getElementById("saveSpDraftBtn").onclick   = doSaveDraft;
   document.getElementById("savePdfBtn").onclick       = doSavePdf;
+  document.getElementById("sendEmailBtn").onclick     = doSendPdfEmail;
   document.getElementById("insertNameBtn").onclick    = () => doInsertField("name");
   document.getElementById("insertNumberBtn").onclick  = () => doInsertField("number");
   document.getElementById("insertClientBtn").onclick  = () => doInsertField("client");
@@ -313,15 +326,22 @@ function openSharePointCopy() {
   // The honest ceiling for the two-window confusion: Office.js can't close this
   // local copy for the user, so tell them it's safe to abandon once Word opens.
   setStatus("spStatus", "info", "Opening in Word… once it's up, you can close this window safely.");
+  openExternalUrl(draftWebUrl);
+}
+
+// Opens a URL in the system browser. openBrowserWindow is the reliable path
+// from inside an Office taskpane (WebView2 may swallow window.open).
+function openExternalUrl(url) {
+  if (!url) return;
   try {
     if (Office?.context?.ui?.openBrowserWindow) {
-      Office.context.ui.openBrowserWindow(draftWebUrl);
+      Office.context.ui.openBrowserWindow(url);
       return;
     }
   } catch (e) {
     console.warn("openBrowserWindow failed, falling back to window.open:", e);
   }
-  window.open(draftWebUrl, "_blank");
+  window.open(url, "_blank");
 }
 
 function openSelectedProjectInPms() {
@@ -500,6 +520,19 @@ async function doSignOut() {
 async function getToken() {
   const result = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: msalAccount });
   return result.accessToken;
+}
+
+// Mail token is separate from getToken(): Mail.ReadWrite is requested on
+// demand, so the silent call fails the first time (no consent yet) — fall
+// back to a consent popup once; every later call resolves silently.
+async function getMailToken() {
+  try {
+    const r = await msalApp.acquireTokenSilent({ scopes: MAIL_DRAFT_SCOPES, account: msalAccount });
+    return r.accessToken;
+  } catch {
+    const r = await msalApp.acquireTokenPopup({ scopes: MAIL_DRAFT_SCOPES, account: msalAccount });
+    return r.accessToken;
+  }
 }
 
 async function onSignedIn() {
@@ -1458,6 +1491,7 @@ async function doSavePdf() {
   saveInFlight = true;
   updateSaveButtons();
   document.getElementById("spLink").innerHTML = "";
+  hideSendEmail();   // stale PDF — the button reappears when this export succeeds
   const titleInput = document.getElementById("titleInput");
   // The Document Name field drives the saved filename.
   const baseName = (titleInput.value || "").trim()
@@ -1482,12 +1516,144 @@ async function doSavePdf() {
     fxFileDrop(document.getElementById("savePdfBtn"), "📄");
     document.getElementById("spLink").innerHTML =
       `<a href="${pdfItem.webUrl}" target="_blank">📄 ${escapeHtml(pdfItem.name)}</a>`;
+    // Keep the exported PDF around so "Send in Email" can attach it.
+    lastPdfBlob = pdfBlob;
+    lastPdfName = pdfItem.name;
+    lastPdfWebUrl = pdfItem.webUrl;
+    showSendEmail();
   } catch (e) {
     setStatus("spStatus", "error", e.message);
   } finally {
     isExporting = false;
     saveInFlight = false;
     updateSaveButtons();
+  }
+}
+
+// ─── SEND IN EMAIL ────────────────────────────────────────────────────────────
+// Creates an Outlook draft with the exported PDF attached, then opens it in
+// Outlook on the web for the user to address and send. Nothing is sent from
+// here — recipients and the Send button stay with the user.
+
+// Graph caps JSON-inline attachments at ~3 MB; bigger PDFs go through an
+// attachment upload session in chunks (size must be a multiple of 320 KiB).
+const INLINE_ATTACH_MAX = 3 * 1024 * 1024;
+const UPLOAD_CHUNK = 327680 * 10;   // 3.2 MB
+
+function showSendEmail() {
+  const btn = document.getElementById("sendEmailBtn");
+  if (btn) btn.style.display = "flex";
+}
+
+function hideSendEmail() {
+  const btn = document.getElementById("sendEmailBtn");
+  if (btn) btn.style.display = "none";
+  const status = document.getElementById("emailStatus");
+  if (status) { status.className = "status"; status.textContent = ""; }
+  const link = document.getElementById("emailLink");
+  if (link) link.innerHTML = "";
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload  = () => resolve(String(fr.result).split(",", 2)[1] || "");
+    fr.onerror = () => reject(new Error("Could not read the PDF for attaching"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function doSendPdfEmail() {
+  if (!lastPdfBlob) { setStatus("emailStatus", "error", "Export a PDF first."); return; }
+  if (emailInFlight) return;
+  emailInFlight = true;
+  const btn = document.getElementById("sendEmailBtn");
+  if (btn) btn.disabled = true;
+  const linkEl = document.getElementById("emailLink");
+  if (linkEl) linkEl.innerHTML = "";
+  try {
+    setStatus("emailStatus", "info", "⏳ Creating email draft…");
+    const token = await getMailToken();
+    // Footer only — the message itself is the user's to write. The SharePoint
+    // link gives recipients (and the sender, later) the filed copy.
+    const bodyHtml =
+      `<br/><br/><div style="font-size:12px;color:#666">Attached: ${escapeHtml(lastPdfName)}` +
+      (lastPdfWebUrl ? ` — <a href="${escapeHtml(lastPdfWebUrl)}">filed copy on SharePoint</a>` : "") +
+      `</div>`;
+    const draftPayload = {
+      subject: lastPdfName.replace(/\.pdf$/i, ""),
+      body: { contentType: "html", content: bodyHtml },
+    };
+    const smallEnough = lastPdfBlob.size <= INLINE_ATTACH_MAX;
+    if (smallEnough) {
+      draftPayload.attachments = [{
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        name: lastPdfName,
+        contentType: "application/pdf",
+        contentBytes: await blobToBase64(lastPdfBlob),
+      }];
+    }
+    const res = await fetch("https://graph.microsoft.com/v1.0/me/messages", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(draftPayload),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error("Draft create failed (" + res.status + "): " + errText.slice(0, 300));
+    }
+    const draft = await res.json();
+    if (!smallEnough) {
+      setStatus("emailStatus", "info", "⏳ Attaching PDF (large file)…");
+      await uploadLargeAttachment(token, draft.id, lastPdfBlob, lastPdfName);
+    }
+    setStatus("emailStatus", "success", "✓ Draft created — opening in Outlook…");
+    fxPaperPlane(btn);
+    // Fallback link in case the browser window is blocked or closed too soon.
+    if (linkEl && draft.webLink) {
+      linkEl.innerHTML = `<a href="${escapeHtml(draft.webLink)}" target="_blank">✉️ Open the draft</a>`;
+    }
+    openExternalUrl(draft.webLink);
+  } catch (e) {
+    setStatus("emailStatus", "error", e.message);
+  } finally {
+    emailInFlight = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Outlook large-attachment upload session. The uploadUrl is pre-authenticated,
+// so the chunk PUTs carry no Authorization header.
+async function uploadLargeAttachment(token, messageId, blob, name) {
+  const sessRes = await fetch(
+    `https://graph.microsoft.com/v1.0/me/messages/${messageId}/attachments/createUploadSession`, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      AttachmentItem: { attachmentType: "file", name, size: blob.size }
+    }),
+  });
+  if (!sessRes.ok) {
+    const errText = await sessRes.text().catch(() => "");
+    throw new Error("Attachment session failed (" + sessRes.status + "): " + errText.slice(0, 300));
+  }
+  const session = await sessRes.json();
+  let offset = 0;
+  while (offset < blob.size) {
+    const end = Math.min(offset + UPLOAD_CHUNK, blob.size);
+    const putRes = await fetch(session.uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Range": `bytes ${offset}-${end - 1}/${blob.size}`,
+      },
+      body: blob.slice(offset, end),
+    });
+    if (!putRes.ok) {
+      const errText = await putRes.text().catch(() => "");
+      throw new Error("Attachment upload failed (" + putRes.status + "): " + errText.slice(0, 300));
+    }
+    offset = end;
   }
 }
 

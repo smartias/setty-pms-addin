@@ -437,6 +437,8 @@
     /* PDF button — full width, below the main save row. Color comes from the
        .brand-bluebeam class; only the layout spacing lives here. */
     #savePdfBtn { margin-top: 6px; }
+    /* Send-in-Email button — hidden until a PDF export succeeds this session. */
+    #sendEmailBtn { margin-top: 6px; display: none; width: 100%; }
 
     /* ─── Brand-colored save buttons ────────────────────────────────────
        Each save button is tinted to its destination app, with a white
@@ -456,12 +458,15 @@
     .brand-word     { background: #2B579A; }   /* Microsoft Word blue      */
     .brand-onenote  { background: #7719AA; }   /* Microsoft OneNote purple */
     .brand-bluebeam { background: #0072CE; }   /* Bluebeam blue            */
+    .brand-outlook  { background: #0F6CBD; }   /* Microsoft Outlook blue   */
     .brand-word:hover:not(:disabled)     { background: #1f4178; }
     .brand-onenote:hover:not(:disabled)  { background: #5f1488; }
     .brand-bluebeam:hover:not(:disabled) { background: #005ba6; }
+    .brand-outlook:hover:not(:disabled)  { background: #0b5697; }
     .brand-word     .brand-ico { color: #2B579A; }
     .brand-onenote  .brand-ico { color: #7719AA; }
     .brand-bluebeam .brand-ico { color: #0072CE; }
+    .brand-outlook  .brand-ico { color: #0F6CBD; }
 
     /* ─── Celebrations ──────────────────────────────────────────────────
        Fun, lightweight feedback for the add-in's key moments. Every effect
@@ -682,6 +687,16 @@
       <div id="spStatus" class="status"></div>
       <div id="spLink" class="footer-link"></div>
 
+      <!-- Send in Email — appears after a successful PDF export. Creates an
+           Outlook draft with the PDF attached and opens it for addressing;
+           nothing is sent until the user hits Send in Outlook. -->
+      <button id="sendEmailBtn" class="brand-btn brand-outlook">
+        <span class="brand-ico">O</span>
+        <span class="brand-label">✉️ Send in Email</span>
+      </button>
+      <div id="emailStatus" class="status"></div>
+      <div id="emailLink" class="footer-link"></div>
+
       <!-- ⑤ Draft-filed confirmation — appears once a .docx draft is filed to
            SharePoint. "Open the SharePoint copy" is the real fix for AutoSave:
            the document open here is a detached local copy that never syncs on
@@ -739,6 +754,6 @@
 
   </div>
 
-  <script src="taskpane.js?v=20260715-pmdefault"></script>
+  <script src="taskpane.js?v=20260716-sendemail"></script>
 </body>
 </html>
