@@ -6,6 +6,7 @@
   <title>Setty PMS Filer</title>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="../msal-browser.min.js"></script>
+  <script src="../jszip.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, same origin as the web apps). -->
   <script src="https://smartias.github.io/setty-pms/setty-auth.js"></script>
   <style>
@@ -79,6 +80,17 @@
       font-family: inherit;
     }
     input:focus { outline: none; border-color: var(--accent); }
+    select {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    select:focus { outline: none; border-color: var(--accent); }
     .field { margin-bottom: 14px; }
     .project-list {
       max-height: 260px;
@@ -748,6 +760,32 @@
         <div id="doneEditingList"><div class="done-empty">No one has marked done yet.</div></div>
       </div>
 
+      <!-- New document from a Setty template — created directly in SharePoint,
+           so AutoSave is on from the first keystroke and the whole file-then-
+           hand-off dance (and its 423 lock) never applies. -->
+      <div class="section-tight" id="newDocSection">
+        <div class="save-section-title">New document</div>
+        <div class="save-section-sub">Starts the file in SharePoint — AutoSave from the first keystroke, no filing step.</div>
+        <button id="newDocToggleBtn" class="btn-insert" style="width:100%" disabled>➕ New from template…</button>
+        <div id="newDocPicker" style="display:none;margin-top:8px">
+          <div class="field" style="margin-bottom:8px">
+            <label for="templateSelect">Template</label>
+            <select id="templateSelect"><option value="">Loading templates…</option></select>
+          </div>
+          <div class="field" style="margin-bottom:8px">
+            <label for="newDocNameInput">File name</label>
+            <input type="text" id="newDocNameInput" placeholder="Document name" autocomplete="off" />
+            <div id="newDocPreview" class="save-preview"></div>
+          </div>
+          <button id="createNewDocBtn" class="brand-btn brand-word" disabled>
+            <span class="brand-ico">W</span>
+            <span class="brand-label">Create &amp; open in Word</span>
+          </button>
+          <div id="newDocStatus" class="status"></div>
+          <div id="newDocLink" class="footer-link"></div>
+        </div>
+      </div>
+
       <!-- Insert: smaller, lower in the pane since saves are the primary action -->
       <div class="section-tight">
         <div class="save-section-title">Insert at cursor</div>
@@ -773,6 +811,6 @@
 
   </div>
 
-  <script src="taskpane.js?v=20260716-supabase-auth"></script>
+  <script src="taskpane.js?v=20260717-new-from-template"></script>
 </body>
 </html>

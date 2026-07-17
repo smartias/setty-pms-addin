@@ -38,6 +38,12 @@ const PROJECTS_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 const LAST_ACCOUNT_STORAGE_KEY = "settyPmsWord:lastMsalAccountHomeId";
 const TARGET_SECTION_NAME = "Documents"; // fixed section per product decision
 const PMS_PROJECT_BASE_URL = "https://smartias.github.io/setty-pms/SettyPMS.html#project:";
+// Setty document templates — same drive as everything else, so the existing
+// Graph token covers them. Word templates only (.docx/.dotx); Excel ones in
+// the folder are filtered out.
+const TEMPLATES_PATH = "SAPX26XXX - NY 2026 Templates and Standards/01 📋 Project Management/Templates for MCP Connector";
+const TEMPLATES_CACHE_KEY = "settyPmsWord:templatesCache";
+const TEMPLATES_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
 
 // ─── DOCUMENT STATUS ─────────────────────────────────────────────────────────
 const DOC_STATUS_OPTIONS = [
@@ -79,6 +85,9 @@ let lastPdfBlob = null;
 let lastPdfName = "";
 let lastPdfWebUrl = "";
 let emailInFlight = false;
+// New-document-from-template state.
+let _templates = [];        // [{ id, name }] from the templates folder
+let newDocInFlight = false;
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 // Surface any unhandled error directly into the pane so a startup crash never
@@ -157,6 +166,10 @@ function setupListeners() {
   document.getElementById("destChangeBtn").onclick    = () => toggleOpt("spFolderEdit");
   document.getElementById("toggleDoneBtn").onclick    = toggleCurrentUserDone;
   document.getElementById("newVersionBtn").onclick    = doStartNewVersion;
+  document.getElementById("newDocToggleBtn").onclick  = toggleNewDocPicker;
+  document.getElementById("createNewDocBtn").onclick  = doCreateFromTemplate;
+  document.getElementById("templateSelect").onchange  = onTemplatePicked;
+  document.getElementById("newDocNameInput").oninput  = () => { updateNewDocPreview(); updateNewDocButtons(); };
   document.getElementById("titleInput").addEventListener("input", updateSavePreview);
   const spSearch = document.getElementById("spFolderSearch");
   if (spSearch) spSearch.addEventListener("input", () => renderSpFolderRows(spSearch.value));
@@ -425,6 +438,7 @@ async function renderSpPicker() {
   const destDisplay = document.getElementById("destFolderDisplay");
   if (destDisplay) destDisplay.textContent = parts.length ? parts.join(" / ") : "Library root";
   updateSavePreview();
+  updateNewDocPreview();   // the new-from-template preview shows the same folder
   crumbs.querySelectorAll("span").forEach(s => {
     s.onclick = async () => {
       const depth = parseInt(s.getAttribute("data-depth"), 10);
@@ -937,6 +951,8 @@ function updateSaveButtons() {
   const nvBtn = document.getElementById("newVersionBtn");
   if (nvBtn) nvBtn.disabled = !spReady || saveInFlight;
 
+  updateNewDocButtons();
+
   const hasProject = !!selectedProject;
   document.getElementById("insertNameBtn").disabled      = !hasProject;
   document.getElementById("insertNumberBtn").disabled    = !hasProject;
@@ -1038,6 +1054,181 @@ function uploadDocxToSharePoint(project, blob, filename, targetPathOverride, con
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     targetPathOverride, conflictBehavior
   );
+}
+
+// ─── NEW DOCUMENT FROM TEMPLATE ───────────────────────────────────────────────
+// Creates the .docx directly in the project folder and opens it, so the doc is
+// born on SharePoint with AutoSave — the file-then-hand-off flow (and its
+// two-copies confusion / 423 lock) never applies to documents started here.
+
+async function loadTemplates(force) {
+  const sel = document.getElementById("templateSelect");
+  if (!sel) return;
+  if (!force) {
+    try {
+      const raw = localStorage.getItem(TEMPLATES_CACHE_KEY);
+      if (raw) {
+        const cached = JSON.parse(raw);
+        if (cached.savedAt && (Date.now() - cached.savedAt) < TEMPLATES_CACHE_TTL_MS
+            && Array.isArray(cached.templates) && cached.templates.length) {
+          _templates = cached.templates;
+          renderTemplateSelect();
+          return;
+        }
+      }
+    } catch {}
+  }
+  try {
+    const token = await getToken();
+    const url = "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID
+      + "/root:/" + encodeDrivePath(TEMPLATES_PATH) + ":/children?$select=id,name,file&$top=200";
+    const res = await fetch(url, { headers: { "Authorization": "Bearer " + token } });
+    if (!res.ok) throw new Error("Template list failed (" + res.status + ")");
+    const data = await res.json();
+    _templates = (data.value || [])
+      .filter(it => it.file && /\.(docx|dotx)$/i.test(it.name || ""))
+      .map(it => ({ id: it.id, name: it.name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    localStorage.setItem(TEMPLATES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), templates: _templates }));
+    renderTemplateSelect();
+  } catch (e) {
+    sel.innerHTML = '<option value="">Couldn’t load templates</option>';
+    setStatus("newDocStatus", "error", e.message);
+  }
+}
+
+// Display/prefill name: drop the extension and the trailing "SA Template" /
+// "TEMPLATE" noise the template files carry.
+function cleanTemplateBase(name) {
+  return String(name || "")
+    .replace(/\.(docx|dotx)$/i, "")
+    .replace(/\s*(SA\s+Template|Template)\s*$/i, "")
+    .trim();
+}
+
+function renderTemplateSelect() {
+  const sel = document.getElementById("templateSelect");
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— pick a template —</option>'
+    + _templates.map(t =>
+        `<option value="${escapeHtml(t.id)}">${escapeHtml(cleanTemplateBase(t.name))}</option>`
+      ).join("");
+  updateNewDocButtons();
+}
+
+function onTemplatePicked() {
+  const sel = document.getElementById("templateSelect");
+  const t = _templates.find(x => x.id === sel.value);
+  if (t) document.getElementById("newDocNameInput").value = cleanTemplateBase(t.name);
+  updateNewDocPreview();
+  updateNewDocButtons();
+}
+
+function updateNewDocPreview() {
+  const el = document.getElementById("newDocPreview");
+  if (!el) return;
+  const name = (document.getElementById("newDocNameInput").value || "").trim();
+  const destEl = document.getElementById("destFolderDisplay");
+  const folder = (destEl && destEl.textContent) || "Library root";
+  el.innerHTML = name
+    ? `→ <b>${escapeHtml(name.replace(/\.docx$/i, ""))}.docx</b> in 📂 ${escapeHtml(folder)}`
+    : "";
+}
+
+function updateNewDocButtons() {
+  const toggle = document.getElementById("newDocToggleBtn");
+  const create = document.getElementById("createNewDocBtn");
+  if (toggle) toggle.disabled = !selectedProject || newDocInFlight;
+  if (create) {
+    const sel = document.getElementById("templateSelect");
+    const name = (document.getElementById("newDocNameInput").value || "").trim();
+    create.disabled = !selectedProject || newDocInFlight || !sel || !sel.value || !name;
+  }
+}
+
+function toggleNewDocPicker() {
+  const pick = document.getElementById("newDocPicker");
+  if (!pick) return;
+  const open = pick.style.display !== "none";
+  pick.style.display = open ? "none" : "block";
+  if (!open) {
+    loadTemplates();
+    updateNewDocPreview();
+    updateNewDocButtons();
+  }
+}
+
+// A .dotx is byte-identical to a .docx except the main-part content type inside
+// [Content_Types].xml — patch that one string so Word opens the copy as a
+// normal document instead of a template. Plain .docx templates pass through.
+async function templateBufferToDocxBlob(buf, srcName) {
+  const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (!/\.dotx$/i.test(srcName || "")) return new Blob([buf], { type: DOCX_MIME });
+  if (typeof JSZip === "undefined") {
+    throw new Error("JSZip bundle did not load (../jszip.min.js). Check that the file is published on GitHub Pages.");
+  }
+  const zip = await JSZip.loadAsync(buf);
+  const ctFile = zip.file("[Content_Types].xml");
+  if (!ctFile) throw new Error("Template is missing [Content_Types].xml — not a valid Office file.");
+  const ct = await ctFile.async("string");
+  zip.file("[Content_Types].xml",
+    ct.replace(/wordprocessingml\.template\.main\+xml/g, "wordprocessingml.document.main+xml"));
+  return zip.generateAsync({ type: "blob", mimeType: DOCX_MIME, compression: "DEFLATE" });
+}
+
+async function doCreateFromTemplate() {
+  if (!selectedProject) { setStatus("newDocStatus", "error", "Pick a project first."); return; }
+  if (newDocInFlight) return;
+  const sel = document.getElementById("templateSelect");
+  const tpl = _templates.find(x => x.id === (sel && sel.value));
+  if (!tpl) { setStatus("newDocStatus", "error", "Pick a template first."); return; }
+  const baseName = (document.getElementById("newDocNameInput").value || "").trim();
+  if (!baseName) { setStatus("newDocStatus", "error", "Give the document a name."); return; }
+  const uploadFilename = baseName.replace(/\.docx$/i, "") + ".docx";
+
+  newDocInFlight = true;
+  updateNewDocButtons();
+  document.getElementById("newDocLink").innerHTML = "";
+  try {
+    // Same conflict etiquette as filing a draft: never silently clobber.
+    let conflictBehavior = "rename";
+    if (await spFileExists(spCurrentPath, uploadFilename)) {
+      const choice = await askNameConflict(uploadFilename);
+      if (choice === "cancel") { setStatus("newDocStatus", "info", "Cancelled."); return; }
+      conflictBehavior = choice;
+    }
+
+    setStatus("newDocStatus", "info", "⏳ Fetching template…");
+    const token = await getToken();
+    // Re-read the item for a fresh pre-authenticated downloadUrl — the cached
+    // template list can be hours old and downloadUrls expire quickly.
+    const metaRes = await fetch(
+      "https://graph.microsoft.com/v1.0/drives/" + SP_DRIVE_ID + "/items/" + tpl.id,
+      { headers: { "Authorization": "Bearer " + token } }
+    );
+    if (!metaRes.ok) throw new Error("Couldn’t read the template (" + metaRes.status + "). Try reopening the pane.");
+    const meta = await metaRes.json();
+    const dlUrl = meta["@microsoft.graph.downloadUrl"];
+    if (!dlUrl) throw new Error("Template has no download URL — is it still in the Templates folder?");
+    const dlRes = await fetch(dlUrl);
+    if (!dlRes.ok) throw new Error("Template download failed (" + dlRes.status + ")");
+    const buf = await dlRes.arrayBuffer();
+    const docxBlob = await templateBufferToDocxBlob(buf, tpl.name);
+
+    setStatus("newDocStatus", "info", "⏳ Creating " + uploadFilename + " in SharePoint…");
+    const item = await uploadDocxToSharePoint(selectedProject, docxBlob, uploadFilename, spCurrentPath, conflictBehavior);
+
+    setStatus("newDocStatus", "success", "✓ " + item.name + " created — opening in Word. AutoSave is on from the start.");
+    document.getElementById("newDocLink").innerHTML =
+      `<a href="${item.webUrl}" target="_blank">📁 ${escapeHtml(item.name)}</a>`;
+    fxFileDrop(document.getElementById("createNewDocBtn"), "📄");
+    if (item.webUrl) openExternalUrl(item.webUrl);
+  } catch (e) {
+    setStatus("newDocStatus", "error", e.message);
+  } finally {
+    newDocInFlight = false;
+    updateNewDocButtons();
+  }
 }
 
 // ─── PDF EXPORT ───────────────────────────────────────────────────────────────
