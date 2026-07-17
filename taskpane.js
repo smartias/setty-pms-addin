@@ -4497,6 +4497,45 @@ const RESPONSE_EXCLUSIONS = [
   "no action needed", "for your records", "just an fyi", "no need to reply",
 ];
 
+// ── Noise gates (Sara 7/17: newsletters, thanks-notes and cc-only mail were
+// drowning the panel — 905 of 1,500 lifetime flags were hand-dismissed). ──
+
+// A chunk containing one of these is NEVER stripped as courtesy, so
+// "Thanks! Can you resend the calcs?" keeps its ask.
+const RESPONSE_HARD_ASK_RE =
+  /\b(can|could|would|will) (you|we)\b|\bplease (send|provide|confirm|advise|review|forward|share|sign|approve|update|complete|return)\b/;
+
+// Courtesy/closure boilerplate — gratitude, sign-offs, and the conditional
+// closers clients mirror back at us ("let me know if you have any
+// questions"). Chunks matching these carry no ask; the dismissal data showed
+// "request phrase" firing 2:1 noise almost entirely from this family.
+const RESPONSE_COURTESY_RES = [
+  /\bthank(s| you)\b/, /\bappreciate\b/,
+  /\b(let (me|us) know|reach out|contact (me|us)|give (me|us) a call)\b.*\bif\b/,
+  /\bif you (have|need)\b.*\b(question|concern|anything|assistance|help|issue)/,
+  /\bshould you (have|need)\b/, /\bdon'?t hesitate\b/, /\bfeel free\b/,
+  /\bhappy to (help|assist|discuss|answer)\b/,
+  /\bhave a (great|good|nice|wonderful)\b/, /\bhope (you|this|all|everyone)\b/,
+  /\bany questions\??$/,
+];
+
+// Bulk/automated senders — the client gate matches by shared DOMAIN, so a
+// client org's blast address passes it; the local part is the tell.
+const NEWSLETTER_SENDER_RE =
+  /^(no-?reply|do-?not-?reply|newsletters?|notifications?|news|updates?|marketing|mailer|bounce|listserv|campaigns?|broadcast|bulletins?|outbox|alerts?|digest)@/;
+
+// System-generated subjects: out-of-office, bounces, read receipts.
+const AUTOMATED_SUBJECT_RE =
+  /^\s*(automatic reply|auto-?reply|out of office|undeliverable|delivery has failed|read:|recall:)/;
+
+// Newsletter/automation footers in the current message's own text.
+const NEWSLETTER_BODY_MARKERS = [
+  "unsubscribe", "view this email in your browser", "view in browser",
+  "email preferences", "manage preferences", "manage your subscription",
+  "you are receiving this email", "do not reply to this",
+  "this is an automated", "automatically generated",
+];
+
 // Strip URLs so a "?utm=…" query string doesn't read as a question.
 function stripUrlsForScan(s) {
   return (s || "").replace(/https?:\/\/\S+/gi, " ");
@@ -4518,24 +4557,37 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
   // amplify a genuine ask — never originate a flag on their own.
   let contentSignal = false;
 
-  if (subj.includes("?")) {
+  // Chunk the body at sentence boundaries — KEEPING each terminator, so a "?"
+  // stays attached to its own sentence — then drop courtesy/closure chunks
+  // ("thanks so much", "let me know if you have any questions", "feel free to
+  // reach out") unless the chunk also carries a hard ask. Every content
+  // signal below scans only what's left, so a thank-you note wrapped in
+  // polite boilerplate can no longer flag, while "Thanks! Can you resend the
+  // calcs?" still does.
+  const chunks = (body.match(/[^.!?\n]+[.!?]?/g) || []).map(s => s.trim()).filter(Boolean);
+  const sentences = chunks.filter(s =>
+    RESPONSE_HARD_ASK_RE.test(s) || !RESPONSE_COURTESY_RES.some(re => re.test(s)));
+  const scanText = sentences.join(" ");
+
+  // Subject "?" only counts on an ORIGINAL subject — on a Re:/Fwd: every
+  // message in the thread inherits the "?", including the client's "thanks!".
+  if (subj.includes("?") && !/^\s*(re|fw|fwd)\s*:/.test(subj)) {
     score += RESPONSE_WEIGHTS.questionMarkInSubject;
     reasons.push("question in subject");
     contentSignal = true;
   }
-  if (body.includes("?")) {
+  if (scanText.includes("?")) {
     score += RESPONSE_WEIGHTS.questionMarkInBody;
     reasons.push("question in body");
     contentSignal = true;
   }
-  // Interrogative openers — split into sentences, check start-of-sentence only.
-  const sentences = body.split(/[.!?\n]+/).map(s => s.trim()).filter(Boolean);
+  // Interrogative openers — start-of-sentence only.
   if (sentences.some(s => RESPONSE_INTERROGATIVES.some(q => s.startsWith(q)))) {
     score += RESPONSE_WEIGHTS.interrogativeOpener;
     reasons.push("direct question");
     contentSignal = true;
   }
-  if (RESPONSE_POLITE_PHRASES.some(p => body.includes(p) || subj.includes(p))) {
+  if (RESPONSE_POLITE_PHRASES.some(p => scanText.includes(p) || subj.includes(p))) {
     score += RESPONSE_WEIGHTS.politeRequest;
     reasons.push("request phrase");
     contentSignal = true;
@@ -4547,7 +4599,7 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
     reasons.push("mentions a date");
     contentSignal = true;
   }
-  if (RESPONSE_URGENCY_WORDS.some(w => body.includes(w) || subj.includes(w))) {
+  if (RESPONSE_URGENCY_WORDS.some(w => scanText.includes(w) || subj.includes(w))) {
     score += RESPONSE_WEIGHTS.urgencyWord;
     reasons.push("urgency");
     contentSignal = true;
@@ -4754,6 +4806,13 @@ async function maybeAddToWatchlist(myGen) {
     // RFI/submittal mail has its own tracking (logged artifacts + the RFI/Submittal
     // Tracker), so it must never land on the response watchlist — even from a client.
     if (isRfiOrSubmittalEmail()) return;
+    // Automated-mail gates: OOF/bounce/receipt subjects and bulk-sender local
+    // parts. The client gate above matches by shared DOMAIN, so a client
+    // org's blast address ("donotreply@", "outbox@") passes it — a real
+    // client ask comes from a real person's address.
+    const subjLower = (typeof emailItem.subject === "string" ? emailItem.subject : "").toLowerCase();
+    if (AUTOMATED_SUBJECT_RE.test(subjLower)) return;
+    if (NEWSLETTER_SENDER_RE.test(from)) return;
 
     const token = await getToken();
     const html  = await getEmailBodyHtml(token);
@@ -4761,6 +4820,11 @@ async function maybeAddToWatchlist(myGen) {
     const tmp = document.createElement("div");
     tmp.innerHTML = html || "";
     const text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
+
+    // Newsletter-footer gate — scans only the CURRENT message's text, so a
+    // real reply quoting a newsletter below the signature doesn't get gated.
+    const currentText = trimToCurrentMessage(text).toLowerCase();
+    if (NEWSLETTER_BODY_MARKERS.some(m => currentText.includes(m))) return;
 
     // Recipient signals — an email sent directly TO you, or one whose greeting
     // names you, is far more likely to need your reply than a mass CC. Computed
@@ -4771,6 +4835,15 @@ async function maybeAddToWatchlist(myGen) {
     const myFirstName = (msalAccount?.name || "").trim().split(/\s+/)[0].replace(/[^\w]/g, "");
     const namedInSalutation = myFirstName.length >= 2 &&
       new RegExp("\\b" + myFirstName + "\\b", "i").test(text.slice(0, 60));
+
+    // CC-only gate: if you're not in the To line and not named anywhere in
+    // the message, any ask in it is someone else's — skip. Panels are
+    // per-user, so the colleague who IS in the To line still gets it flagged
+    // on their own pane; a thread nobody at Setty answers still surfaces
+    // there after the same 24-business-hour grace.
+    const namedAnywhere = myFirstName.length >= 2 &&
+      new RegExp("\\b" + myFirstName + "\\b", "i").test(currentText);
+    if (!addressedToMe && !namedAnywhere) return;
 
     const subject = (typeof emailItem.subject === "string") ? emailItem.subject : "";
     const verdict = needsResponse(subject, text, emailItem.dateTimeCreated,
