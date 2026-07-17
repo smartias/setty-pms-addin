@@ -914,12 +914,18 @@ function updateSaveButtons() {
   oneBtn.disabled = !selectedProject || saveInFlight;
   document.getElementById("saveOneNoteLabel").textContent = "Save to OneNote" + projTag;
 
-  draftBtn.disabled = !spReady || saveInFlight;
+  // When the open document IS the filed SharePoint copy, an "update" would PUT
+  // to the very file Word has locked — SharePoint rejects it with 423. AutoSave
+  // already covers this case, so disable the button rather than offer a doomed
+  // upload.
+  const inCloudCopy = draftSaved && isEditingFiledCloudCopy();
+  draftBtn.disabled = !spReady || saveInFlight || inCloudCopy;
   // Plain-language states. No project-tag suffix here — the labels are long and
   // the pill above already shows the project. The "●" on a dirty update ties to
   // the amber filed card's "● Unsynced edits" so they read as the same signal.
   document.getElementById("saveSpDraftLabel").textContent =
-    !draftSaved        ? "File to SharePoint"
+    inCloudCopy        ? "Filed — AutoSave is on"
+    : !draftSaved      ? "File to SharePoint"
     : dirtySinceFiled  ? "Update filed copy ●"
     :                    "Update filed copy";
   draftBtn.style.display = "";
@@ -1014,6 +1020,11 @@ async function uploadFileToSharePoint(project, blob, filename, contentType, targ
     body: blob,
   });
   if (!res.ok) {
+    // 423 = the target file is open in a Word session (co-authoring lock).
+    // The raw Graph JSON is useless to the user — say what to actually do.
+    if (res.status === 423) {
+      throw new Error("The SharePoint copy is open in another Word window or browser tab, so SharePoint has it locked. Close the other copy, wait a minute, and retry — or change the Document Name to file it as a fresh copy.");
+    }
     const errText = await res.text().catch(() => "");
     throw new Error("SharePoint " + res.status + ": " + errText.slice(0, 300));
   }
