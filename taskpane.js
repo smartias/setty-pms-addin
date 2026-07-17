@@ -791,7 +791,7 @@ async function getCurrentSharedKey() {
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
   const candidateIds = getCurrentMessageIdCandidates();
-  return (project.emails || []).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
+  return _emailRowsFor(project).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
 }
 function getLoggedEmailArtifactLabels(project) {
   if (!project || !emailItem?.itemId) return [];
@@ -848,7 +848,7 @@ function getLoggedRfiSubArtifacts(project) {
   // Build set of email-record IDs for emails on this project that match
   // the currently-open item. Used to detect "linked" relationships below.
   const matchingEmailRecordIds = new Set();
-  for (const e of (project.emails || [])) {
+  for (const e of _emailRowsFor(project)) {
     if (!e?.msgId) continue;
     if (e.msgId === sourceItemId || sourceMessageIds.includes(e.msgId)) {
       if (e.id) matchingEmailRecordIds.add(e.id);
@@ -866,7 +866,7 @@ function getLoggedRfiSubArtifacts(project) {
       ? curDateRaw.toISOString().slice(0, 10)
       : typeof curDateRaw === "string" ? curDateRaw.slice(0, 10) : "";
     if (curSubject && curFrom) {
-      for (const e of (project.emails || [])) {
+      for (const e of _emailRowsFor(project)) {
         if (matchingEmailRecordIds.has(e.id)) continue;
         if ((e.subject || "").trim() !== curSubject) continue;
         if ((e.fromAddress || "").toLowerCase().trim() !== curFrom) continue;
@@ -889,7 +889,7 @@ function getLoggedRfiSubArtifacts(project) {
   // the email was moved (EWS ID changed) and sourceMessageId was never stored.
   const isSourceViaFuzzy = (srcItemId) => {
     if (!srcItemId) return false;
-    return (project.emails || []).some(
+    return _emailRowsFor(project).some(
       e => e.msgId === srcItemId && matchingEmailRecordIds.has(e.id)
     );
   };
@@ -1811,7 +1811,9 @@ function _stripProjectForCache(p) {
     directory: (p.directory || []).map(d => ({ email: d.email || "" })),
     projectContacts: { pm: ((p.projectContacts?.pm) || []).map(c => ({ email: c.email || "" })) },
     // Nested record arrays — slim each record to ONLY the fields the add-in
-    // reads from the cached project. findSavedEmailRecord needs msgId.
+    // reads from the cached project. emails[] is empty on the slim-view load
+    // (filed-email reads go through ensureProjectEmailMeta) but is kept for
+    // the legacy pms_data fallback path, which still carries inline records.
     // refreshOneNoteLinkBanner needs note.{sourceItemId, sourceMessageId,
     // oneNoteUrl}. getLoggedEmailArtifactLabels needs note + milestone +
     // rfi + sub source-id matchers. Pickers need id/number/title/status/etc.
@@ -1997,8 +1999,13 @@ async function loadProjects() {
     // (≈291) are under it today but both grow; an unpaged read would silently drop
     // everything past row 1000 once they cross it. sbFetchAllRows throws on a failed
     // page, so a transient error still lands in the catch below and falls back.
+    // pms_projects_slim = pms_projects minus the inline project.emails[] array
+    // (~1/3 of the wire size and growing with every filed email). Filed-email
+    // reads come from pms_project_emails via ensureProjectEmailMeta; save
+    // flows still re-fetch the FULL row (fetchFreshProjectV2) so email-append
+    // mutators always merge against the complete inline array.
     const [pRows, cRows] = await Promise.all([
-      sbFetchAllRows("pms_projects?select=id,project,version&order=id.asc", "sb loadProjects v2 projects"),
+      sbFetchAllRows("pms_projects_slim?select=id,project,version&order=id.asc", "sb loadProjects v2 projects"),
       sbFetchAllRows("pms_clients?select=client&order=id.asc", "sb loadProjects v2 clients"),
     ]);
     if (pRows && cRows) {
@@ -2136,6 +2143,17 @@ async function fetchFreshProjectV2(projectId) {
 // Canonical JSON for value-equality across a Postgres jsonb round-trip (jsonb
 // normalizes key order, so plain stringify comparison would false-negative).
 // Mirrors JSON.stringify semantics: undefined-valued keys are dropped.
+// The DB trigger rewrites project.emails on every save (restores the archive
+// when the key is absent — slim-loaded saves — and strips heavy bodies when
+// present), so the stored blob's emails NEVER byte-match what we sent. Any
+// equality check against a fresh fetch must compare everything EXCEPT emails.
+function _projectMinusEmails(p) {
+  if (!p || typeof p !== "object") return p;
+  const copy = { ...p };
+  delete copy.emails;
+  return copy;
+}
+
 function _canonicalJson(v) {
   if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
   if (Array.isArray(v)) return "[" + v.map(x => _canonicalJson(x === undefined ? null : x)).join(",") + "]";
@@ -2165,10 +2183,13 @@ async function saveProjectRowV2(project, expectedVersion) {
     // server committed. The retry then matches 0 rows (version already bumped)
     // and looks exactly like a real conflict, telling the user their save
     // failed when it succeeded (and inviting a duplicate re-save). If the
-    // cloud is at exactly expected+1 AND holds byte-for-byte what we sent,
-    // that "conflict" was our own write landing — treat as success.
+    // cloud is at exactly expected+1 AND holds what we sent, that "conflict"
+    // was our own write landing — treat as success. Compared MINUS the
+    // emails key: the slim-email trigger rewrites it server-side on every
+    // save, so a full-blob compare would never match and this recovery
+    // would silently stop working.
     if (fresh && fresh.version === expectedVersion + 1 &&
-        _canonicalJson(fresh.project) === _canonicalJson(project)) {
+        _canonicalJson(_projectMinusEmails(fresh.project)) === _canonicalJson(_projectMinusEmails(project))) {
       _projectVersionCache.set(project.id, fresh.version);
       return fresh.version;
     }
@@ -2342,7 +2363,111 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     const errText = await res.text();
     throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
   }
+  // Keep the filed-email metadata cache in step with this insert so the
+  // saved-indicator, chips and auto-save dedup gate see the new record
+  // without a round-trip.
+  _recordEmailMetaLocal(projectId, {
+    id: emailRecord.id,
+    msgId: emailRecord.msgId,
+    conversationId: conversationId ?? (currentConversationId || null),
+    subject: emailRecord.subject || "",
+    from: emailRecord.from || "",
+    fromAddress: emailRecord.fromAddress || "",
+    toAddresses: emailRecord.to || "",
+    ccAddresses: emailRecord.cc || "",
+    date: emailRecord.date || null,
+    spFolderUrl: emailRecord.spFolderUrl || "",
+    savedAt: emailRecord.savedAt || new Date().toISOString(),
+    savedToSharePoint: !!savedToSharePoint,
+  });
 }
+
+// ─── FILED-EMAIL METADATA (table-backed) ────────────────────────────────────
+// Since the slim-load cutover, the bulk project load comes from the
+// pms_projects_slim view, which omits the inline project.emails[] array.
+// Everything that used to scan project.emails — the saved-email indicator,
+// "Logged as RFI/Sub" chips, auto-save's already-filed gate, and the RFI/Sub
+// recipient resolvers — now reads a per-project slice of pms_project_emails
+// (the authoritative filed-email index: 15k+ rows vs the inline array's
+// partial ~5k). Rows are mapped to the inline record field names so the
+// matching code is unchanged. Cached per project with a short TTL; updated
+// locally on every successful saveProjectEmailRow so gates never lag a save.
+const _projEmailMetaCache = new Map(); // projectId -> { rows, at, promise }
+const PROJ_EMAIL_META_TTL_MS = 3 * 60 * 1000;
+
+function _mapEmailMetaRow(r) {
+  return {
+    id: r.record_id,
+    msgId: r.msg_id,
+    conversationId: r.conversation_id,
+    subject: r.subject,
+    from: r.from_name,
+    fromAddress: r.from_address,
+    toAddresses: r.to_addresses,
+    ccAddresses: r.cc_addresses,
+    date: r.email_date,
+    spFolderUrl: r.sp_folder_url,
+    savedAt: r.saved_at,
+    savedToSharePoint: !!r.saved_to_sharepoint,
+  };
+}
+
+// Sync accessor used by render-path code. Serves the warmed cache; falls back
+// to the inline array (still populated on the legacy pms_data path, and on
+// any project object refreshed via the full-row fetchFreshProjectV2).
+function _emailRowsFor(project) {
+  if (!project) return [];
+  const c = _projEmailMetaCache.get(project.id);
+  if (c && c.rows) return c.rows;
+  return project.emails || [];
+}
+
+async function ensureProjectEmailMeta(projectId, { force = false } = {}) {
+  if (!projectId) return [];
+  const cached = _projEmailMetaCache.get(projectId);
+  if (!force && cached) {
+    if (cached.rows && Date.now() - cached.at < PROJ_EMAIL_META_TTL_MS) return cached.rows;
+    if (cached.promise) return cached.promise;
+  }
+  const promise = (async () => {
+    const rows = await sbFetchAllRows(
+      "pms_project_emails?project_id=eq." + encodeURIComponent(projectId) +
+      "&select=record_id,msg_id,conversation_id,subject,from_name,from_address,to_addresses,cc_addresses,email_date,sp_folder_url,saved_at,saved_to_sharepoint" +
+      "&order=email_date.desc.nullslast,record_id.asc",
+      "sb projectEmailMeta");
+    const mapped = rows.map(_mapEmailMetaRow);
+    _projEmailMetaCache.set(projectId, { rows: mapped, at: Date.now() });
+    return mapped;
+  })();
+  // Stale-while-refreshing: keep serving old rows until the new fetch lands.
+  _projEmailMetaCache.set(projectId, { rows: cached?.rows, at: cached?.at || 0, promise });
+  try {
+    return await promise;
+  } catch (e) {
+    // On failure keep any stale rows (better than nothing); with no rows at
+    // all, callers fall back to project.emails / proceed — the DB-side
+    // (project_id, msg_id) dedup still guards against double-filing.
+    if (cached?.rows) {
+      _projEmailMetaCache.set(projectId, { rows: cached.rows, at: cached.at });
+      return cached.rows;
+    }
+    _projEmailMetaCache.delete(projectId);
+    console.warn("projectEmailMeta fetch failed for", projectId, e.message);
+    return [];
+  }
+}
+
+// Local upsert after a successful table insert — no-op if the project's
+// cache was never loaded (next ensure fetches the row anyway). Replaces any
+// existing record for the same email (mirrors the inline replace on the
+// SharePoint save path) so spFolderUrl/savedToSharePoint updates take.
+function _recordEmailMetaLocal(projectId, rec) {
+  const c = _projEmailMetaCache.get(projectId);
+  if (!c || !c.rows) return;
+  c.rows = c.rows.filter(e => !(e.id === rec.id || (rec.msgId && e.msgId === rec.msgId)));
+  c.rows.unshift(rec);
+}
+
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
 }
@@ -2950,6 +3075,19 @@ function setSelectedProject(project, persistForEmail = false) {
   // Re-render the "Logged as RFI/Sub" chip row — different project may have
   // different artifacts sourced from the same email.
   try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[chips] refresh failed:", e.message); }
+  // Warm the table-backed filed-email metadata for this project, then repaint
+  // the affordances that read it (saved indicator + RFI/Sub chips render
+  // empty-handed above until the rows land). Guarded so a slow fetch for a
+  // project the user has already moved off of can't repaint the wrong
+  // selection. ensureProjectEmailMeta never throws (degrades internally).
+  if (selectedProject) {
+    const metaPid = selectedProject.id;
+    void ensureProjectEmailMeta(metaPid).then(() => {
+      if (!selectedProject || selectedProject.id !== metaPid) return;
+      try { refreshLoggedArtifactChips(); } catch {}
+      try { refreshEmailSavedIndicator(); } catch {}
+    });
+  }
   // Re-populate the "Link to" dropdown — open RFIs/Subs differ per project.
   try { refreshLinkToTargetDropdown(); } catch (e) { console.warn("[link-to] refresh failed:", e.message); }
   // "N new" count depends on the selected project's directory.
@@ -3026,6 +3164,14 @@ async function autoSaveEmailToRecord() {
     const msgId = getCurrentMessageRecordId();
     if (!msgId) return;
     if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
+    // Filed-detection reads the table-backed metadata cache — it MUST be
+    // loaded before the "already filed" gate is trusted. With a cold cache
+    // every open of a tagged email would look unfiled and re-run a full
+    // save cycle (version churn + phantom conflicts); the DB dedup would
+    // catch the duplicate, but only after the wasted round-trips.
+    await ensureProjectEmailMeta(selectedProject.id);
+    if (myGen !== itemContextGeneration) return; // user moved on during fetch
+    if (!selectedProject) return;
     if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
     // Respect the process-wide save lock. Auto-save used to bypass it and
     // race user-initiated saves on the version counter — both fetch v10, one
@@ -7809,9 +7955,9 @@ function _docxInfoRow(docxLib, label, value, opts = {}) {
 // responder themselves on the COPIES line. Optional override via opts.
 function _resolveRfiResponseRecipients(rfi, project) {
   const recipients = [];
-  // Original sender: look up in project.emails by sourceItemId/sourceMessageId
+  // Original sender: look up in the filed-email metadata by sourceItemId/sourceMessageId
   if (rfi.sourceItemId || rfi.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
       (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
     );
@@ -8175,7 +8321,7 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
 function _resolveSubReviewRecipients(sub, project) {
   const recipients = [];
   if (sub.sourceItemId || sub.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
       (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
     );
@@ -8919,9 +9065,9 @@ async function submitRfiResponse() {
 // { email, name } or null.
 function _guessEmailForRfi(rfi, project) {
   // If the original was logged from an email, we may have its from-address on
-  // the email record. The project.emails array has msgId → from/fromAddress.
+  // the email record. Filed-email metadata rows have msgId → from/fromAddress.
   if (rfi.sourceItemId || rfi.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
       (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
     );
@@ -9411,7 +9557,7 @@ async function submitSubReview() {
 
 function _guessEmailForSub(sub, project) {
   if (sub.sourceItemId || sub.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
       (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
     );
