@@ -5696,28 +5696,28 @@ const EMAIL_OPEN_QUIPS = [
   "*sniffs for change orders*",
 ];
 const MILESTONE_QUIPS_10 = [
-  "🎉 10 saved! That's a respectable start.",
+  "🎉 10 saved{name}! That's a respectable start.",
   "🎉 10 emails — foundation of project memory laid.",
   "🎉 10 down — documenting like a court reporter on caffeine.",
   "🎉 10 saved! Future-You will send a thank-you note.",
   "🎉 10 emails — measure twice, file once. You're doing both.",
 ];
 const MILESTONE_QUIPS_25 = [
-  "🔥 25 this week — strong rhythm!",
+  "🔥 25 this week{name} — strong rhythm!",
   "🔥 25 saved — architects are jealous of your filing game.",
   "🔥 25 emails — the project record gods are pleased.",
   "🔥 25 down — your project history is becoming legendary.",
   "🔥 25 emails — fixing project memory one save at a time.",
 ];
 const MILESTONE_QUIPS_50 = [
-  "🚀 50 emails — on a roll!",
+  "🚀 50 emails{name} — on a roll!",
   "🚀 50 saved! At this rate you'll need a bigger SharePoint folder.",
   "🚀 50 — basically the project's official scribe at this point.",
   "🚀 50 — *applies extra clipboard authority*",
   "🚀 50 emails! Documentation icon status: confirmed.",
 ];
 const MILESTONE_QUIPS_100 = [
-  "🏆 100 emails — legendary week!",
+  "🏆 100 emails — legendary week{name}!",
   "🏆 100 saved — you're now the project archivist. Update LinkedIn.",
   "🏆 100 emails — Setty docs hall of fame.",
   "🏆 100 — you've crossed from 'PM' to 'librarian'.",
@@ -5767,8 +5767,19 @@ function generateSillySavingMessage() {
   return `${e} ${v} ${n}…`;
 }
 
+// First name from the Outlook profile ("Sara Arias" → "Sara") — free
+// personalization, no extra permissions. Quips embed "{name}" where ", First"
+// reads naturally; if the profile is unavailable the token collapses to "".
+function addinFirstName() {
+  try {
+    const dn = (Office.context.mailbox.userProfile.displayName || "").trim();
+    return dn ? dn.split(/\s+/)[0] : "";
+  } catch (_) { return ""; }
+}
 function pickQuip(pool) {
-  return pool[Math.floor(Math.random() * pool.length)];
+  const n = addinFirstName();
+  return pool[Math.floor(Math.random() * pool.length)]
+    .replace(/\{name\}/g, n ? ", " + n : "");
 }
 
 // Lazy-load canvas-confetti on first celebration. Saves the ~5KB download
@@ -5803,42 +5814,42 @@ function pickSavingMessage() {
 // reminders, since those are the hours people actually skip breaks.
 const TIME_GREETINGS = {
   morning: [
-    "☕ Morning — first file of the day. Strong start.",
-    "☕ Filing before 10am? Disciplined.",
-    "🌅 Bright and early. Project record blessed.",
+    "☕ Morning{name} — first file of the day. Strong start.",
+    "☕ Filing before 10am{name}? Disciplined.",
+    "🌅 Bright and early{name}. Project record blessed.",
   ],
   lateBreakfast: [
-    "🥐 Late breakfast filing. Solid.",
-    "🥐 Pre-lunch productivity. Building momentum.",
-    "🍵 Mid-morning groove. Nice pace.",
+    "🥐 Late breakfast filing{name}. Solid.",
+    "🥐 Pre-lunch productivity. Building momentum{name}.",
+    "🍵 Mid-morning groove{name}. Nice pace.",
   ],
   lunch: [
-    "🥪 Lunchtime filing — but eat something too, ok?",
-    "🥪 Filing while you eat? AEC heroics. Don't forget the food.",
-    "🥗 Lunch-hour documentation. Hydrate too.",
-    "🍴 Filing through lunch? At least step away from the screen for 5.",
+    "🥪 Lunchtime filing{name} — but eat something too, ok?",
+    "🥪 Filing while you eat{name}? AEC heroics. Don't forget the food.",
+    "🥗 Lunch-hour documentation{name}. Hydrate too.",
+    "🍴 Filing through lunch{name}? At least step away from the screen for 5.",
   ],
   afternoon: [
-    "📊 Mid-afternoon focus. Respect.",
-    "🧘 Afternoon files going in — also: stand up, stretch, water?",
-    "📊 3pm momentum. You've earned a 5-min break soon.",
-    "👀 Eyes off the screen for a sec? Then back to it.",
-    "☕ Mid-afternoon — second coffee window is officially open.",
+    "📊 Mid-afternoon focus. Respect{name}.",
+    "🧘 Afternoon files going in{name} — also: stand up, stretch, water?",
+    "📊 3pm momentum{name}. You've earned a 5-min break soon.",
+    "👀 Eyes off the screen for a sec{name}? Then back to it.",
+    "☕ Mid-afternoon{name} — second coffee window is officially open.",
   ],
   evening: [
-    "🌅 Evening filing — wrapping up clean.",
-    "🌅 End-of-day cleanup. Tomorrow-You says thanks.",
-    "🌇 Closing the loop on today. Nice.",
+    "🌅 Evening filing{name} — wrapping up clean.",
+    "🌅 End-of-day cleanup{name}. Tomorrow-You says thanks.",
+    "🌇 Closing the loop on today{name}. Nice.",
   ],
   lateEvening: [
-    "🌙 9-to-9 day? Thanks for the dedication.",
-    "🌙 Past 7pm? Make sure dinner happened.",
-    "🌃 Evening shift respect.",
+    "🌙 9-to-9 day{name}? Thanks for the dedication.",
+    "🌙 Past 7pm{name}? Make sure dinner happened.",
+    "🌃 Evening shift respect{name}.",
   ],
   lateNight: [
-    "🦉 Filing past 10pm — admirable. Sleep is also good.",
-    "🌙 Late shift respect. Set a hard stop?",
-    "🦉 The owl hours. Don't let this become a habit.",
+    "🦉 Filing past 10pm{name} — admirable. Sleep is also good.",
+    "🌙 Late shift respect{name}. Set a hard stop?",
+    "🦉 The owl hours{name}. Don't let this become a habit.",
   ],
 };
 function timeOfDayGreeting() {
