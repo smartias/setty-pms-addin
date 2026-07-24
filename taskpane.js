@@ -21,6 +21,11 @@ const GRAPH_SCOPES = [
 // associated feature triggers a one-time per-user consent popup; afterwards
 // the token is cached silently like any other Graph token.
 const CHANNEL_MESSAGE_SCOPES = ["ChannelMessage.Send"];
+// On-demand too: reading a mailbox that's been shared/delegated to the signed-in
+// user (e.g. a departed colleague's) needs Mail.Read.Shared. Kept out of the
+// default sign-in so the consent popup only appears the first time someone
+// actually scans another person's mailbox.
+const SHARED_MAIL_SCOPES = ["Mail.Read.Shared"];
 const TEAMS_TEAM_ID   = "a4c48361-7991-43db-af83-4c854918a760";
 const TEAMS_TENANT_ID = "f374c024-71c2-48b6-8420-076fff97327c";
 const SUPABASE_URL  = "https://khxmgjilwhdguuepbhne.supabase.co";
@@ -98,7 +103,15 @@ Office.onReady(async (info) => {
       Office.EventType.ItemChanged,
       // ItemChanged only ever fires while the pane is pinned, so the first one
       // we receive doubles as proof the user found the pin — hide the hint.
-      () => { markPanePinned(); showView("mainView"); applyComposeModeUiGuard(); loadItemContext(); }
+      // Signed-out guard: without it, a pinned-but-signed-out user landed on a
+      // non-functional main view with no sign-in button.
+      () => {
+        markPanePinned();
+        applyComposeModeUiGuard();
+        if (!msalAccount) { showView("signInView"); return; }
+        showView("mainView");
+        loadItemContext();
+      }
     );
     loadItemContext();
   } catch (e) {
@@ -145,8 +158,12 @@ function applyComposeModeUiGuard() {
   const compose = isComposeMode();
   document.body.classList.toggle("compose-mode", compose);
   // Hide in Compose: there's no sent email yet to file or log.
+  // NOTE: saveRecordBtn ("Save to Project") is deliberately NOT in this list — it's
+  // retired (auto-file on tag covers the record) and stays hidden via its inline
+  // display:none. Listing it here would reset display="" in read mode and un-hide it,
+  // since nothing else re-applies its visibility afterward.
   const hiddenInCompose = [
-    "saveSpBtn", "saveRecordBtn", "saveConfirmation",
+    "saveSpBtn", "saveConfirmation",
     "logNoteBtn", "sendToTeamsBtn", "newActionItemBtn",
     "moreActions", "oneNoteLinkBanner",
     "dateSuggestionBlock",
@@ -201,12 +218,24 @@ function setupEventListeners() {
   document.getElementById("signOutBtn").onclick    = doSignOut;
   const wlRefresh = document.getElementById("responseWatchlistRefresh");
   if (wlRefresh) wlRefresh.onclick = () => { void renderResponseWatchlist(); };
-  const sweepBtn = document.getElementById("sweepRunBtn");
-  if (sweepBtn) sweepBtn.onclick = () => { void sweepRecentMail(); };
   const sweepFileBtn = document.getElementById("sweepFileBtn");
-  if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(); };
+  if (sweepFileBtn) sweepFileBtn.onclick = () => { void sweepRunAndFile(true); };
+  const sweepRunAllBtn = document.getElementById("sweepRunAllBtn");
+  if (sweepRunAllBtn) sweepRunAllBtn.onclick = () => { void sweepAutoRunToEnd(); };
+  const sweepStopBtn = document.getElementById("sweepStopBtn");
+  if (sweepStopBtn) sweepStopBtn.onclick = () => {
+    _sweepAutoStop = true;
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent += "  ·  ⏹ stopping after this page…";
+  };
+  const sweepClearBtn = document.getElementById("sweepClearBtn");
+  if (sweepClearBtn) sweepClearBtn.onclick = () => sweepClearResults();
+  const sweepMoreBtn = document.getElementById("sweepMoreBtn");
+  if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
+  const linkArtifactBtn = document.getElementById("linkArtifactBtn");
+  if (linkArtifactBtn) linkArtifactBtn.onclick = () => { void linkSelectedArtifactFromMain(); };
   // Pin hint banner — show unless previously dismissed or pinning was detected.
   initPinHintBanner();
   // Version footer — took over the old main-view logo's jobs (hover tooltip +
@@ -244,7 +273,12 @@ function setupEventListeners() {
   // URL/permissions logic stays in one place (openSelectedProjectInPms).
   const spHintLink = document.getElementById("spFolderHintLink");
   if (spHintLink) spHintLink.onclick = (e) => { e.preventDefault(); openSelectedProjectInPms(); };
-  document.getElementById("logNoteBtn").onclick    = () => showView("noteView");
+  document.getElementById("logNoteBtn").onclick    = () => { resetNoteView(); showView("noteView"); };
+  // Show the "Staff on site visit" field only when the Site Visit category is picked.
+  document.getElementById("noteCategory").onchange = toggleSiteVisitStaffField;
+  // Manual "pull latest from PMS" — new projects / schedule edits made elsewhere
+  // don't appear mid-session otherwise (project data is loaded once at open).
+  document.getElementById("refreshProjectsBtn").onclick = () => refreshProjectData();
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
@@ -279,10 +313,15 @@ function setupEventListeners() {
   document.getElementById("manualMilestoneBtn").onclick = showManualMilestoneForm;
   document.getElementById("addParticipantBtn").onclick = onAddParticipantClick;
   document.getElementById("saveMilestoneBtn").onclick = doSaveMilestone;
+  document.getElementById("billableScheduleToggle").onclick = toggleBillableSchedule;
   document.getElementById("saveNoteBtn").onclick    = doSaveNote;
   document.getElementById("saveActionItemBtn").onclick = doSaveActionItem;
-  document.getElementById("saveRfiBtn").onclick     = doSaveRfi;
-  document.getElementById("saveSubBtn").onclick     = doSaveSub;
+  document.getElementById("saveRfiBtn").onclick     = () => { void saveArtifactThen("rfi", false); };
+  document.getElementById("saveSubBtn").onclick     = () => { void saveArtifactThen("sub", false); };
+  const saveRfiAnotherBtn = document.getElementById("saveRfiAnotherBtn");
+  if (saveRfiAnotherBtn) saveRfiAnotherBtn.onclick = () => { void saveArtifactThen("rfi", true); };
+  const saveSubAnotherBtn = document.getElementById("saveSubAnotherBtn");
+  if (saveSubAnotherBtn) saveSubAnotherBtn.onclick = () => { void saveArtifactThen("sub", true); };
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
@@ -325,9 +364,9 @@ function setupEventListeners() {
       ).slice(0, 10);
       if (!matches.length) { dropdown.style.display = "none"; return; }
       dropdown.innerHTML = matches.map(p => `
-        <div class="proj-option" data-id="${p.id}">
-          <div class="proj-num">${p.projectNumber || ""}</div>
-          <div class="proj-name">${p.name || ""}</div>
+        <div class="proj-option" data-id="${escHtml(p.id)}">
+          <div class="proj-num">${escHtml(p.projectNumber || "")}</div>
+          <div class="proj-name">${escHtml(p.name || "")}</div>
         </div>
       `).join("");
       dropdown.style.display = "block";
@@ -411,6 +450,9 @@ function loadItemContext() {
     emailItem = null;
     return;
   }
+  // Leaving the pane pinned all day? Quietly pull the latest projects/schedules
+  // on email switch (throttled) so the data doesn't silently go stale.
+  maybeAutoRefreshProjects();
   // Bump the generation. All async work below captures `myGen` at start and
   // bails out before writing module state if the generation has advanced
   // (= user clicked a different email mid-fetch).
@@ -649,6 +691,35 @@ function getEffectiveInternetMessageId() {
   if (cachedInternetMessageIdGen === itemContextGeneration) return cachedInternetMessageId;
   return "";
 }
+// Awaitable form: resolves the STABLE internetMessageId, fetching it from raw
+// headers if Outlook didn't expose it synchronously (new Outlook for Windows
+// returns "" for internetMessageId). Callers MUST await this before keying a
+// record on getCurrentMessageRecordId(), so auto-log/save never fall back to the
+// volatile REST/item id — that fallback was drifting across re-opens, producing
+// duplicate rows and a disconnected Save-to-SharePoint patch. Resolves "" only if
+// headers are unavailable (Mailbox < 1.8) or the fetch times out, in which case
+// callers keep the legacy fallback — never worse than before.
+function ensureInternetMessageId() {
+  const sync = getEffectiveInternetMessageId();
+  if (sync) return Promise.resolve(sync);
+  const myGen = itemContextGeneration;
+  if (!emailItem?.getAllInternetHeadersAsync) return Promise.resolve("");
+  return new Promise(resolve => {
+    let done = false;
+    const finish = v => { if (!done) { done = true; resolve(v); } };
+    setTimeout(() => finish(""), 2500); // never hang a save on a stuck header fetch
+    try {
+      emailItem.getAllInternetHeadersAsync(result => {
+        if (myGen !== itemContextGeneration) return finish(""); // user moved on
+        if (result.status !== Office.AsyncResultStatus.Succeeded) return finish("");
+        const m = String(result.value || "").match(/^Message-ID:\s*(.+)$/im);
+        const id = m ? m[1].trim() : "";
+        if (id) { cachedInternetMessageId = id; cachedInternetMessageIdGen = myGen; }
+        finish(id);
+      });
+    } catch { finish(""); }
+  });
+}
 function getCurrentMessageRecordId() {
   // Prefer internetMessageId (shared across recipients) for cross-mailbox matching.
   // Keep REST/item IDs as fallbacks so existing records created before this change still resolve.
@@ -667,9 +738,16 @@ function getCurrentSharedMessageId() {
 async function getCurrentConversationId() {
   if (currentConversationId) return currentConversationId;
   try {
+    // Stale-result guard: loadItemContext resets currentConversationId on item
+    // switch, but a fetch started for the PREVIOUS item can resolve after that
+    // reset and stamp the old thread's id onto the new item's context. A tag
+    // written against that id lands in pms_email_thread_tags under the WRONG
+    // conversation — and that table drives auto-tagging for the whole firm.
+    const myGen = itemContextGeneration;
     const restId = getCurrentMessageRestId();
     if (!restId) return "";
     const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=conversationId", null);
+    if (myGen !== itemContextGeneration) return ""; // user moved on — don't stamp
     currentConversationId = data?.conversationId || "";
     return currentConversationId;
   } catch {
@@ -693,8 +771,12 @@ async function getCurrentSharedKey() {
     // iCalUId not yet loaded — fetch synchronously now
     if (emailItem?.itemId) {
       try {
+        // Same stale-result guard as getCurrentConversationId: never stamp a
+        // previous item's iCalUId onto the current context after an item switch.
+        const myGen = itemContextGeneration;
         const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
         const ev = await graphFetch("GET", "/me/events/" + restId + "?$select=iCalUId", null);
+        if (myGen !== itemContextGeneration) return ""; // user moved on — don't stamp
         currentItemICalUId = ev?.iCalUId || "";
         return currentItemICalUId;
       } catch {
@@ -709,7 +791,7 @@ async function getCurrentSharedKey() {
 function findSavedEmailRecord(project, msgId) {
   if (!project || !msgId) return null;
   const candidateIds = getCurrentMessageIdCandidates();
-  return (project.emails || []).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
+  return _emailRowsFor(project).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
 }
 function getLoggedEmailArtifactLabels(project) {
   if (!project || !emailItem?.itemId) return [];
@@ -766,7 +848,7 @@ function getLoggedRfiSubArtifacts(project) {
   // Build set of email-record IDs for emails on this project that match
   // the currently-open item. Used to detect "linked" relationships below.
   const matchingEmailRecordIds = new Set();
-  for (const e of (project.emails || [])) {
+  for (const e of _emailRowsFor(project)) {
     if (!e?.msgId) continue;
     if (e.msgId === sourceItemId || sourceMessageIds.includes(e.msgId)) {
       if (e.id) matchingEmailRecordIds.add(e.id);
@@ -784,7 +866,7 @@ function getLoggedRfiSubArtifacts(project) {
       ? curDateRaw.toISOString().slice(0, 10)
       : typeof curDateRaw === "string" ? curDateRaw.slice(0, 10) : "";
     if (curSubject && curFrom) {
-      for (const e of (project.emails || [])) {
+      for (const e of _emailRowsFor(project)) {
         if (matchingEmailRecordIds.has(e.id)) continue;
         if ((e.subject || "").trim() !== curSubject) continue;
         if ((e.fromAddress || "").toLowerCase().trim() !== curFrom) continue;
@@ -807,7 +889,7 @@ function getLoggedRfiSubArtifacts(project) {
   // the email was moved (EWS ID changed) and sourceMessageId was never stored.
   const isSourceViaFuzzy = (srcItemId) => {
     if (!srcItemId) return false;
-    return (project.emails || []).some(
+    return _emailRowsFor(project).some(
       e => e.msgId === srcItemId && matchingEmailRecordIds.has(e.id)
     );
   };
@@ -951,6 +1033,45 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
   }
 }
 
+// Explicit "🔗 Link" action for the main-view dropdown. Auto-tagging now files the
+// email on open, so users no longer click Save SP — which is what used to trigger
+// the link as a side-effect. This decouples it: pick a target, click Link, repeat
+// (one email can relate to several open RFIs/Subs). Ensures the email record exists
+// first so there's an id to cross-link.
+async function linkSelectedArtifactFromMain() {
+  const sel = document.getElementById("linkToTarget");
+  const linkValue = sel?.value || "";
+  if (!selectedProject) { setStatus("actionStatus", "error", "Pick a project first."); return; }
+  if (!linkValue) { setStatus("actionStatus", "info", "Choose an RFI or Submittal from the dropdown first."); return; }
+  // withSaveGuard: this flow writes the project row (via the record save +
+  // linkEmailToArtifact) and used to bypass the process-wide save lock — a
+  // click during a slow auto-save raced the version counter and produced a
+  // phantom "Save conflict" for the user.
+  return withSaveGuard("link-artifact", async () => {
+    try {
+      await ensureInternetMessageId();
+      let rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      if (!rec) {
+        await _doSaveToProjectRecordOnly(true);  // auto-save usually did this on open
+        rec = findSavedEmailRecord(selectedProject, getCurrentMessageRecordId());
+      }
+      if (!rec) { setStatus("actionStatus", "error", "Couldn't save this email to the project — try again."); return; }
+      setStatus("actionStatus", "info", "⏳ Linking…");
+      const result = await linkEmailToArtifact({ linkValue, emailRecord: rec, snapItem: emailItem });
+      if (result.ok) {
+        setStatus("actionStatus", "success", "✓ Linked" + (result.label || "") + ". Pick another RFI/Sub to link, or you're done.");
+        if (sel) sel.value = "";                 // reset so the next pick is a fresh choice
+        try { refreshLinkToTargetDropdown(); } catch {}
+        try { refreshLoggedArtifactChips(); } catch {}
+      } else {
+        setStatus("actionStatus", "error", "✗ Couldn't link" + (result.label || "") + ".");
+      }
+    } catch (e) {
+      setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+    }
+  }, ["linkArtifactBtn"]);
+}
+
 function refreshLinkToTargetDropdown() {
   const row = document.getElementById("linkToRow");
   const sel = document.getElementById("linkToTarget");
@@ -1018,6 +1139,7 @@ function _applyChipPresenceUiToggles(hasChips) {
   }
 }
 function refreshLoggedArtifactChips() {
+  try { refreshOpenActionItemChips(); } catch (e) { console.warn("[action-chips]", e.message); }
   const container = document.getElementById("loggedAsArtifactChips");
   if (!container) return;
   if (!selectedProject || !emailItem?.itemId) {
@@ -1090,6 +1212,63 @@ function refreshLoggedArtifactChips() {
     else if (action === "log-sub-review") openSubReviewView(id);
   };
 }
+// ── Open action items (project-level) ────────────────────────────────────────
+// Surfaces the tagged project's open action items as chips with a "Mark Done"
+// button — mirrors refreshLoggedArtifactChips so the user can close items from
+// the email they're working. Capped so it stays compact.
+const OPEN_ACTION_ITEM_CHIP_CAP = 5;
+function isOpenActionItem(n) {
+  return !!n && (n.actionItem || n.category === "Action Item") && (n.actionStatus || "open") !== "done";
+}
+function refreshOpenActionItemChips() {
+  const container = document.getElementById("openActionItemChips");
+  if (!container) return;
+  const open = selectedProject ? (selectedProject.notes || []).filter(isOpenActionItem) : [];
+  if (open.length === 0) { container.innerHTML = ""; container.style.display = "none"; return; }
+  container.style.display = "flex";
+  const shown = open.slice(0, OPEN_ACTION_ITEM_CHIP_CAP);
+  const rows = shown.map(n => {
+    const task = ((n.body || "").split("\n")[0] || "Action item").slice(0, 56);
+    const owner = n.actionOwner || n.owner || "";
+    const due = n.actionDueDate || n.dueDate || "";
+    const meta = [owner, due].filter(Boolean).join(" · ");
+    const label = ("✅ " + task + (meta ? "  (" + meta + ")" : "")).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const idAttr = String(n.id).replace(/"/g, "&quot;");
+    const chip = `<span style="display:inline-flex;align-items:center;padding:4px 10px;border-radius:12px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;font-size:11px;font-weight:600;">${label}</span>`;
+    const btn = `<button data-action="mark-action-done" data-id="${idAttr}" style="align-self:flex-start;background:#b45309;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">✓ Mark Done</button>`;
+    return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chip}${btn}</div>`;
+  });
+  if (open.length > shown.length) {
+    rows.push(`<div style="font-size:11px;color:#64748b;padding-left:4px;">+${open.length - shown.length} more open (manage in PMS)</div>`);
+  }
+  container.innerHTML = rows.join("");
+  container.onclick = (ev) => {
+    const btn = ev.target.closest("button[data-action='mark-action-done']");
+    if (btn) void markActionItemDone(btn.getAttribute("data-id"));
+  };
+}
+async function markActionItemDone(noteId) {
+  if (!selectedProject || !noteId) return;
+  if (saveInFlight) { setStatus("actionStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
+  setStatus("actionStatus", "info", "⏳ Closing action item…");
+  try {
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      notes: (fresh.notes || []).map(n =>
+        n.id === noteId
+          ? { ...n, actionStatus: "done", status: "Done", updatedAt: new Date().toISOString() }
+          : n),
+    }));
+    setStatus("actionStatus", "success", "✓ Action item closed.");
+    refreshOpenActionItemChips();
+  } catch (e) {
+    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
+  } finally {
+    saveInFlight = false;
+  }
+}
+
 function refreshEmailSavedIndicator(animate = false) {
   const btnSharePoint = document.getElementById("saveSpBtn");
   const btnRecordOnly = document.getElementById("saveRecordBtn");
@@ -1121,18 +1300,24 @@ function refreshEmailSavedIndicator(animate = false) {
     try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
+  // The open email is filed to selectedProject → stamp the "filed" chips. Idempotent
+  // + guarded so it runs once per item/project; covers the quiet auto-save-on-tag path
+  // (which skips recordSaveAndCelebrate), explicit saves, and re-opening filed mail.
+  const _stampKey = emailItem.itemId + "|" + selectedProject.id;
+  if (_stampKey !== _lastStampedKey) { _lastStampedKey = _stampKey; void stampProjectCategory(selectedProject); }
 
-  // Record is saved. Only collapse to the "done" card once it's filed to
-  // SharePoint; while it's record-only (e.g. auto-saved on tag), KEEP the Save to
-  // SharePoint button available so attachments can still be filed.
+  // Record is logged. Keep the Save to SharePoint button ONLY when there are
+  // attachments not yet filed there; otherwise collapse to the "✓ logged" card.
   const wasFiledToSharePoint = !!existing.spFolderUrl;
-  if (!wasFiledToSharePoint) {
-    applyEmailFlowEmphasis();
+  const hasAttachments = !!existing.hasAttachments || (attCount && attCount > 0);
+  if (!wasFiledToSharePoint && hasAttachments) {
+    applyEmailFlowEmphasis(); // keeps the SharePoint button visible for attachments
     if (confirmation) confirmation.style.display = "none";
+    setStatus("actionStatus", "success", "✓ Logged to project record — Save attachments to SharePoint below.");
     try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
-  // Filed to SharePoint → collapse the save row into a single big-check card.
+  // Filed to SharePoint, or nothing to file → collapse into the "✓ logged" card.
   if (saveRow) saveRow.style.display = "none";
   if (saveCapRow) saveCapRow.style.display = "none";
 
@@ -1143,7 +1328,7 @@ function refreshEmailSavedIndicator(animate = false) {
 
   const primary = wasFiledToSharePoint
     ? "Saved to SharePoint + project record"
-    : "Saved to project record";
+    : "Logged to project record";
   const secondaryParts = [`Filed ${savedDate}`];
   if (wasFiledToSharePoint && attCount && attCount > 0) {
     secondaryParts.push(`${attCount} file${attCount > 1 ? "s" : ""}`);
@@ -1246,8 +1431,20 @@ let _customSpFolderName = "";
 // rename UI is an inline input that appears inside the pane.
 let _renamingSpFolder = false;
 
+// Resolve the current item's subject to a plain STRING. In compose-mode
+// appointments (the organizer editing their own meeting) item.subject is an
+// async Subject object, not a string — calling string methods on it throws
+// "…replace is not a function". loadItemContext resolves the value into the
+// #emailSubject element via getAsync, so read that as the source of truth and
+// only trust item.subject directly when it's already a string.
+function getResolvedItemSubject() {
+  if (typeof emailItem?.subject === "string") return emailItem.subject;
+  const el = document.getElementById("emailSubject")?.textContent || "";
+  return (el && el !== "(Loading…)" && el !== "(No subject)") ? el : "";
+}
+
 function _getDefaultSpFolderSubject() {
-  return (emailItem?.subject || "No Subject")
+  return (getResolvedItemSubject() || "No Subject")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -1365,30 +1562,36 @@ function applyEmailFlowEmphasis() {
         btnRow.appendChild(clearBtn);
       }
     } else {
-      if (_customSpFolderName) {
-        const prefix = document.createTextNode("Folder: ");
-        const strong = document.createElement("strong");
-        strong.style.color = "var(--text)";
-        strong.textContent = _customSpFolderName;
-        capSp.appendChild(prefix);
-        capSp.appendChild(strong);
-      } else {
-        capSp.appendChild(document.createTextNode("Email + attachments → SharePoint + record"));
-      }
-      // Quiet text link — discoverable next to the caption but not competing
-      // with the save buttons for attention.
+      // Prominent, always-visible folder control in the pending state. The old
+      // faint underlined link was easy to miss, so show the actual folder name
+      // that will be created plus a clearly-tappable Rename button. (The
+      // YYYY_MM_DD prefix is added automatically at save time, not shown here.)
+      const folderName = _customSpFolderName || _getDefaultSpFolderSubject();
+      const wrap = document.createElement("span");
+      wrap.style.cssText = "display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px 8px;justify-content:center;";
+
+      const label = document.createElement("span");
+      label.style.cssText = "font-size:11px;color:var(--muted);";
+      label.appendChild(document.createTextNode("📁 Folder: "));
+      const strong = document.createElement("strong");
+      strong.style.color = "var(--text)";
+      strong.textContent = folderName;
+      label.appendChild(strong);
+      wrap.appendChild(label);
+
       const renameBtn = document.createElement("button");
       renameBtn.type = "button";
       renameBtn.id = "saveSpRenameLink";
-      renameBtn.textContent = _customSpFolderName ? "change" : "rename folder";
+      renameBtn.textContent = _customSpFolderName ? "✏️ Change name" : "✏️ Rename folder";
       renameBtn.title = "Set a custom folder name (the date prefix is added automatically)";
-      renameBtn.style.cssText = "margin-left:8px;color:var(--muted);background:transparent;border:none;padding:2px 0;font:inherit;font-size:11px;cursor:pointer;text-decoration:underline;text-underline-offset:2px;";
+      renameBtn.style.cssText = "font-size:11px;padding:3px 10px;border:1px solid var(--primary);background:#fff;color:var(--primary);border-radius:4px;cursor:pointer;white-space:nowrap;";
       renameBtn.addEventListener("click", e => {
         e.preventDefault();
         e.stopPropagation();
         openSpFolderRenameEditor();
       });
-      capSp.appendChild(renameBtn);
+      wrap.appendChild(renameBtn);
+      capSp.appendChild(wrap);
     }
   }
   if (row) row.style.gridTemplateColumns = "1fr";
@@ -1465,6 +1668,21 @@ async function onSignedIn() {
   // Surface any saves that didn't complete on a previous session.
   try { showPendingFilingBanner(); } catch (e) { console.warn("[filing-queue] banner render failed:", e.message); }
 }
+// Only escalate a failed silent token acquisition to a popup when MSAL says
+// the user actually has to interact (expired session, consent needed). A bare
+// catch here used to popup on ANY silent failure — including transient network
+// errors — so background flows (auto-save, chip refreshes) could spawn an
+// unprompted MSAL popup with no user gesture, or fail cryptically when the
+// webview blocked it. Genuine interaction cases (first-time consent for the
+// Teams/shared-mail scopes, expired refresh token) still get the popup.
+function _msalNeedsInteraction(e) {
+  try {
+    if (typeof msal !== "undefined" && msal.InteractionRequiredAuthError &&
+        e instanceof msal.InteractionRequiredAuthError) return true;
+  } catch { /* msal global not exposed — fall through to code check */ }
+  const code = String(e?.errorCode || e?.code || "") + " " + String(e?.message || "");
+  return /interaction_required|consent_required|login_required|no_tokens_found|no_account_error/i.test(code);
+}
 async function getToken(forceRefresh = false) {
   const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
   if (!account) throw new Error("Not signed in");
@@ -1475,7 +1693,8 @@ async function getToken(forceRefresh = false) {
     // cache thinks are still valid.
     const r = await msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account, forceRefresh });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     const r = await msalApp.acquireTokenPopup({ scopes: GRAPH_SCOPES, account });
     return r.accessToken;
   }
@@ -1490,10 +1709,26 @@ async function getChannelMessageToken() {
   try {
     const r = await msalApp.acquireTokenSilent({ scopes: CHANNEL_MESSAGE_SCOPES, account });
     return r.accessToken;
-  } catch {
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
     // First call → consent popup. Subsequent silent calls succeed because
     // the consent is cached on the user's MSAL account.
     const r = await msalApp.acquireTokenPopup({ scopes: CHANNEL_MESSAGE_SCOPES, account });
+    return r.accessToken;
+  }
+}
+// On-demand token for reading a mailbox shared/delegated to the signed-in user.
+// Same lazy-consent pattern as getChannelMessageToken: the Mail.Read.Shared
+// prompt fires once, the first time someone scans a colleague's mailbox.
+async function getSharedMailToken() {
+  const account = msalAccount || msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+  if (!account) throw new Error("Not signed in");
+  try {
+    const r = await msalApp.acquireTokenSilent({ scopes: SHARED_MAIL_SCOPES, account });
+    return r.accessToken;
+  } catch (e) {
+    if (!_msalNeedsInteraction(e)) throw e;
+    const r = await msalApp.acquireTokenPopup({ scopes: SHARED_MAIL_SCOPES, account });
     return r.accessToken;
   }
 }
@@ -1504,6 +1739,21 @@ const SB_HEADERS = {
   "Content-Type": "application/json",
   "Prefer": "return=minimal",
 };
+
+// Shared suite sign-in (setty-auth.js, loaded cross-repo from /setty-pms/).
+// Shim keeps the pane fully functional if that script ever fails to load —
+// filing must never die on an auth nicety. SB_HEADERS is read at call time
+// everywhere, so mutating Authorization covers all ~30 call sites. Taskpanes
+// can't full-page redirect, so the pill uses the popup flow (same pattern as
+// the pane's existing MSAL popups).
+const _settyAuth = window.settyAuth || {
+  init: async () => null, onChange() {}, token: () => SUPABASE_ANON,
+  isSignedIn: () => false, mountPill() {}, signInPopup: async () => null,
+};
+const settyAuthReady = _settyAuth.init().catch(() => null).then(() => _syncSettyAuth());
+function _syncSettyAuth() { SB_HEADERS.Authorization = "Bearer " + _settyAuth.token(); }
+_settyAuth.onChange(_syncSettyAuth);
+_settyAuth.mountPill({ label: "🔐 Sign in", onClick: () => _settyAuth.signInPopup() });
 // localStorage cache for the projects/clients picker. Two changes vs prior
 // "v2" format:
 //   1. Strip projects + clients down to the fields the pane actually reads
@@ -1561,7 +1811,9 @@ function _stripProjectForCache(p) {
     directory: (p.directory || []).map(d => ({ email: d.email || "" })),
     projectContacts: { pm: ((p.projectContacts?.pm) || []).map(c => ({ email: c.email || "" })) },
     // Nested record arrays — slim each record to ONLY the fields the add-in
-    // reads from the cached project. findSavedEmailRecord needs msgId.
+    // reads from the cached project. emails[] is empty on the slim-view load
+    // (filed-email reads go through ensureProjectEmailMeta) but is kept for
+    // the legacy pms_data fallback path, which still carries inline records.
     // refreshOneNoteLinkBanner needs note.{sourceItemId, sourceMessageId,
     // oneNoteUrl}. getLoggedEmailArtifactLabels needs note + milestone +
     // rfi + sub source-id matchers. Pickers need id/number/title/status/etc.
@@ -1702,7 +1954,27 @@ function saveProjectsCache(projects, clients, versionMap) {
   }
 }
 
+// Page past PostgREST's 1000-row response cap for an arbitrary select, returning
+// ALL rows. `pathQuery` must already include its query string AND a stable
+// &order=<unique-ish key> so offset paging stays disjoint across pages. Throws on
+// the first non-ok page so callers can fall back (e.g. to the legacy pms_data row).
+async function sbFetchAllRows(pathQuery, label) {
+  const out = [];
+  const PAGE = 1000;
+  for (let offset = 0; offset < 500000; offset += PAGE) {
+    const res = await fetchWithRetry(
+      SUPABASE_URL + "/rest/v1/" + pathQuery + "&limit=" + PAGE + "&offset=" + offset,
+      { headers: SB_HEADERS }, { label });
+    if (!res.ok) throw new Error((label || "sbFetchAllRows") + " HTTP " + res.status);
+    const rows = await res.json();
+    if (rows && rows.length) out.push(...rows);
+    if (!rows || rows.length < PAGE) break;   // last page reached
+  }
+  return out;
+}
+
 async function loadProjects() {
+  await settyAuthReady;   // session header set before the first Supabase read
   // Hydrate from cache instantly (if available) so the pane is responsive
   // even before the fresh fetch returns. The cache holds the *projects array*
   // (post-archived-filter) and the version map; we'll overwrite both when
@@ -1723,13 +1995,20 @@ async function loadProjects() {
   // don't exist yet or are empty (pre-migration). Once PMS migrates, V2 is
   // authoritative and the legacy row becomes a static safety net.
   try {
-    const [pRes, cRes] = await Promise.all([
-      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects?select=id,project,version", { headers: SB_HEADERS }, { label: "sb loadProjects v2 projects" }),
-      fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_clients?select=client", { headers: SB_HEADERS }, { label: "sb loadProjects v2 clients" }),
+    // Page both reads past the 1000-row cap. pms_projects (≈130) and pms_clients
+    // (≈291) are under it today but both grow; an unpaged read would silently drop
+    // everything past row 1000 once they cross it. sbFetchAllRows throws on a failed
+    // page, so a transient error still lands in the catch below and falls back.
+    // pms_projects_slim = pms_projects minus the inline project.emails[] array
+    // (~1/3 of the wire size and growing with every filed email). Filed-email
+    // reads come from pms_project_emails via ensureProjectEmailMeta; save
+    // flows still re-fetch the FULL row (fetchFreshProjectV2) so email-append
+    // mutators always merge against the complete inline array.
+    const [pRows, cRows] = await Promise.all([
+      sbFetchAllRows("pms_projects_slim?select=id,project,version&order=id.asc", "sb loadProjects v2 projects"),
+      sbFetchAllRows("pms_clients?select=client&order=id.asc", "sb loadProjects v2 clients"),
     ]);
-    if (pRes.ok && cRes.ok) {
-      const pRows = await pRes.json();
-      const cRows = await cRes.json();
+    if (pRows && cRows) {
       if (pRows && pRows.length > 0) {
         // V2 path
         allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
@@ -1768,6 +2047,57 @@ async function loadProjects() {
     console.error("Failed to load projects:", e);
   }
 }
+
+// Project data is loaded once when the pane opens (onSignedIn → loadProjects).
+// While the pane stays open — pinned across emails — new projects or schedule
+// edits made in PMS (or by teammates) never appear until a full reload. These
+// two hooks fix that without a reload:
+//   • the ↻ button calls refreshProjectData() explicitly, and
+//   • loadItemContext() calls maybeAutoRefreshProjects() on each email switch,
+//     throttled so rapid switching can't hammer the DB.
+// Seeded to "now" at module load so the initial onSignedIn fetch counts as the
+// baseline and the first few email switches don't trigger a redundant re-fetch.
+let _lastProjectsRefreshAt = Date.now();
+let _projectRefreshInFlight = false;
+const PROJECTS_AUTO_REFRESH_MS = 3 * 60 * 1000; // silent re-fetch at most once per 3 min
+
+async function refreshProjectData({ silent = false } = {}) {
+  if (_projectRefreshInFlight) return;
+  _projectRefreshInFlight = true;
+  const btn = document.getElementById("refreshProjectsBtn");
+  if (btn) btn.classList.add("spinning");
+  if (!silent) setStatus("actionStatus", "info", "⏳ Refreshing from PMS…");
+  try {
+    await loadProjects();               // fresh Supabase fetch; overwrites allProjects + cache
+    _lastProjectsRefreshAt = Date.now();
+    // Re-point the current selection at the freshly-fetched object so the
+    // jobcard, schedule and directory reflect the latest data. Don't re-persist
+    // the mapping (second arg false) — we're refreshing data, not re-tagging.
+    if (selectedProject) {
+      const fresh = getProjectById(selectedProject.id);
+      if (fresh) setSelectedProject(fresh, false);
+    } else {
+      await restoreProjectSelectionForCurrentEmail();
+    }
+    updateProjectQuickLinks();
+    try { updatePeopleButtonBadge(); } catch {}
+    if (!silent) setStatus("actionStatus", "success", "✓ Updated from PMS");
+  } catch (e) {
+    if (!silent) setStatus("actionStatus", "error", "✗ Refresh failed: " + humanizeError(e));
+  } finally {
+    _projectRefreshInFlight = false;
+    if (btn) btn.classList.remove("spinning");
+  }
+}
+
+// Fire a silent refresh on email switch, but only if it's been a while — keeps
+// the pane current for someone who leaves it pinned all day without adding a
+// network round-trip to every single email they open.
+function maybeAutoRefreshProjects() {
+  if (Date.now() - _lastProjectsRefreshAt < PROJECTS_AUTO_REFRESH_MS) return;
+  refreshProjectData({ silent: true });
+}
+
 async function saveToSupabase(updatedProjects) {
   await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton", {
     method: "PATCH",
@@ -1810,6 +2140,27 @@ async function fetchFreshProjectV2(projectId) {
   return { project: rows[0].project, version: rows[0].version };
 }
 
+// Canonical JSON for value-equality across a Postgres jsonb round-trip (jsonb
+// normalizes key order, so plain stringify comparison would false-negative).
+// Mirrors JSON.stringify semantics: undefined-valued keys are dropped.
+// The DB trigger rewrites project.emails on every save (restores the archive
+// when the key is absent — slim-loaded saves — and strips heavy bodies when
+// present), so the stored blob's emails NEVER byte-match what we sent. Any
+// equality check against a fresh fetch must compare everything EXCEPT emails.
+function _projectMinusEmails(p) {
+  if (!p || typeof p !== "object") return p;
+  const copy = { ...p };
+  delete copy.emails;
+  return copy;
+}
+
+function _canonicalJson(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return "[" + v.map(x => _canonicalJson(x === undefined ? null : x)).join(",") + "]";
+  return "{" + Object.keys(v).filter(k => v[k] !== undefined).sort()
+    .map(k => JSON.stringify(k) + ":" + _canonicalJson(v[k])).join(",") + "}";
+}
+
 async function saveProjectRowV2(project, expectedVersion) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(project.id) +
               "&version=eq." + expectedVersion;
@@ -1827,6 +2178,21 @@ async function saveProjectRowV2(project, expectedVersion) {
   if (!result || result.length === 0) {
     // version mismatch — re-fetch to give caller something to merge
     const fresh = await fetchFreshProjectV2(project.id);
+    // False-conflict detection: this PATCH goes through fetchWithRetry, which
+    // retries on network errors — including a connection dropped AFTER the
+    // server committed. The retry then matches 0 rows (version already bumped)
+    // and looks exactly like a real conflict, telling the user their save
+    // failed when it succeeded (and inviting a duplicate re-save). If the
+    // cloud is at exactly expected+1 AND holds what we sent, that "conflict"
+    // was our own write landing — treat as success. Compared MINUS the
+    // emails key: the slim-email trigger rewrites it server-side on every
+    // save, so a full-blob compare would never match and this recovery
+    // would silently stop working.
+    if (fresh && fresh.version === expectedVersion + 1 &&
+        _canonicalJson(_projectMinusEmails(fresh.project)) === _canonicalJson(_projectMinusEmails(project))) {
+      _projectVersionCache.set(project.id, fresh.version);
+      return fresh.version;
+    }
     throw new AddinConflictError(
       "Project " + project.id + " was modified by someone else (cloud v" +
       (fresh?.version ?? "?") + ", you had v" + expectedVersion + ")",
@@ -1928,32 +2294,22 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
   // write a stale shadow copy that no one reads. In that case we surface a
   // clear error rather than silently writing to a dead-end table.
   const migrationDone = await _checkAddinMigrationStatus();
-  if (migrationDone && !fresh) {
-    // V2 migration is complete but this project doesn't have a V2 row. Either
-    // the project was added in legacy and never migrated (unlikely), or this
-    // is a brand-new add via the add-in. Treat as INSERT.
-    try {
-      const mutated = mutateProject({ id: projectId });
-      if (!mutated?.id) throw new Error("mutator returned invalid project");
-      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_projects", {
-        method: "POST",
-        headers: SB_HEADERS,
-        body: JSON.stringify({ id: projectId, project: mutated, version: 1, updated_at: new Date().toISOString() }),
-      }, { label: "sb pms_projects insert" });
-      if (!res.ok) throw new Error("pms_projects POST HTTP " + res.status);
-      _projectVersionCache.set(projectId, 1);
-      allProjects = allProjects.map(p => p.id === projectId ? mutated : p);
-      if (selectedProject && selectedProject.id === projectId) selectedProject = mutated;
-      return mutated;
-    } catch (insertErr) {
-      throw new Error("Could not save: V2 row missing for project " + projectId + " and INSERT failed: " + insertErr.message);
-    }
-  }
+  // ORDER MATTERS: v2FetchFailed implies fresh === undefined, so this check
+  // must come before the missing-row check — previously the INSERT branch
+  // below shadowed it and this "try again" path was unreachable.
   if (migrationDone && v2FetchFailed) {
     // Migration is done but our V2 fetch failed transiently. Don't fall back
     // to legacy — surface the error so the user retries instead of writing
     // to a dead-end table.
     throw new Error("Cloud temporarily unreachable. Wait a few seconds and try again. (V2 fetch failed; not falling back to legacy because the data layer has migrated.)");
+  }
+  if (migrationDone && !fresh) {
+    // Fetch SUCCEEDED but returned no row: the project doesn't exist in V2.
+    // The add-in never creates projects, so there is no legitimate INSERT
+    // case — this used to POST a skeleton row built from a bare {id}, which
+    // resurrected projects deleted in PMS as ghost rows containing only the
+    // new note/email (name, number, folder URL, milestones all missing).
+    throw new Error("This project no longer exists in PMS (it may have been deleted). Refresh the pane and pick another project.");
   }
 
   // Pre-migration: legacy path is still authoritative
@@ -1978,6 +2334,9 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     from_address: emailRecord.fromAddress || "",
     to_addresses: emailRecord.to || "",
     cc_addresses: emailRecord.cc || "",
+    // Explicit direction so Claude can reason about "what we sent" vs "what we received"
+    // without inferring from the address. Firm domain (setty.com) sender => outgoing.
+    direction: String(emailRecord.fromAddress || "").toLowerCase().endsWith("@setty.com") ? "outgoing" : "incoming",
     email_date: emailRecord.date || null,
     saved_at: emailRecord.savedAt || new Date().toISOString(),
     saved_by: emailRecord.savedBy || null,
@@ -2004,7 +2363,111 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     const errText = await res.text();
     throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
   }
+  // Keep the filed-email metadata cache in step with this insert so the
+  // saved-indicator, chips and auto-save dedup gate see the new record
+  // without a round-trip.
+  _recordEmailMetaLocal(projectId, {
+    id: emailRecord.id,
+    msgId: emailRecord.msgId,
+    conversationId: conversationId ?? (currentConversationId || null),
+    subject: emailRecord.subject || "",
+    from: emailRecord.from || "",
+    fromAddress: emailRecord.fromAddress || "",
+    toAddresses: emailRecord.to || "",
+    ccAddresses: emailRecord.cc || "",
+    date: emailRecord.date || null,
+    spFolderUrl: emailRecord.spFolderUrl || "",
+    savedAt: emailRecord.savedAt || new Date().toISOString(),
+    savedToSharePoint: !!savedToSharePoint,
+  });
 }
+
+// ─── FILED-EMAIL METADATA (table-backed) ────────────────────────────────────
+// Since the slim-load cutover, the bulk project load comes from the
+// pms_projects_slim view, which omits the inline project.emails[] array.
+// Everything that used to scan project.emails — the saved-email indicator,
+// "Logged as RFI/Sub" chips, auto-save's already-filed gate, and the RFI/Sub
+// recipient resolvers — now reads a per-project slice of pms_project_emails
+// (the authoritative filed-email index: 15k+ rows vs the inline array's
+// partial ~5k). Rows are mapped to the inline record field names so the
+// matching code is unchanged. Cached per project with a short TTL; updated
+// locally on every successful saveProjectEmailRow so gates never lag a save.
+const _projEmailMetaCache = new Map(); // projectId -> { rows, at, promise }
+const PROJ_EMAIL_META_TTL_MS = 3 * 60 * 1000;
+
+function _mapEmailMetaRow(r) {
+  return {
+    id: r.record_id,
+    msgId: r.msg_id,
+    conversationId: r.conversation_id,
+    subject: r.subject,
+    from: r.from_name,
+    fromAddress: r.from_address,
+    toAddresses: r.to_addresses,
+    ccAddresses: r.cc_addresses,
+    date: r.email_date,
+    spFolderUrl: r.sp_folder_url,
+    savedAt: r.saved_at,
+    savedToSharePoint: !!r.saved_to_sharepoint,
+  };
+}
+
+// Sync accessor used by render-path code. Serves the warmed cache; falls back
+// to the inline array (still populated on the legacy pms_data path, and on
+// any project object refreshed via the full-row fetchFreshProjectV2).
+function _emailRowsFor(project) {
+  if (!project) return [];
+  const c = _projEmailMetaCache.get(project.id);
+  if (c && c.rows) return c.rows;
+  return project.emails || [];
+}
+
+async function ensureProjectEmailMeta(projectId, { force = false } = {}) {
+  if (!projectId) return [];
+  const cached = _projEmailMetaCache.get(projectId);
+  if (!force && cached) {
+    if (cached.rows && Date.now() - cached.at < PROJ_EMAIL_META_TTL_MS) return cached.rows;
+    if (cached.promise) return cached.promise;
+  }
+  const promise = (async () => {
+    const rows = await sbFetchAllRows(
+      "pms_project_emails?project_id=eq." + encodeURIComponent(projectId) +
+      "&select=record_id,msg_id,conversation_id,subject,from_name,from_address,to_addresses,cc_addresses,email_date,sp_folder_url,saved_at,saved_to_sharepoint" +
+      "&order=email_date.desc.nullslast,record_id.asc",
+      "sb projectEmailMeta");
+    const mapped = rows.map(_mapEmailMetaRow);
+    _projEmailMetaCache.set(projectId, { rows: mapped, at: Date.now() });
+    return mapped;
+  })();
+  // Stale-while-refreshing: keep serving old rows until the new fetch lands.
+  _projEmailMetaCache.set(projectId, { rows: cached?.rows, at: cached?.at || 0, promise });
+  try {
+    return await promise;
+  } catch (e) {
+    // On failure keep any stale rows (better than nothing); with no rows at
+    // all, callers fall back to project.emails / proceed — the DB-side
+    // (project_id, msg_id) dedup still guards against double-filing.
+    if (cached?.rows) {
+      _projEmailMetaCache.set(projectId, { rows: cached.rows, at: cached.at });
+      return cached.rows;
+    }
+    _projEmailMetaCache.delete(projectId);
+    console.warn("projectEmailMeta fetch failed for", projectId, e.message);
+    return [];
+  }
+}
+
+// Local upsert after a successful table insert — no-op if the project's
+// cache was never loaded (next ensure fetches the row anyway). Replaces any
+// existing record for the same email (mirrors the inline replace on the
+// SharePoint save path) so spFolderUrl/savedToSharePoint updates take.
+function _recordEmailMetaLocal(projectId, rec) {
+  const c = _projEmailMetaCache.get(projectId);
+  if (!c || !c.rows) return;
+  c.rows = c.rows.filter(e => !(e.id === rec.id || (rec.msgId && e.msgId === rec.msgId)));
+  c.rows.unshift(rec);
+}
+
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
 }
@@ -2260,8 +2723,24 @@ function getConversationProjectMap() {
     return {};
   }
 }
+// Cap the per-email/per-thread tag maps. They accumulate one entry per tagged
+// email forever (~150-char REST-id keys) and were never pruned — months of
+// heavy filing eventually crowds the localStorage quota the projects cache
+// needs, and the only symptom is pane opens quietly getting slow again.
+// Plain-object string keys keep insertion order (and JSON round-trips preserve
+// it), so the FIRST keys are the oldest tags — drop those. Cloud thread tags
+// (pms_email_thread_tags) still restore anything pruned here.
+function _pruneMapToCap(map, cap) {
+  const keys = Object.keys(map);
+  if (keys.length <= cap) return map;
+  for (const k of keys.slice(0, keys.length - cap)) delete map[k];
+  return map;
+}
+function saveEmailProjectMap(map) {
+  localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 2000)));
+}
 function saveConversationProjectMap(map) {
-  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map || {}));
+  localStorage.setItem(EMAIL_CONVO_PROJECT_MAP_STORAGE_KEY, JSON.stringify(_pruneMapToCap(map || {}, 3000)));
 }
 async function saveSharedConversationProjectTag(conversationId, projectId) {
   if (!conversationId || !projectId) return;
@@ -2372,8 +2851,6 @@ function applyPipelineUiRules() {
       hint.style.display = "none";
     }
   }
-  if (!isPipeline) return;
-
   const keepEnabled = new Set([
     "saveRecordBtn",
     "openPmsBtn",
@@ -2394,10 +2871,14 @@ function applyPipelineUiRules() {
     "manualMilestoneBtn",
     "addParticipantBtn",
   ];
+  // Runs UNCONDITIONALLY (no early return on awarded projects): this function
+  // is the only thing that re-enables these buttons after a pipeline project
+  // disabled them. Previously, switching pipeline → awarded left "Log as
+  // Note" and friends dead until the user left and re-opened the email.
   actionButtons.forEach(id => {
     const btn = document.getElementById(id);
     if (!btn) return;
-    btn.disabled = !keepEnabled.has(id);
+    btn.disabled = isPipeline && !keepEnabled.has(id);
   });
 }
 
@@ -2464,7 +2945,7 @@ async function clearProjectTagForCurrentEmail() {
     const map = getEmailProjectMap();
     if (map[msgId]) {
       delete map[msgId];
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
   }
   // Use shared key (handles both emails and appointments) so the cross-device
@@ -2482,6 +2963,109 @@ async function clearProjectTagForCurrentEmail() {
   setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project.");
 }
 
+// ── JOBCARD ──────────────────────────────────────────────────────────────────
+// At-a-glance "what we know about this job" lines, shown inside the green project
+// badge. Pure client-side render from the already-loaded project object (status,
+// milestones, RFIs, submittals, action-item notes) — no AI, no network call, $0.
+function renderJobcard(project) {
+  const el = document.getElementById("jobcardBody");
+  if (!el) return;
+  if (!project) { el.style.display = "none"; el.innerHTML = ""; return; }
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const today = new Date().toISOString().slice(0, 10);
+  const ok = (d) => typeof d === "string" && d >= "2015-01-01" && d <= "2100-12-31";
+  const fmt = (d) => { try { return new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return esc(d); } };
+
+  const liveMs = (project.milestones || []).filter(m =>
+    m && ok(m.dueDate) && !m.cancelled && (m.status || "") !== "Completed");
+  const allMs = (project.milestones || []).filter(m =>
+    m && ok(m.dueDate) && !m.cancelled);
+  // Next = soonest still-open milestone strictly ahead of us. Previous = the most
+  // recent checkpoint reached, today included (completed or not). Today belongs in
+  // Previous — it's been reached — so the boundary is > today / <= today, not
+  // >= today / < today, which dropped a milestone dated today from both rows.
+  // We dropped the "overdue" count: past milestones rarely get marked Completed,
+  // so nearly every job looked perpetually overdue. Next/Previous reads as a clean
+  // "where we are" timeline.
+  const nextM = liveMs.filter(m => m.dueDate > today)
+    .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)))[0] || null;
+  const prevM = allMs.filter(m => m.dueDate <= today)
+    .sort((a, b) => String(b.dueDate).localeCompare(String(a.dueDate)))[0] || null;
+
+  const actions = (project.notes || []).filter(n =>
+    n && (n.actionItem || n.category === "Action Item") && (n.actionStatus || "open") !== "done");
+  const nextAction = actions.filter(a => ok(a.actionDueDate))
+    .sort((a, b) => String(a.actionDueDate).localeCompare(String(b.actionDueDate)))[0] || null;
+
+  const openRfis = (project.rfis || []).filter(r => RFI_OPEN_STATUSES.has(r?.status || "Open")).length;
+  const openSubs = (project.submittals || []).filter(s => SUB_OPEN_STATUSES.has(s?.status || "Received")).length;
+
+  const rows = [];
+  if (project.status) {
+    rows.push('<div style="margin-bottom:4px;"><span style="display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:10px;background:var(--bg);border:1px solid #b6e3b6;color:var(--success);">' + esc(project.status) + '</span></div>');
+  }
+  const row = (label, valueHtml) =>
+    '<div style="display:flex;gap:8px;font-size:12px;line-height:1.45;color:var(--text);margin-top:4px;">' +
+    '<span style="color:var(--text-soft);min-width:64px;flex:none;font-weight:600;">' + label + '</span>' +
+    '<span style="min-width:0;">' + valueHtml + '</span></div>';
+
+  if (nextM) {
+    rows.push(row("Next", esc(nextM.name || "Milestone") + " · due " + fmt(nextM.dueDate)));
+  }
+  if (prevM) {
+    rows.push(row("Previous", esc(prevM.name || "Milestone") + " · " + fmt(prevM.dueDate)));
+  }
+
+  if (actions.length > 0) {
+    let v = actions.length + " action item" + (actions.length > 1 ? "s" : "");
+    if (nextAction) v += " · 1 due " + fmt(nextAction.actionDueDate);
+    rows.push(row("Actions", esc(v)));
+  }
+
+  if (openRfis > 0 || openSubs > 0) {
+    const parts = [];
+    if (openRfis > 0) parts.push(openRfis + " RFI" + (openRfis > 1 ? "s" : "") + " open");
+    if (openSubs > 0) parts.push(openSubs + " submittal" + (openSubs > 1 ? "s" : "") + " in review");
+    rows.push(row("Technical", esc(parts.join(" · "))));
+  }
+
+  // Ask Claude about this job — opens the user's OWN Claude (their existing seat) with a
+  // prefilled prompt. The job snapshot is embedded INLINE so the answer works EVERYWHERE
+  // (web, desktop, mobile, even a free account) with no connector dependency — the connector
+  // is desktop-only and not yet approved org-wide, so a connector-only prompt would come back
+  // empty on web. A soft connector line lets desktop users who do have it pull live email/
+  // document detail too. $0: no API key, no metering, no new service.
+  const askLines = [
+    "Brief me on " + (project.projectNumber ? project.projectNumber + " " : "") +
+    (project.name || "this project") +
+    ". Here is the current snapshot from our PMS — tell me what needs my attention, what's at risk, and what to do next:",
+  ];
+  if (project.status) askLines.push("- Status: " + project.status);
+  if (nextM) askLines.push("- Next milestone: " + (nextM.name || "Milestone") + " due " + nextM.dueDate);
+  if (prevM) askLines.push("- Previous milestone: " + (prevM.name || "Milestone") + " on " + prevM.dueDate);
+  if (actions.length > 0) askLines.push("- Open action items: " + actions.length +
+    (nextAction ? " (next due " + nextAction.actionDueDate + ")" : ""));
+  if (openRfis > 0) askLines.push("- Open RFIs: " + openRfis);
+  if (openSubs > 0) askLines.push("- Submittals in review: " + openSubs);
+  askLines.push(
+    "If you have the Setty PMS connector enabled, use it to pull the latest emails and documents " +
+    "(including anything I still owe a reply on) and cite sources; otherwise brief me from the snapshot above.");
+  const askPrompt = askLines.join("\n");
+  const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
+  rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
+
+  el.innerHTML = rows.join("");
+  el.style.display = "block"; // the Ask-Claude link always renders, so the body always shows
+
+  const askEl = document.getElementById("jcAskClaude");
+  if (askEl) askEl.onclick = (e) => {
+    e.preventDefault();
+    try { openExternalUrl(askUrl); } catch (err) { console.warn("[jobcard] open Claude failed:", err); }
+  };
+}
+
 function setSelectedProject(project, persistForEmail = false) {
   selectedProject = project || null;
   // Hide phase-inappropriate logging buttons (Log as RFI / Submittal) when
@@ -2491,6 +3075,19 @@ function setSelectedProject(project, persistForEmail = false) {
   // Re-render the "Logged as RFI/Sub" chip row — different project may have
   // different artifacts sourced from the same email.
   try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[chips] refresh failed:", e.message); }
+  // Warm the table-backed filed-email metadata for this project, then repaint
+  // the affordances that read it (saved indicator + RFI/Sub chips render
+  // empty-handed above until the rows land). Guarded so a slow fetch for a
+  // project the user has already moved off of can't repaint the wrong
+  // selection. ensureProjectEmailMeta never throws (degrades internally).
+  if (selectedProject) {
+    const metaPid = selectedProject.id;
+    void ensureProjectEmailMeta(metaPid).then(() => {
+      if (!selectedProject || selectedProject.id !== metaPid) return;
+      try { refreshLoggedArtifactChips(); } catch {}
+      try { refreshEmailSavedIndicator(); } catch {}
+    });
+  }
   // Re-populate the "Link to" dropdown — open RFIs/Subs differ per project.
   try { refreshLinkToTargetDropdown(); } catch (e) { console.warn("[link-to] refresh failed:", e.message); }
   // "N new" count depends on the selected project's directory.
@@ -2524,7 +3121,7 @@ function setSelectedProject(project, persistForEmail = false) {
     if (msgId) {
       const map = getEmailProjectMap();
       map[msgId] = selectedProject.id;
-      localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+      saveEmailProjectMap(map);
     }
     void (async () => {
       // Use the shared key (iCalUId for appointments, conversationId for emails)
@@ -2540,6 +3137,7 @@ function setSelectedProject(project, persistForEmail = false) {
     })();
   }
   updateProjectQuickLinks();
+  try { renderJobcard(selectedProject); } catch (e) { console.warn("[jobcard] render failed:", e.message); }
   refreshActionItemOwnerOptions();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
@@ -2561,13 +3159,36 @@ async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
     if (typeof emailItem?.subject !== "string") return; // compose / appointment — skip
+    const myGen = itemContextGeneration;
+    await ensureInternetMessageId(); // resolve the STABLE id before keying the record (prevents re-log drift)
     const msgId = getCurrentMessageRecordId();
     if (!msgId) return;
     if (_autoSavingMsgId === msgId) return;                    // a save for this email is already running
+    // Filed-detection reads the table-backed metadata cache — it MUST be
+    // loaded before the "already filed" gate is trusted. With a cold cache
+    // every open of a tagged email would look unfiled and re-run a full
+    // save cycle (version churn + phantom conflicts); the DB dedup would
+    // catch the duplicate, but only after the wasted round-trips.
+    await ensureProjectEmailMeta(selectedProject.id);
+    if (myGen !== itemContextGeneration) return; // user moved on during fetch
+    if (!selectedProject) return;
     if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
+    // Respect the process-wide save lock. Auto-save used to bypass it and
+    // race user-initiated saves on the version counter — both fetch v10, one
+    // PATCHes to v11, the other's version=eq.10 matches 0 rows → a phantom
+    // "Save conflict" for a save the user did nothing wrong on. Wait for the
+    // in-flight save (bounded), then re-check everything that may have changed.
+    for (let waited = 0; saveInFlight && waited < 20000; waited += 500) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (saveInFlight) return;                    // still busy — skip; re-attempted on next open
+    if (myGen !== itemContextGeneration) return; // user moved on while we waited
+    if (!selectedProject) return;
+    if (findSavedEmailRecord(selectedProject, msgId)) return; // the save we waited on logged it
     _autoSavingMsgId = msgId;
+    saveInFlight = true; // hold the lock so a user click can't race US either
     try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
-    finally { _autoSavingMsgId = null; }
+    finally { saveInFlight = false; _autoSavingMsgId = null; }
   } catch (e) {
     console.warn("auto-save failed:", e);
   }
@@ -2595,6 +3216,13 @@ function refreshCalendarStatus() {
   }
 }
 async function restoreProjectSelectionForCurrentEmail() {
+  // Stale-restore guard: this function awaits Graph + Supabase, and its result
+  // APPLIES a selection (which auto-files the open email via setSelectedProject
+  // → autoSaveEmailToRecord). If the user has arrowed to a different email while
+  // we were fetching, applying the old email's project would silently file the
+  // NEW email into the OLD email's project. Capture the generation and bail
+  // after every await — the new item runs its own restore.
+  const myGen = itemContextGeneration;
   const msgId = getCurrentMessageRestId();
   if (!allProjects.length) return;
   let projectId = "";
@@ -2609,12 +3237,14 @@ async function restoreProjectSelectionForCurrentEmail() {
     // Use shared key — iCalUId for appointments, conversationId for emails.
     // Awaits the iCalUId Graph fetch internally for appointments.
     const sharedKey = await getCurrentSharedKey();
+    if (myGen !== itemContextGeneration) return; // user moved on
     if (sharedKey) {
       const convoMap = getConversationProjectMap();
       projectId = convoMap[sharedKey] || "";
       if (projectId) restoredVia = "localStorage-sharedKey";
       if (!projectId) {
         const tag = await getSharedConversationTag(sharedKey);
+        if (myGen !== itemContextGeneration) return; // user moved on
         projectId = tag?.project_id || "";
         if (projectId) {
           restoredVia = "cloud-sharedKey";
@@ -2655,9 +3285,10 @@ async function restoreProjectSelectionForCurrentEmail() {
           if (msgId) {
             const map = getEmailProjectMap();
             map[msgId] = projectId;
-            localStorage.setItem(EMAIL_PROJECT_MAP_STORAGE_KEY, JSON.stringify(map));
+            saveEmailProjectMap(map);
           }
           const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
+          if (myGen !== itemContextGeneration) return; // user moved on — don't tag the wrong thread
           if (sharedKey) {
             const convoMap = getConversationProjectMap();
             convoMap[sharedKey] = projectId;
@@ -2671,6 +3302,10 @@ async function restoreProjectSelectionForCurrentEmail() {
     }
   }
 
+  // Final stale check before APPLYING anything to the UI/selection. This is
+  // the line that matters most: setSelectedProject auto-files the currently
+  // open email, so a stale application = wrong-project filing.
+  if (myGen !== itemContextGeneration) return;
   if (!projectId) {
     // No tag exists for this thread — surface ranked suggestions instead so
     // users don't always have to type/search. The chip area is hidden by
@@ -2720,6 +3355,12 @@ const SUGGESTION_WEIGHTS = {
 };
 const SUGGESTION_MIN_SCORE = 2;
 const SUGGESTION_MAX_RESULTS = 3;
+// Learned sender→project signal (the same filed-log RPC the sweep uses) cached for
+// the SYNCHRONOUS chips (suggestProjects). Loaded once per session by
+// ensureSenderSignalCache(); empty until it lands, then read synchronously so each
+// email you file makes the chips — not just the sweep — smarter about who files where.
+let _senderSignalCache = new Map();
+let _senderSignalPromise = null;
 // Words to ignore when tokenizing project names and subjects — too generic to
 // signal anything ("Project Renovation" matching "Renovation Project" should
 // not count as a hit).
@@ -2870,6 +3511,13 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
     }
   }
 
+  // Fold in the LEARNED sender→project signal (same filed-log data the sweep uses,
+  // cached on email open). Beyond boosting an existing subject match, mergeSenderSignal
+  // ADDS a candidate for a project this sender reliably files to — so a known sender
+  // surfaces the right job even when the subject names no project at all.
+  const learned = _senderSignalCache.get((senderEmail || "").trim().toLowerCase());
+  if (learned && learned.length) mergeSenderSignal(scored, learned);
+
   scored.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
   return scored.slice(0, SUGGESTION_MAX_RESULTS);
 }
@@ -2883,7 +3531,9 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
 // PREVIEW WRITES NOTHING. It exists to calibrate the thresholds against real mail
 // before auto-filing is enabled. Filing + the review queue come next once the
 // numbers look right.
-const SWEEP_FETCH_COUNT = 150; // recent messages to scan (some filtered to Focused)
+const SWEEP_PAGE_SIZE = 250;          // messages per Graph page — a lean $select keeps this well under the 504 ceiling
+const SWEEP_TARGET_ACTIONABLE = 300;  // keep paging within one batch until this many file+review surface. Raised from 50 for backfill: each Run & file / Load more now walks far deeper before pausing (older/sparser mail hits the SWEEP_MAX_PAGES_PER_BATCH ceiling instead) — fewer clicks to get through a mailbox
+const SWEEP_MAX_PAGES_PER_BATCH = 30; // safety cap: at most 30×250 = 7,500 messages scanned per Preview / Load-more press
 const SWEEP_REVIEW_MIN  = 4;   // min name/acronym score to ENTER review (≥2 distinctive signals)
 
 // Common AEC / institutional words that appear across many project names — too
@@ -2978,8 +3628,26 @@ function sweepParticipants(msg) {
 //   auto-file ONLY when a project ID (SAPX or client prime #) is in the subject;
 //   review only when the name/acronym score clears SWEEP_REVIEW_MIN (≥2 distinctive
 //   signals); otherwise skip. A single coincidental word no longer files anything.
-function classifySweep(candidates) {
+function classifySweep(candidates, filterId = null) {
   if (!candidates.length) return { action: "skip" };
+  // Project-scoped run ("only this job"): decide solely about the chosen project.
+  // Auto-file as much as possible for it — a project # in the subject is decisive;
+  // otherwise file when it's a solid match (≥ review min) that no OTHER job outscores.
+  // Queue anything plausible-but-uncertain as a maybe, and skip mail that clearly
+  // belongs elsewhere (a different job's # in the subject, or no signal for this one).
+  if (filterId) {
+    const match = candidates.find((c) => c.project && c.project.id === filterId);
+    if (!match) return { action: "skip" };                                   // no signal for this job
+    const matchHasId = (match.reasons || []).some((r) => r.includes("project #"));
+    if (matchHasId) return { action: "file", project: match.project, score: match.score, reasons: match.reasons };
+    const otherHasId = candidates.some((c) => c !== match && (c.reasons || []).some((r) => r.includes("project #")));
+    if (otherHasId) return { action: "skip" };                               // a DIFFERENT job's # is in the subject
+    const best = Math.max(...candidates.map((c) => c.score));
+    if (match.score >= SWEEP_REVIEW_MIN && match.score >= best) {             // solid, and nothing outscores it
+      return { action: "file", project: match.project, score: match.score, reasons: match.reasons };
+    }
+    return { action: "review", candidates: [match, ...candidates.filter((c) => c !== match).slice(0, 2)] };
+  }
   const top = candidates[0];
   const hasId = (top.reasons || []).some((r) => r.includes("project #"));
   if (hasId) return { action: "file", project: top.project, score: top.score, reasons: top.reasons };
@@ -2989,36 +3657,89 @@ function classifySweep(candidates) {
 
 // msg_ids already in the email log, so the preview ignores already-filed mail.
 async function sweepLoadFiledIds() {
+  // PostgREST caps every response at 1000 rows, so a plain ?select=msg_id only ever
+  // returned the first 1000 of however many are filed — the rest looked "never filed"
+  // and got re-processed (and re-saved, only to be rejected by the unique index) on
+  // every run. Page through ALL rows so the dedup set is complete.
+  const ids = new Set();
   try {
-    const res = await fetchWithRetry(
-      SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id",
-      { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
-    if (!res.ok) return new Set();
-    const rows = await res.json();
-    return new Set((rows || []).map(r => r.msg_id).filter(Boolean));
-  } catch { return new Set(); }
+    const PAGE = 1000;
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      // order= gives Postgres a stable row order across pages. Without it,
+      // page boundaries can shift under concurrent inserts (the sweep itself
+      // inserts rows) and msg_ids silently fall between pages → dedup misses.
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=msg_id&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
+        { headers: SB_HEADERS }, { label: "sb sweep filed ids" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) if (r.msg_id) ids.add(r.msg_id);
+      if (!rows || rows.length < PAGE) break;   // last page reached
+    }
+  } catch { /* return whatever we gathered */ }
+  return ids;
+}
+
+// conversation_id -> projectId for threads that already have a filed email, so a
+// thread tied to a job auto-files the rest instead of re-surfacing each message.
+// Only UNAMBIGUOUS threads (filed to exactly one project) auto-file; a thread
+// split across projects is left for normal per-message classification.
+async function sweepLoadConvoProjectMap() {
+  try {
+    const byConv = new Map();
+    const PAGE = 1000;                          // page past the 1000-row PostgREST cap
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      // Same stable-order rule as sweepLoadFiledIds.
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?select=conversation_id,project_id&conversation_id=not.is.null&order=record_id.asc&limit=" + PAGE + "&offset=" + offset,
+        { headers: SB_HEADERS }, { label: "sb sweep convo map" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) {
+        const c = r.conversation_id;
+        if (!c || !r.project_id) continue;
+        if (!byConv.has(c)) byConv.set(c, new Set());
+        byConv.get(c).add(r.project_id);
+      }
+      if (!rows || rows.length < PAGE) break;    // last page reached
+    }
+    const map = new Map();
+    for (const [c, set] of byConv) if (set.size === 1) map.set(c, [...set][0]);
+    return map;
+  } catch { return new Map(); }
 }
 
 // Learned sender→project signal from the filed log (RPC sender_project_signals).
 // Self-improving: as more emails get filed, more senders become project-specific.
 // Fetched once per sweep. Returns Map(lower-address -> [{projectId, n, projects}]).
 async function sweepLoadSenderMap() {
+  // sender_project_signals RETURNS TABLE, so its RPC response is capped at 1000
+  // rows just like a plain table read. The result is one row per sender→project
+  // signal; that count climbs as the email backfill adds external senders (ceiling
+  // ≈ 2× distinct external senders), so page past the cap instead of trusting one
+  // call. PostgREST applies limit/offset/order to a table-valued function's result;
+  // the explicit order on a stable key keeps successive pages disjoint.
+  const map = new Map();
   try {
-    const res = await fetchWithRetry(
-      SUPABASE_URL + "/rest/v1/rpc/sender_project_signals",
-      { method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json" }, body: "{}" },
-      { label: "sb sender signals" });
-    if (!res.ok) return new Map();
-    const rows = await res.json();
-    const map = new Map();
-    for (const r of (rows || [])) {
-      const addr = (r.from_address || "").toLowerCase();
-      if (!addr) continue;
-      if (!map.has(addr)) map.set(addr, []);
-      map.get(addr).push({ projectId: r.project_id, n: r.n, projects: r.projects });
+    const PAGE = 1000;
+    for (let offset = 0; offset < 500000; offset += PAGE) {
+      const res = await fetchWithRetry(
+        SUPABASE_URL + "/rest/v1/rpc/sender_project_signals?limit=" + PAGE + "&offset=" + offset +
+          "&order=from_address.asc,project_id.asc",
+        { method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json" }, body: "{}" },
+        { label: "sb sender signals" });
+      if (!res.ok) break;
+      const rows = await res.json();
+      for (const r of (rows || [])) {
+        const addr = (r.from_address || "").toLowerCase();
+        if (!addr) continue;
+        if (!map.has(addr)) map.set(addr, []);
+        map.get(addr).push({ projectId: r.project_id, n: r.n, projects: r.projects });
+      }
+      if (!rows || rows.length < PAGE) break;   // last page reached
     }
-    return map;
-  } catch { return new Map(); }
+  } catch { /* return whatever we gathered */ }
+  return map;
 }
 
 // Merge the learned sender signal into a message's subject candidates. A sender
@@ -3046,6 +3767,21 @@ function mergeSenderSignal(candidates, senderProjects) {
   return candidates;
 }
 
+// Load the learned sender→project map ONCE per session and cache it for the
+// synchronous chips (suggestProjects). Reuses the sweep's loader. onReady fires
+// only on the initial load so the chips can re-rank the moment the signal arrives;
+// after that every email reads _senderSignalCache synchronously. Refreshes on
+// taskpane reload (so a session's new filings show up next time the pane opens).
+function ensureSenderSignalCache(onReady) {
+  if (_senderSignalPromise) return _senderSignalPromise;
+  _senderSignalPromise = (async () => {
+    try { _senderSignalCache = await sweepLoadSenderMap(); }
+    catch { _senderSignalCache = new Map(); }
+  })();
+  if (typeof onReady === "function") _senderSignalPromise.then(onReady);
+  return _senderSignalPromise;
+}
+
 async function sweepRecentMail() {
   const btn = document.getElementById("sweepRunBtn");
   const statusEl = document.getElementById("sweepStatus");
@@ -3055,25 +3791,28 @@ async function sweepRecentMail() {
     return;
   }
   if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = "⏳ Scanning your Focused inbox…";
+  if (statusEl) statusEl.textContent = "⏳ Scanning " + sweepResolveMailbox().label + " (all folders)…";
   if (resultsEl) resultsEl.innerHTML = "";
   try {
-    const r = await sweepScan(); // shared scanner: newest-first, Focused-only, subject-matched
+    const r = await sweepResolveScan(true); // fresh batch; paginates to ~target actionable across all folders
     if (statusEl) {
       statusEl.textContent =
-        "Scanned " + r.scanned + " focused · would auto-file " + r.file.length +
-        " · review " + r.review.length + " · skip " + r.skip +
-        " · already filed " + r.alreadyFiled + "  — preview only, nothing saved.";
+        "Scanned " + _sweepTotals.scanned + " in " + _sweepSource.label +
+        " · would auto-file " + r.file.length + " · review " + r.review.length +
+        " · skip " + _sweepTotals.skip + " · already filed " + _sweepTotals.alreadyFiled +
+        (_sweepCursor ? " · more await Run & file" : " · end of mailbox") +
+        "  — preview only, nothing saved.";
     }
     const grp = (t) => '<div style="font-weight:600;margin:8px 0 4px;">' + t + "</div>";
     const meta = (t) => '<span style="color:#888;">' + t + "</span>";
+    const num = (t) => t ? ' <span style="color:#888;font-family:Consolas,monospace;font-size:11px;">' + sweepEsc(t) + "</span>" : "";
     const rowCss = 'style="padding:4px 0;border-top:1px solid #eee;font-size:12px;"';
     const lines = [];
     if (r.file.length) {
       lines.push(grp("✅ Would auto-file (" + r.file.length + ")"));
       for (const e of r.file) {
-        lines.push("<div " + rowCss + "><b>" + sweepEsc(e.project.projectNumber || e.project.name) +
-          "</b> — " + sweepEsc(e.subject) + "<br>" +
+        lines.push("<div " + rowCss + "><b>" + sweepEsc(e.project.name || e.project.projectNumber) +
+          "</b>" + num(e.project.name ? e.project.projectNumber : "") + " — " + sweepEsc(e.subject) + "<br>" +
           meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " · score " + e.score) + "</div>");
       }
     }
@@ -3081,16 +3820,22 @@ async function sweepRecentMail() {
       lines.push(grp("🟡 Needs review (" + r.review.length + ")"));
       for (const e of r.review) {
         const opts = (e.candidates || [])
-          .map((c) => sweepEsc(c.project.projectNumber || c.project.name) + " (" + c.score + ")").join(" · ");
+          .map((c) => sweepEsc(c.project.name || c.project.projectNumber) + " (" + c.score + ")").join(" · ");
         lines.push("<div " + rowCss + ">" + sweepEsc(e.subject) + "<br>" +
           meta(sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + " → " + opts) + "</div>");
       }
     }
-    if (resultsEl) resultsEl.innerHTML = lines.join("") || meta("No new emails matched a project.");
+    if (resultsEl) resultsEl.innerHTML = lines.join("") || meta("No new emails matched a project — try Load more or a different mailbox.");
   } catch (e) {
     if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
   } finally {
     if (btn) btn.disabled = false;
+    // Preview is stateless: it advanced the shared cursor without filing
+    // anything, so a leftover "Load more" would resume PAST the previewed
+    // pages and their unfiled matches would be silently skipped. Reset the
+    // cursor so the next Run & file starts from the top.
+    _sweepCursor = null;
+    updateSweepMoreBtn();
   }
 }
 
@@ -3140,38 +3885,173 @@ let _sweepReview = []; // ambiguous items awaiting confirm after a Run & file
 const sweepEsc = (s) => String(s == null ? "" : s)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// Fetch + classify recent mail into rich items carrying the Graph id +
-// conversationId needed to file later. Writes nothing.
-async function sweepScan() {
-  const token = await getToken();
-  // Newest first, then keep only Focused (Graph can't combine $filter + $orderby).
-  const path = "/me/messages?$top=" + SWEEP_FETCH_COUNT +
+// ── Mailbox source resolution ────────────────────────────────────────────────
+// Empty field (or your own address) → "/me"; a colleague's address → "/users/{addr}"
+// so the same scan code can target a departed PM's shared mailbox.
+function sweepResolveMailbox() {
+  // Restored 2026-06-24. Blank (or "me") → scan your own mailbox via /me.
+  // A colleague's address → scan THEIR mailbox via /users/{addr}; shared:true makes
+  // sweepResolveScan + sweepFileItems route a Mail.Read.Shared token (not /me's).
+  // Needed because the per-item "open their mailbox and file manually" path is
+  // blocked by Outlook's "add-in unavailable on shared items" rule.
+  const raw = (document.getElementById("sweepMailbox")?.value || "").trim();
+  if (!raw || raw.toLowerCase() === "me") {
+    return { base: "/me", shared: false, label: "your mailbox" };
+  }
+  return { base: "/users/" + encodeURIComponent(raw), shared: true, label: raw };
+}
+// Resolve the optional "only this project" box to a single project {id,label}, or
+// null for a whole-mailbox sweep. Exact project number wins; otherwise the first
+// number/name substring match. The resolved label is echoed in the scan status so
+// a wrong guess is obvious before much is filed.
+function sweepResolveProjectFilter() {
+  const raw = (document.getElementById("sweepProject")?.value || "").trim().toLowerCase();
+  if (!raw) return null;
+  const live = (allProjects || []).filter((p) => p && !p.archived && (p.name || p.projectNumber));
+  const exact = live.find((p) => (p.projectNumber || "").toLowerCase() === raw);
+  const hit = exact || live.find((p) =>
+    (p.projectNumber || "").toLowerCase().includes(raw) || (p.name || "").toLowerCase().includes(raw));
+  return hit ? { id: hit.id, label: ((hit.projectNumber ? hit.projectNumber + " " : "") + (hit.name || "")).trim() } : null;
+}
+// Module-level scan source + cursor, shared across Preview / Run & file / Load more.
+// _sweepSource carries the messages-collection base ("/me" or "/users/{addr}") and
+// the token (a Mail.Read.Shared token for a colleague's mailbox); _sweepCursor is
+// the @odata.nextLink for the next batch (null = start fresh or mailbox exhausted).
+let _sweepSource = { base: "/me", token: null, label: "your mailbox", shared: false };
+let _sweepCursor = null;
+let _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+// Project-scope filter for the current run: {id,label} when the user typed a job in
+// the sweep's "only this project" box, else null (whole-mailbox sweep). Resolved on
+// reset, read by sweepScanBatch to file/queue ONLY that job and skip the rest.
+let _sweepProjectFilter = null;
+// Conversation-level dedup for the current run: convId -> projectId (the thread is
+// tied to a job) or "review" (already queued once this run). Reset each fresh run
+// so a thread is surfaced/auto-filed ONCE, not per-message. Persists across
+// Load-more batches so a long thread doesn't re-appear page after page.
+let _sweepConvoSeen = new Map();
+// Auto-run ("Run to end") state: _sweepAutoRunning guards against a double start;
+// _sweepAutoStop is set by the Stop button and checked between pages and batches.
+let _sweepAutoRunning = false;
+let _sweepAutoStop = false;
+// "Run to end" defers its inline project.emails[] writes into this queue (pid -> slim
+// recs) and flushes ONCE per project when the run ends/stops. A per-batch save rewrote
+// each growing project blob and re-fired the slim-email guard trigger over the whole
+// array → row-lock pile-up that wedged the DB on big backfills (2026-06-24). null =
+// sync inline immediately (single Run & file / review-confirm — one batch, no churn).
+let _sweepInlineQueue = null;
+// Dedup datasets (filed msg_ids, thread→project map, sender signal), loaded ONCE
+// per run instead of at the start of every batch. The per-batch reload was both
+// slow (each set is N/1000 sequential paged requests — hundreds of round trips
+// on a deep Run-to-end) and racy (the sweep's own inserts shift page boundaries
+// mid-run). sweepFileItems keeps the in-memory sets current as it files.
+let _sweepDedup = null;
+
+// Resolve mailbox + token + cursor, then scan one batch. reset=true starts a new
+// run from the chosen mailbox; reset=false continues the saved cursor (Load more).
+async function sweepResolveScan(reset) {
+  if (reset) {
+    const mb = sweepResolveMailbox();
+    _sweepSource = { base: mb.base, label: mb.label, shared: mb.shared, token: null };
+    _sweepCursor = null;
+    _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+    _sweepConvoSeen = new Map();
+    _sweepProjectFilter = sweepResolveProjectFilter(); // null = whole mailbox; else {id,label}
+    _sweepDedup = null; // fresh run → fresh dedup snapshot
+  }
+  if (!_sweepDedup) {
+    const [filed, senderMap, convoMap] = await Promise.all([
+      sweepLoadFiledIds(), sweepLoadSenderMap(), sweepLoadConvoProjectMap(),
+    ]);
+    _sweepDedup = { filed, senderMap, convoMap };
+  }
+  // Refresh the token at the start of EVERY batch (incl. Load more) so a long
+  // backfill never carries a stale token into graphFetch's 401 path — which would
+  // otherwise retry a shared-mailbox call with the wrong (own-mailbox) token.
+  _sweepSource.token = _sweepSource.shared ? await getSharedMailToken() : await getToken();
+  const batch = await sweepScanBatch({ base: _sweepSource.base, token: _sweepSource.token, cursor: _sweepCursor });
+  _sweepCursor = batch.nextLink; // null once the mailbox is fully walked
+  _sweepTotals.scanned += batch.scanned;
+  _sweepTotals.skip += batch.skip;
+  _sweepTotals.alreadyFiled += batch.alreadyFiled;
+  return batch;
+}
+// Fetch + classify mail into rich items carrying the Graph id + conversationId
+// needed to file later. Writes nothing. Paginates within the batch — following
+// @odata.nextLink verbatim, per Graph's paging rules — until enough actionable
+// items surface (so skipped / already-filed messages no longer cap the run), the
+// mailbox is exhausted, or the per-batch page cap is hit. Scans ALL folders
+// (incl. Sent): no Focused filter, since a backfill wants the whole mailbox.
+async function sweepScanBatch({ base, token, cursor }) {
+  // Run-scoped dedup snapshot — loaded once in sweepResolveScan, kept current
+  // by sweepFileItems as emails file. (Was reloaded here every batch.)
+  const { filed, senderMap, convoMap } = _sweepDedup || { filed: new Set(), senderMap: new Map(), convoMap: new Map() };
+  const filterId = _sweepProjectFilter?.id || null; // scoped run → only file/queue this one job
+  const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0, nextLink: null };
+  // First page builds the query; later pages follow the (base-stripped) nextLink.
+  let path = cursor || (base + "/messages?$top=" + SWEEP_PAGE_SIZE +
     "&$select=id,internetMessageId,inferenceClassification,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,hasAttachments" +
-    "&$orderby=receivedDateTime%20desc";
-  const data = await graphFetch("GET", path, null, token);
-  const messages = data?.value || [];
-  const filed = await sweepLoadFiledIds();
-  const senderMap = await sweepLoadSenderMap();
-  const out = { scanned: 0, file: [], review: [], skip: 0, alreadyFiled: 0 };
-  for (const m of messages) {
-    if (m.inferenceClassification && m.inferenceClassification !== "focused") continue; // Focused only
-    out.scanned++;
-    const sender = m.from?.emailAddress?.address || "";
-    if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
-    const mid = m.internetMessageId || "";
-    if (mid && filed.has(mid)) { out.alreadyFiled++; continue; }
-    const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())));
-    if (verdict.action === "skip") { out.skip++; continue; }
-    const item = {
-      gid: m.id, convId: m.conversationId || "", msgId: mid,
-      subject: m.subject || "(no subject)",
-      from: m.from?.emailAddress?.name || sender, fromAddress: sender,
-      to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
-      cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
-      date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
-    };
-    if (verdict.action === "file") out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
-    else out.review.push({ ...item, candidates: verdict.candidates });
+    "&$orderby=receivedDateTime%20desc");
+  for (let page = 0; page < SWEEP_MAX_PAGES_PER_BATCH; page++) {
+    const data = await graphFetch("GET", path, null, token);
+    for (const m of (data?.value || [])) {
+      out.scanned++;
+      const sender = m.from?.emailAddress?.address || "";
+      if (looksPromotional(sender)) { out.skip++; continue; } // newsletters / marketing
+      const mid = m.internetMessageId || "";
+      // No internetMessageId = a draft (the sweep walks ALL folders). These
+      // could never be filed properly: saveProjectEmailRow no-ops without a
+      // msgId, yet the item was still counted "filed" and re-appended a slim
+      // inline rec to the project row on EVERY run (unbounded drift). Skip.
+      if (!mid) { out.skip++; continue; }
+      if (filed.has(mid)) { out.alreadyFiled++; continue; }
+      const item = {
+        gid: m.id, convId: m.conversationId || "", msgId: mid,
+        subject: m.subject || "(no subject)",
+        from: m.from?.emailAddress?.name || sender, fromAddress: sender,
+        to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+        cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean).join(", "),
+        date: m.receivedDateTime || "", hasAttachments: !!m.hasAttachments,
+      };
+      // Conversation-level dedup — one decision per thread, not per message. If the
+      // thread is already tied to a job (filed in a past run, or auto-filed earlier
+      // this run), file the rest of it there instead of surfacing each message. If
+      // it's already queued for review this run, skip the extras so it doesn't pop
+      // up over and over.
+      if (item.convId) {
+        const seen = _sweepConvoSeen.get(item.convId);
+        const tiedProj = convoMap.get(item.convId) || (seen && seen !== "review" ? seen : null);
+        if (tiedProj) {
+          if (filterId && tiedProj !== filterId) { out.skip++; continue; } // scoped run: another job's thread
+          const proj = (allProjects || []).find((p) => p && p.id === tiedProj);
+          if (proj) {
+            _sweepConvoSeen.set(item.convId, tiedProj);
+            out.file.push({ ...item, project: proj, score: 99, reasons: ["same thread already filed to this job"] });
+            continue;
+          }
+        }
+        if (seen === "review") { out.alreadyFiled++; continue; } // thread already queued once this run
+      }
+      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())), filterId);
+      if (verdict.action === "skip") { out.skip++; continue; }
+      if (verdict.action === "file") {
+        if (item.convId) _sweepConvoSeen.set(item.convId, verdict.project.id);
+        out.file.push({ ...item, project: verdict.project, score: verdict.score, reasons: verdict.reasons });
+      } else {
+        if (item.convId) _sweepConvoSeen.set(item.convId, "review");
+        out.review.push({ ...item, candidates: verdict.candidates });
+      }
+    }
+    // Live progress so a deep scan doesn't look frozen — refreshes once per page (~250 msgs).
+    const _se = document.getElementById("sweepStatus");
+    const _scope = _sweepProjectFilter ? " · only " + _sweepProjectFilter.label : "";
+    if (_se) _se.textContent = "⏳ Reading mailbox" + _scope + "… " + out.scanned + " scanned · " +
+      out.file.length + " to file · " + out.review.length + " to review…";
+    const next = data?.["@odata.nextLink"] || null;
+    out.nextLink = next ? next.replace("https://graph.microsoft.com/v1.0", "") : null;
+    if (!out.nextLink) break;                                                  // mailbox fully walked
+    if (_sweepAutoStop) break;                                                 // user hit Stop — cursor preserved so they can resume
+    if (out.file.length + out.review.length >= SWEEP_TARGET_ACTIONABLE) break; // enough to act on this batch
+    path = out.nextLink;
   }
   return out;
 }
@@ -3192,17 +4072,44 @@ function stripHtmlToText(html) {
 
 // File sweep items to item.projectId: writes the search-index row (with stripped
 // body_text) and dual-writes project.emails[] grouped per project. {filed, failed}.
-async function sweepFileItems(items) {
+async function sweepFileItems(items, opts = {}) {
   if (!items.length) return { filed: 0, failed: 0 };
-  const token = await getToken();
+  // Read bodies from whatever mailbox each item was SCANNED from (it._src,
+  // snapshotted by sweepRunAndFile) — not whatever the mailbox box says now.
+  // Review items can be confirmed long after the run, after the user has
+  // changed the box; filing them against the current source 404'd the body
+  // fetch and silently saved empty-body records. Tokens are acquired lazily
+  // per scope (own vs shared) and cached for the call.
+  let _ownTok = null, _sharedTok = null;
+  const tokenFor = async (shared) => shared
+    ? (_sharedTok || (_sharedTok = await getSharedMailToken()))
+    : (_ownTok || (_ownTok = await getToken()));
   const byProject = new Map();
   let filed = 0, failed = 0;
+  let done = 0;
   for (const it of items) {
+    // Honor Stop mid-filing (opts.honorStop — set by the run flows, NOT by
+    // review-confirm, where a stale flag from a previously stopped run would
+    // abort a single-item file). Unfiled remainder is safe: dedup lets the
+    // next full run pick these emails up again.
+    if (opts.honorStop && _sweepAutoStop) break;
+    done++;
+    const _fe = document.getElementById("sweepStatus");
+    if (_fe) _fe.textContent = "⏳ Filing email " + done + " of " + items.length + "… (" + filed + " saved)";
     try {
+      const src = it._src || _sweepSource || { base: "/me", shared: false };
+      const base = src.base || "/me";
+      const token = await tokenFor(!!src.shared);
       let bodyHtml = "";
       try {
-        const d = await graphFetch("GET", "/me/messages/" + it.gid + "?$select=body", null, token);
+        const d = await graphFetch("GET", base + "/messages/" + it.gid + "?$select=body", null, token);
         bodyHtml = d?.body?.content || "";
+        // Restore inline photos: resolve cid: refs to data: URIs so they render
+        // in the PMS email log (the single-email path did this; bulk filing did not).
+        if (bodyHtml && /src\s*=\s*["']cid:/i.test(bodyHtml)) {
+          const imgs = await getInlineImagesForMessageId(base, it.gid, token);
+          bodyHtml = await embedInlineImagesFromMap(bodyHtml, imgs);
+        }
       } catch (_) { /* body fetch is best-effort */ }
       const rec = {
         id: uid(), msgId: it.msgId,
@@ -3218,85 +4125,297 @@ async function sweepFileItems(items) {
       };
       await saveProjectEmailRow(it.projectId, rec, false, it.convId || null);
       if (!byProject.has(it.projectId)) byProject.set(it.projectId, []);
-      byProject.get(it.projectId).push(rec);
+      // Inline copy is slim — bodies live in pms_project_emails (and the guard trigger
+      // strips them anyway), so omit them here to keep the deferred queue + each
+      // project-row write small.
+      const slim = { ...rec }; delete slim.bodyHtmlCompressed; delete slim.bodyText;
+      byProject.get(it.projectId).push(slim);
       filed++;
+      // Keep the run-scoped dedup snapshot current (it's no longer reloaded per
+      // batch): mark the msg filed, and keep the thread map honest — filing the
+      // same thread to a SECOND project makes it ambiguous, so drop it.
+      if (_sweepDedup) {
+        if (it.msgId) _sweepDedup.filed.add(it.msgId);
+        if (it.convId) {
+          const existing = _sweepDedup.convoMap.get(it.convId);
+          if (existing && existing !== it.projectId) _sweepDedup.convoMap.delete(it.convId);
+          else _sweepDedup.convoMap.set(it.convId, it.projectId);
+        }
+      }
     } catch (e) {
       console.warn("sweep file failed:", e);
       failed++;
     }
   }
-  // Keep project.emails[] in sync — one save per project (avoids version churn).
-  for (const [pid, recs] of byProject) {
-    try {
-      await applyLocalChangeAndSave(pid, (fresh) => ({ ...fresh, emails: [...(fresh.emails || []), ...recs] }));
-    } catch (e) {
-      console.warn("sweep dual-write to project.emails failed for", pid, e);
+  // Keep project.emails[] in sync. During "Run to end" these writes are DEFERRED into
+  // _sweepInlineQueue and flushed ONCE per project when the run ends (see the queue's
+  // declaration) — a per-batch save here rewrote each growing project blob and re-fired
+  // the slim-email guard trigger over the whole array, wedging the DB on big backfills.
+  // Single "Run & file" / review-confirm (queue null) still sync immediately — one batch.
+  if (_sweepInlineQueue) {
+    for (const [pid, recs] of byProject) {
+      const q = _sweepInlineQueue.get(pid) || [];
+      for (const r of recs) q.push(r);
+      _sweepInlineQueue.set(pid, q);
     }
+  } else {
+    await flushSweepInlineForProjects(byProject);
   }
   return { filed, failed };
 }
 
-// RUN & FILE — auto-file the confident bucket, queue the ambiguous ones.
-async function sweepRunAndFile() {
-  const btn = document.getElementById("sweepFileBtn");
-  const statusEl = document.getElementById("sweepStatus");
-  if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return; }
-  if (btn) btn.disabled = true;
-  if (statusEl) statusEl.textContent = "⏳ Scanning and filing confident matches…";
-  try {
-    const r = await sweepScan();
-    for (const it of r.file) it.projectId = it.project.id;
-    const { filed, failed } = await sweepFileItems(r.file);
-    _sweepReview = r.review;
-    if (statusEl) statusEl.textContent =
-      "✓ Filed " + filed + (failed ? (" · " + failed + " failed") : "") +
-      " · " + _sweepReview.length + " to review · skipped " + r.skip + " · already filed " + r.alreadyFiled;
-    renderSweepReviewQueue();
-  } catch (e) {
-    if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
-  } finally {
-    if (btn) btn.disabled = false;
+// Apply the per-project inline project.emails[] sync (dedup vs FRESH, one save per
+// project). Used for both immediate saves (single batch) and the deferred end-of-run
+// flush. Retries once on a save conflict; an unrecoverable failure is logged, not
+// thrown — the email is already safe in pms_project_emails, only the slim inline
+// mirror is skipped (it self-heals on the next save to that project).
+async function flushSweepInlineForProjects(byProject) {
+  for (const [pid, recs] of byProject) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await applyLocalChangeAndSave(pid, (fresh) => {
+          // Dedup against FRESH data, mirroring the DB's (project_id, msg_id) uniqueness,
+          // so the JSON array can't drift even though the table now can't.
+          const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
+          const add = recs.filter(r => !r.msgId || !have.has(r.msgId));
+          return add.length ? { ...fresh, emails: [...(fresh.emails || []), ...add] } : fresh;
+        });
+        break;
+      } catch (e) {
+        if (attempt === 0) continue; // transient conflict — applyLocalChangeAndSave re-fetches, retry once
+        console.warn("sweep inline sync failed for", pid, e);
+      }
+    }
   }
 }
 
-// Review queue — each ambiguous email gets a button per candidate project + Skip.
+// RUN & FILE — auto-file the confident bucket, queue the ambiguous ones.
+async function sweepRunAndFile(reset = true) {
+  const btn = document.getElementById("sweepFileBtn");
+  const moreBtn = document.getElementById("sweepMoreBtn");
+  const statusEl = document.getElementById("sweepStatus");
+  if (!allProjects || !allProjects.length) { if (statusEl) statusEl.textContent = "Projects still loading…"; return { ok: false }; }
+  // Standalone "Run & file" (not inside a Run-to-end): show Stop so a long scan can be
+  // halted — the scan loop already checks _sweepAutoStop between pages.
+  const standalone = !_sweepAutoRunning;
+  if (standalone) { _sweepAutoStop = false; _setSweepAutoUI(true); }
+  if (btn) btn.disabled = true;
+  if (moreBtn) moreBtn.disabled = true;
+  if (statusEl) statusEl.textContent = reset ? "⏳ Scanning and filing confident matches…" : "⏳ Loading the next batch…";
+  try {
+    if (reset) _sweepReview = [];
+    const r = await sweepResolveScan(reset);
+    // Snapshot the scan source onto every item — review items can be confirmed
+    // after the mailbox box changes, and must file from where they were found.
+    const src = { base: _sweepSource.base, shared: _sweepSource.shared };
+    for (const it of r.file)   { it.projectId = it.project.id; it._src = src; }
+    for (const it of r.review) { it._src = src; }
+    const { filed, failed } = await sweepFileItems(r.file, { honorStop: true });
+    _sweepTotals.filed += filed;
+    _sweepReview.push(...r.review);
+    const pending = _sweepReview.filter((e) => !e._done && !(e._filedTo && e._filedTo.length)).length;
+    if (statusEl) statusEl.textContent =
+      "✓ Filed " + _sweepTotals.filed + (failed ? (" · " + failed + " failed this batch") : "") +
+      " · " + pending + " to review · scanned " + _sweepTotals.scanned +
+      " · skipped " + _sweepTotals.skip + " · already filed " + _sweepTotals.alreadyFiled +
+      " · [" + _sweepSource.label + "]" + (_sweepCursor ? " · more available" : " · end of mailbox");
+    renderSweepReviewQueue();
+    return { ok: true };
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "✗ " + humanizeError(e);
+    return { ok: false };
+  } finally {
+    if (btn) btn.disabled = false;
+    if (standalone) _setSweepAutoUI(false);
+    updateSweepMoreBtn();
+  }
+}
+// Show the Load-more button only while the chosen mailbox still has pages left.
+function updateSweepMoreBtn() {
+  const moreBtn = document.getElementById("sweepMoreBtn");
+  if (!moreBtn) return;
+  moreBtn.style.display = _sweepCursor ? "" : "none";
+  moreBtn.disabled = false;
+}
+
+// Swap the run/more buttons for a Stop button while an auto-run is going.
+function _setSweepAutoUI(running) {
+  for (const id of ["sweepFileBtn", "sweepRunAllBtn", "sweepMoreBtn", "sweepClearBtn"]) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = running ? "none" : "";
+  }
+  const stop = document.getElementById("sweepStopBtn");
+  if (stop) stop.style.display = running ? "" : "none";
+}
+
+// Clear the on-screen sweep results + review list and reset the batch cursor, WITHOUT
+// touching the mailbox/project boxes or anything already filed (those are safe in
+// pms_project_emails). Replaces "close and reopen the pane for a fresh slate".
+function sweepClearResults() {
+  if (_sweepAutoRunning) return; // never yank state out from under a live run
+  _sweepReview = [];
+  _sweepCursor = null;
+  _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
+  _sweepConvoSeen = new Map();
+  _sweepDedup = null; // next run reloads a fresh dedup snapshot
+  const results = document.getElementById("sweepResults");
+  if (results) results.innerHTML = "";
+  const status = document.getElementById("sweepStatus");
+  if (status) status.textContent = "";
+  updateSweepMoreBtn();
+}
+
+// "Run to end" — keep filing batches until the mailbox is exhausted or the user
+// hits Stop. sweepRunAndFile already shows per-page/per-email progress and the
+// cumulative totals after each batch, so the numbers climb as it goes. We reassert
+// the auto UI after each batch because sweepRunAndFile re-enables the normal
+// buttons in its own finally block.
+async function sweepAutoRunToEnd() {
+  if (_sweepAutoRunning) return;
+  _sweepAutoRunning = true;
+  _sweepAutoStop = false;
+  _sweepInlineQueue = new Map(); // defer inline project.emails[] writes; flush once at run end
+  _setSweepAutoUI(true);
+  try {
+    let res = await sweepRunAndFile(true);   // first batch — fresh scan from the top
+    _setSweepAutoUI(true);
+    while (res?.ok && _sweepCursor && !_sweepAutoStop) {
+      res = await sweepRunAndFile(false);    // next batch, continuing the cursor
+      _setSweepAutoUI(true);
+    }
+    const s = document.getElementById("sweepStatus");
+    if (res && res.ok === false) {
+      // A batch errored (e.g. network hiccup) — sweepRunAndFile already painted the
+      // "✗ …". Don't tack on a false "reached the end"; the cursor is preserved, so
+      // clicking Run to end again resumes from here.
+      if (s && /^✗/.test(s.textContent)) s.textContent += "  ·  ⏹ stopped — click “Run to end” again to resume.";
+    } else if (s) {
+      s.textContent += _sweepAutoStop ? "  ·  ⏹ stopped" : "  ·  ✅ reached the end of the mailbox";
+    }
+  } catch (e) {
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent = "✗ " + humanizeError(e);
+  } finally {
+    // Flush the deferred inline writes BEFORE releasing the run lock — ONE save per
+    // project for the whole run instead of one per batch (the backfill-wedge fix).
+    // Runs on normal end, Stop, or error; bodies are already safe in pms_project_emails.
+    const queue = _sweepInlineQueue; _sweepInlineQueue = null;
+    if (queue && queue.size) {
+      const s = document.getElementById("sweepStatus");
+      const base = s ? s.textContent : "";
+      if (s) s.textContent = base + "  ·  💾 syncing " + queue.size + " project record(s)…";
+      try { await flushSweepInlineForProjects(queue); } catch (e) { console.warn("inline flush failed", e); }
+      if (s) s.textContent = base;
+    }
+    _sweepAutoRunning = false;
+    _setSweepAutoUI(false);
+    updateSweepMoreBtn();
+  }
+}
+
+// Review queue — each ambiguous email gets a button per candidate project. Filing
+// to one does NOT close the row: an email can belong to two jobs, so once filed it
+// collapses to a ✓ confirmation with "＋ also file to another job", which re-opens
+// the candidates to copy the SAME email into a second project. One file resolves
+// the item (drops it from the "left" count); Skip dismisses an unmatched one.
 function renderSweepReviewQueue() {
   const resultsEl = document.getElementById("sweepResults");
   if (!resultsEl) return;
-  const pending = _sweepReview.filter((e) => !e._done);
-  if (!pending.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
+  const isFiled = (e) => !!(e._filedTo && e._filedTo.length);
+  const needsAttention = (e) => !e._done && !isFiled(e);
+  const visible = _sweepReview.filter((e) => e._done !== "skip"); // hide skipped; keep ✓ confirmations
+  if (!visible.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
   const bcss = 'style="margin:2px 4px 2px 0;padding:2px 8px;font-size:12px;cursor:pointer;"';
-  const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + pending.length + ' left)</div>'];
+  const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + _sweepReview.filter(needsAttention).length + ' left)</div>'];
   _sweepReview.forEach((e, i) => {
-    if (e._done) return;
-    const cands = (e.candidates || []).map((c, ci) =>
-      '<button type="button" data-sw="file" data-i="' + i + '" data-ci="' + ci + '" ' + bcss + ">" +
-      sweepEsc(c.project.projectNumber || c.project.name) + "</button>").join("");
-    rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' +
-      sweepEsc(e.subject) + '<br><span style="color:#888;">' + sweepEsc(e.from) + " · " +
-      sweepEsc((e.date || "").slice(0, 10)) + "</span><br>File to: " + cands +
-      '<button type="button" data-sw="skip" data-i="' + i + '" ' + bcss + ">Skip</button></div>");
+    if (e._done === "skip") return;
+    const subjLine = sweepEsc(e.subject) + '<br><span style="color:#888;">' +
+      sweepEsc(e.from) + " · " + sweepEsc((e.date || "").slice(0, 10)) + "</span>";
+    if (e._done === "filing") {
+      rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' + subjLine +
+        '<br><span style="color:#888;">⏳ filing…</span></div>');
+      return;
+    }
+    const filed = e._filedTo || [];
+    const filedNames = filed.map((f) => f.name).join(", ");
+    const filedIds = new Set(filed.map((f) => f.id));
+    const moreToFile = filed.length < (e.candidates || []).length;
+    // Filed and not re-expanded → compact ✓ confirmation + opt-in to copy elsewhere.
+    if (filed.length && !e._expand) {
+      rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;opacity:0.9;">' + subjLine +
+        '<br><span style="color:#107c10;">✓ Filed to ' + sweepEsc(filedNames) + "</span>" +
+        (moreToFile ? ' <button type="button" data-sw="expand" data-i="' + i + '" ' + bcss + ">＋ also file to another job</button>" : "") +
+        "</div>");
+      return;
+    }
+    // Buttons lead with the project NAME — people recognize "CHCR Grove and New
+    // Dorp", not "SAPX226014.00". The number rides along as a muted subtitle so
+    // same-named candidates (e.g. two phases of one job) stay distinguishable.
+    // A project already filed shows as a disabled green ✓ chip.
+    const cands = (e.candidates || []).map((c, ci) => {
+      const name = (c.project.name || "").trim();
+      const num  = (c.project.projectNumber || "").trim();
+      const primary  = name || num;                 // always show something
+      const subtitle = (name && num) ? num : "";    // number as a subtitle, never the sole label
+      const already  = filedIds.has(c.project.id);
+      const style = "margin:2px 4px 2px 0;padding:3px 8px;font-size:12px;text-align:left;line-height:1.25;vertical-align:top;" +
+        (already ? "cursor:default;background:#dff6dd;border:1px solid #9fd89f;color:#0b5a0b;" : "cursor:pointer;");
+      const opener = already
+        ? '<button type="button" disabled style="' + style + '">'
+        : '<button type="button" data-sw="file" data-i="' + i + '" data-ci="' + ci + '" style="' + style + '">';
+      return opener +
+        '<span style="font-weight:600;">' + (already ? "✓ " : "") + sweepEsc(primary) + "</span>" +
+        (subtitle ? '<br><span style="color:#888;font-size:11px;font-family:Consolas,monospace;">' + sweepEsc(subtitle) + "</span>" : "") +
+        "</button>";
+    }).join("");
+    const lead = filed.length
+      ? '<span style="color:#107c10;">✓ Filed to ' + sweepEsc(filedNames) + "</span> · also file to:"
+      : "File to:";
+    const tail = filed.length
+      ? '<button type="button" data-sw="done" data-i="' + i + '" ' + bcss + ">✓ Done</button>"
+      : '<button type="button" data-sw="skip" data-i="' + i + '" ' + bcss + ">Skip</button>";
+    rows.push('<div style="padding:6px 0;border-top:1px solid #eee;font-size:12px;">' + subjLine +
+      "<br>" + lead + " " + cands + tail + "</div>");
   });
   resultsEl.innerHTML = rows.join("");
   resultsEl.querySelectorAll("button[data-sw]").forEach((b) => {
     b.onclick = () => {
-      const i = +b.dataset.i;
-      if (b.dataset.sw === "skip") { if (_sweepReview[i]) _sweepReview[i]._done = "skip"; renderSweepReviewQueue(); return; }
-      void sweepConfirmReview(i, +b.dataset.ci);
+      const i = +b.dataset.i; const e = _sweepReview[i]; if (!e) return;
+      switch (b.dataset.sw) {
+        case "skip":   e._done = "skip";  renderSweepReviewQueue(); break;
+        case "done":   e._expand = false; renderSweepReviewQueue(); break;  // collapse to the ✓ confirmation
+        case "expand": e._expand = true;  renderSweepReviewQueue(); break;  // re-open candidates to copy elsewhere
+        case "file":   void sweepConfirmReview(i, +b.dataset.ci); break;
+      }
     };
   });
 }
 
 async function sweepConfirmReview(i, ci) {
   const e = _sweepReview[i];
-  if (!e || e._done) return;
+  if (!e || e._done === "skip" || e._done === "filing") return;
   const proj = e.candidates?.[ci]?.project;
   if (!proj) return;
+  e._filedTo = e._filedTo || [];
+  if (e._filedTo.some((f) => f.id === proj.id)) return; // don't double-file the same job
   e._done = "filing";
   renderSweepReviewQueue();
-  const { filed } = await sweepFileItems([{ ...e, projectId: proj.id }]);
-  e._done = filed ? "filed" : null;
-  if (!filed) { const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again."; }
+  // try/catch so a thrown error (e.g. token acquisition popup blocked) can't
+  // leave the row stuck on "⏳ filing…" forever — the _done guard above would
+  // then block every retry click until the pane reloads.
+  let filed = 0;
+  try {
+    ({ filed } = await sweepFileItems([{ ...e, projectId: proj.id }]));
+  } catch (err) {
+    console.warn("review confirm failed:", err);
+  }
+  e._done = null;
+  if (filed) {
+    e._filedTo.push({ id: proj.id, name: (proj.name || proj.projectNumber || "project") });
+    e._expand = false; // collapse to the ✓ confirmation; "＋ also file" re-expands to copy to another job
+  } else {
+    const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again.";
+  }
   renderSweepReviewQueue();
 }
 
@@ -3306,6 +4425,11 @@ function renderProjectSuggestions() {
   const labelText = document.getElementById("suggestionLabelText");
   if (!block || !chips) return;
   if (selectedProject) { block.style.display = "none"; chips.innerHTML = ""; return; }
+
+  // First email of the session: load the learned sender signal, then re-rank the
+  // chips once it lands (a known sender can surface a job with no subject match).
+  // No-op on later calls — the cache is warm and read synchronously by suggestProjects.
+  ensureSenderSignalCache(renderProjectSuggestions);
 
   const subject = (typeof emailItem?.subject === "string") ? emailItem.subject : "";
   const results = suggestProjects(subject, emailFromAddress);
@@ -3373,6 +4497,45 @@ const RESPONSE_EXCLUSIONS = [
   "no action needed", "for your records", "just an fyi", "no need to reply",
 ];
 
+// ── Noise gates (Sara 7/17: newsletters, thanks-notes and cc-only mail were
+// drowning the panel — 905 of 1,500 lifetime flags were hand-dismissed). ──
+
+// A chunk containing one of these is NEVER stripped as courtesy, so
+// "Thanks! Can you resend the calcs?" keeps its ask.
+const RESPONSE_HARD_ASK_RE =
+  /\b(can|could|would|will) (you|we)\b|\bplease (send|provide|confirm|advise|review|forward|share|sign|approve|update|complete|return)\b/;
+
+// Courtesy/closure boilerplate — gratitude, sign-offs, and the conditional
+// closers clients mirror back at us ("let me know if you have any
+// questions"). Chunks matching these carry no ask; the dismissal data showed
+// "request phrase" firing 2:1 noise almost entirely from this family.
+const RESPONSE_COURTESY_RES = [
+  /\bthank(s| you)\b/, /\bappreciate\b/,
+  /\b(let (me|us) know|reach out|contact (me|us)|give (me|us) a call)\b.*\bif\b/,
+  /\bif you (have|need)\b.*\b(question|concern|anything|assistance|help|issue)/,
+  /\bshould you (have|need)\b/, /\bdon'?t hesitate\b/, /\bfeel free\b/,
+  /\bhappy to (help|assist|discuss|answer)\b/,
+  /\bhave a (great|good|nice|wonderful)\b/, /\bhope (you|this|all|everyone)\b/,
+  /\bany questions\??$/,
+];
+
+// Bulk/automated senders — the client gate matches by shared DOMAIN, so a
+// client org's blast address passes it; the local part is the tell.
+const NEWSLETTER_SENDER_RE =
+  /^(no-?reply|do-?not-?reply|newsletters?|notifications?|news|updates?|marketing|mailer|bounce|listserv|campaigns?|broadcast|bulletins?|outbox|alerts?|digest)@/;
+
+// System-generated subjects: out-of-office, bounces, read receipts.
+const AUTOMATED_SUBJECT_RE =
+  /^\s*(automatic reply|auto-?reply|out of office|undeliverable|delivery has failed|read:|recall:)/;
+
+// Newsletter/automation footers in the current message's own text.
+const NEWSLETTER_BODY_MARKERS = [
+  "unsubscribe", "view this email in your browser", "view in browser",
+  "email preferences", "manage preferences", "manage your subscription",
+  "you are receiving this email", "do not reply to this",
+  "this is an automated", "automatically generated",
+];
+
 // Strip URLs so a "?utm=…" query string doesn't read as a question.
 function stripUrlsForScan(s) {
   return (s || "").replace(/https?:\/\/\S+/gi, " ");
@@ -3394,24 +4557,37 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
   // amplify a genuine ask — never originate a flag on their own.
   let contentSignal = false;
 
-  if (subj.includes("?")) {
+  // Chunk the body at sentence boundaries — KEEPING each terminator, so a "?"
+  // stays attached to its own sentence — then drop courtesy/closure chunks
+  // ("thanks so much", "let me know if you have any questions", "feel free to
+  // reach out") unless the chunk also carries a hard ask. Every content
+  // signal below scans only what's left, so a thank-you note wrapped in
+  // polite boilerplate can no longer flag, while "Thanks! Can you resend the
+  // calcs?" still does.
+  const chunks = (body.match(/[^.!?\n]+[.!?]?/g) || []).map(s => s.trim()).filter(Boolean);
+  const sentences = chunks.filter(s =>
+    RESPONSE_HARD_ASK_RE.test(s) || !RESPONSE_COURTESY_RES.some(re => re.test(s)));
+  const scanText = sentences.join(" ");
+
+  // Subject "?" only counts on an ORIGINAL subject — on a Re:/Fwd: every
+  // message in the thread inherits the "?", including the client's "thanks!".
+  if (subj.includes("?") && !/^\s*(re|fw|fwd)\s*:/.test(subj)) {
     score += RESPONSE_WEIGHTS.questionMarkInSubject;
     reasons.push("question in subject");
     contentSignal = true;
   }
-  if (body.includes("?")) {
+  if (scanText.includes("?")) {
     score += RESPONSE_WEIGHTS.questionMarkInBody;
     reasons.push("question in body");
     contentSignal = true;
   }
-  // Interrogative openers — split into sentences, check start-of-sentence only.
-  const sentences = body.split(/[.!?\n]+/).map(s => s.trim()).filter(Boolean);
+  // Interrogative openers — start-of-sentence only.
   if (sentences.some(s => RESPONSE_INTERROGATIVES.some(q => s.startsWith(q)))) {
     score += RESPONSE_WEIGHTS.interrogativeOpener;
     reasons.push("direct question");
     contentSignal = true;
   }
-  if (RESPONSE_POLITE_PHRASES.some(p => body.includes(p) || subj.includes(p))) {
+  if (RESPONSE_POLITE_PHRASES.some(p => scanText.includes(p) || subj.includes(p))) {
     score += RESPONSE_WEIGHTS.politeRequest;
     reasons.push("request phrase");
     contentSignal = true;
@@ -3423,7 +4599,7 @@ function needsResponse(subject, bodyText, emailReceivedDate, opts = {}) {
     reasons.push("mentions a date");
     contentSignal = true;
   }
-  if (RESPONSE_URGENCY_WORDS.some(w => body.includes(w) || subj.includes(w))) {
+  if (RESPONSE_URGENCY_WORDS.some(w => scanText.includes(w) || subj.includes(w))) {
     score += RESPONSE_WEIGHTS.urgencyWord;
     reasons.push("urgency");
     contentSignal = true;
@@ -3618,6 +4794,16 @@ async function isThreadAwaitingReply(conversationId) {
 // Classify-on-open hook. Runs when a client email is viewed: scores it, and if
 // it looks like it needs a reply, adds it to the watchlist. Best-effort and
 // silent — any failure here must never block the rest of the taskpane.
+// True when the open email is an RFI/submittal notification or is already logged as
+// one — keeps that mail off the response watchlist (it's tracked elsewhere).
+function isRfiOrSubmittalEmail() {
+  const from = (emailFromAddress || "").toLowerCase();
+  if (/procoretech\.com|forma\.autodesk|@kahua\.|e-?builder\.net|newforma/.test(from)) return true;
+  const subj = (typeof emailItem?.subject === "string" ? emailItem.subject : "").toLowerCase();
+  if (/\brfi\b|\bsubmittal\b|\btransmittal\b|\bsub[\s#-]*\d/.test(subj)) return true;
+  try { if (selectedProject && getLoggedRfiSubArtifacts(selectedProject).length > 0) return true; } catch (e) {}
+  return false;
+}
 async function maybeAddToWatchlist(myGen) {
   try {
     if (currentItemKind !== "message" || !emailItem) return;
@@ -3635,6 +4821,16 @@ async function maybeAddToWatchlist(myGen) {
     // contact address or shared email domain.
     const client = getClientByEmail(emailFromAddress);
     if (!client) return;
+    // RFI/submittal mail has its own tracking (logged artifacts + the RFI/Submittal
+    // Tracker), so it must never land on the response watchlist — even from a client.
+    if (isRfiOrSubmittalEmail()) return;
+    // Automated-mail gates: OOF/bounce/receipt subjects and bulk-sender local
+    // parts. The client gate above matches by shared DOMAIN, so a client
+    // org's blast address ("donotreply@", "outbox@") passes it — a real
+    // client ask comes from a real person's address.
+    const subjLower = (typeof emailItem.subject === "string" ? emailItem.subject : "").toLowerCase();
+    if (AUTOMATED_SUBJECT_RE.test(subjLower)) return;
+    if (NEWSLETTER_SENDER_RE.test(from)) return;
 
     const token = await getToken();
     const html  = await getEmailBodyHtml(token);
@@ -3642,6 +4838,11 @@ async function maybeAddToWatchlist(myGen) {
     const tmp = document.createElement("div");
     tmp.innerHTML = html || "";
     const text = (tmp.innerText || tmp.textContent || "").replace(/\s+/g, " ");
+
+    // Newsletter-footer gate — scans only the CURRENT message's text, so a
+    // real reply quoting a newsletter below the signature doesn't get gated.
+    const currentText = trimToCurrentMessage(text).toLowerCase();
+    if (NEWSLETTER_BODY_MARKERS.some(m => currentText.includes(m))) return;
 
     // Recipient signals — an email sent directly TO you, or one whose greeting
     // names you, is far more likely to need your reply than a mass CC. Computed
@@ -3656,9 +4857,18 @@ async function maybeAddToWatchlist(myGen) {
     // Hard gate: only watch emails whose greeting names the signed-in user.
     // A mass update or group thread that doesn't open with your name is not
     // your reply to owe, however question-shaped its body is. If the account
-    // has no usable first name we can't check — fall through to the score
-    // gates rather than silently disabling the watchlist.
+    // has no usable first name we can't check — fall through to the CC-only
+    // gate below rather than silently disabling the watchlist.
     if (canCheckName && !namedInSalutation) return;
+
+    // CC-only gate: if you're not in the To line and not named anywhere in
+    // the message, any ask in it is someone else's — skip. Panels are
+    // per-user, so the colleague who IS in the To line still gets it flagged
+    // on their own pane; a thread nobody at Setty answers still surfaces
+    // there after the same 24-business-hour grace.
+    const namedAnywhere = myFirstName.length >= 2 &&
+      new RegExp("\\b" + myFirstName + "\\b", "i").test(currentText);
+    if (!addressedToMe && !namedAnywhere) return;
 
     const subject = (typeof emailItem.subject === "string") ? emailItem.subject : "";
     const verdict = needsResponse(subject, text, emailItem.dateTimeCreated,
@@ -3940,6 +5150,30 @@ function isInProjectDirectory(email) {
   if ((selectedProject.directory || []).some(d => (d.email || "").trim().toLowerCase() === emailLc)) return true;
   return ((selectedProject.projectContacts?.pm) || []).some(c => (c.email || "").trim().toLowerCase() === emailLc);
 }
+// "Already on SOME job" — is this email in ANY project's directory or PM list,
+// not just the selected one. Memoized against the allProjects reference
+// (loadProjects reassigns the array on refresh), so the set rebuilds only when
+// the project data changes.
+let _allDirEmailsCache = { ref: null, set: new Set() };
+function isInAnyProjectDirectory(email) {
+  const emailLc = (email || "").trim().toLowerCase();
+  if (!emailLc) return false;
+  if (_allDirEmailsCache.ref !== allProjects) {
+    const set = new Set();
+    for (const p of (allProjects || [])) {
+      for (const d of (p.directory || [])) {
+        const e = (d.email || "").trim().toLowerCase();
+        if (e) set.add(e);
+      }
+      for (const c of ((p.projectContacts?.pm) || [])) {
+        const e = (c.email || "").trim().toLowerCase();
+        if (e) set.add(e);
+      }
+    }
+    _allDirEmailsCache = { ref: allProjects, set };
+  }
+  return _allDirEmailsCache.set.has(emailLc);
+}
 // Setty staff are managed via the project's Teams tab in PMS, not the
 // contact directories — so they're excluded from the "new" nudge entirely.
 function isSettyInternalEmail(email) {
@@ -3954,6 +5188,11 @@ function isSettyInternalEmail(email) {
 function senderNeedsEnrichment() {
   const addr = (emailFromAddress || "").trim().toLowerCase();
   if (!addr) return null;
+  // Setty staff are managed via the project's Teams tab, not the contact
+  // directories (same exclusion getParticipantDirectoryStatus applies). Never
+  // nudge to enrich an internal sender from their signature — even if a stale
+  // @setty.com record lingers in a directory from before that rule existed.
+  if (isSettyInternalEmail(addr)) return null;
   // Saved/enriched this session — stop nudging immediately, even before the
   // in-memory directory cache reflects the backfilled title/phone.
   if (_sessionSavedContactEmails.has(addr)) return null;
@@ -3971,9 +5210,15 @@ function getParticipantDirectoryStatus(p) {
   const sessionSaved = !!emailLc && _sessionSavedContactEmails.has(emailLc);
   const globalHit = internal ? null : findGlobalContact(emailLc);
   const inProject = internal ? false : isInProjectDirectory(emailLc);
+  // Filed on SOME job's directory even if not in the global directory or this
+  // project — still "known", so it must not read as a brand-new contact. Stops
+  // the nudge firing for people you've already got on another project. (inProject
+  // ⊂ inAnyProject, but the selected project may be a fresher object than the
+  // cached allProjects copy, so check both.)
+  const inAnyProject = internal ? false : (inProject || isInAnyProjectDirectory(emailLc));
   // "New" = external, nowhere in the firm's directories, and not just saved
   // this session.
-  return { internal, globalHit, inProject, sessionSaved, isNew: !internal && !globalHit && !inProject && !sessionSaved };
+  return { internal, globalHit, inProject, inAnyProject, sessionSaved, isNew: !internal && !globalHit && !inProject && !inAnyProject && !sessionSaved };
 }
 // Nudge on the main-view button: surface how many of this email's
 // participants aren't in any directory yet, BEFORE the user opens the list.
@@ -4097,8 +5342,33 @@ async function resolveSpIds() {
 // Cleared on item switch (loadItemContext).
 const _emailBodyCache = new Map();
 function clearEmailBodyCache() { _emailBodyCache.clear(); }
-async function getEmailBodyHtml(token) {
-  const item = Office.context.mailbox.item;
+// The email's true send date. For ARCHIVED items, emailItem.dateTimeCreated is the
+// archive-copy time (a 2021 email can read as 2023), so prefer the internet "Date:"
+// header — the real send date Outlook shows. Falls back to dateTimeCreated.
+async function getEmailDateReliable() {
+  const headerDate = await new Promise(resolve => {
+    try {
+      if (!emailItem?.getAllInternetHeadersAsync) return resolve("");
+      emailItem.getAllInternetHeadersAsync(r => {
+        if (r.status !== Office.AsyncResultStatus.Succeeded) return resolve("");
+        const m = String(r.value || "").match(/^Date:\s*(.+)$/im);
+        resolve(m ? m[1].trim() : "");
+      });
+    } catch { resolve(""); }
+  });
+  if (headerDate) {
+    const d = new Date(headerDate);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  return emailItem?.dateTimeCreated || null;
+}
+
+// `itemSnapshot` (optional): the mailbox item captured by the caller before any
+// awaits. The save paths pass their snapshot so a fast item-switch mid-save
+// can't put a different email's body under the snapshotted header/folder.
+// Callers without a snapshot (watchlist, Teams share, date scan) read live.
+async function getEmailBodyHtml(token, itemSnapshot) {
+  const item = itemSnapshot || Office.context.mailbox.item;
   const msgId = item?.itemId;
   if (msgId && _emailBodyCache.has(msgId)) return _emailBodyCache.get(msgId);
 
@@ -4128,6 +5398,226 @@ async function getEmailBodyHtml(token) {
 
   if (body && msgId) _emailBodyCache.set(msgId, body);
   return body;
+}
+
+// ── Inline image resolution (for OneNote pages + the PMS email log) ──────────
+// Email HTML references embedded images as cid: pointers; the bytes live as
+// inline file attachments. OneNote can't read cid: (it needs multipart name:
+// parts) and the PMS log needs them as data: URIs — both start from this fetch.
+// Everything here is best-effort: on any failure callers keep the original body.
+const _inlineImgCache = new Map(); // itemId -> Map<cidLower, {contentType, bytes}>
+
+// List an item's attachments WITHOUT payloads, then fetch bytes for just the
+// inline images. The naive `GET /attachments` returns contentBytes — the full
+// base64 of EVERY attachment, including the 20MB PDFs that get uploaded
+// separately — which was the main cause of slow SharePoint saves ("download
+// everything twice"). $select here uses base-attachment properties only;
+// contentId lives on the fileAttachment derived type and can't be reliably
+// $selected on the base collection, so it comes back with the per-attachment
+// GET below (small: inline images only).
+const ATT_LIST_SELECT = "?$select=id,name,contentType,size,isInline";
+const INLINE_FETCH_CONCURRENCY = 4;
+// candidates: [{id}] from the listing. fetchOne(attId) -> full fileAttachment
+// (contentBytes + contentId) or null. Returns cid->{contentType,bytes} map.
+async function _fetchInlineImageMap(candidates, fetchOne, valueUrlFor, token) {
+  const map = new Map();
+  for (let i = 0; i < candidates.length; i += INLINE_FETCH_CONCURRENCY) {
+    const batch = candidates.slice(i, i + INLINE_FETCH_CONCURRENCY);
+    await Promise.all(batch.map(async (c) => {
+      try {
+        const att = await fetchOne(c.id);
+        if (!att) return;
+        const cid = String(att.contentId || "").replace(/[<>]/g, "").trim().toLowerCase();
+        if (!cid) return;
+        let bytes = att.contentBytes ? toBytesFromBase64(att.contentBytes) : null;
+        if (!bytes) {
+          const r = await fetchWithRetry(valueUrlFor(c.id),
+            { headers: { "Authorization": "Bearer " + token } }, { label: "graph inline img $value" });
+          if (r.ok) bytes = new Uint8Array(await r.arrayBuffer());
+        }
+        if (bytes) map.set(cid, { contentType: att.contentType, bytes });
+      } catch (e) { console.warn("[inline-img] single fetch failed:", e.message); }
+    }));
+  }
+  return map;
+}
+
+async function getInlineImagesForEmail(token) {
+  const item = Office.context.mailbox.item;
+  const itemId = item?.itemId;
+  if (itemId && _inlineImgCache.has(itemId)) return _inlineImgCache.get(itemId);
+  try {
+    const restId = Office.context.mailbox.convertToRestId(itemId, Office.MailboxEnums.RestVersion.v2_0);
+    const attData = await graphFetch("GET", "/me/messages/" + restId + "/attachments" + ATT_LIST_SELECT, null, token);
+    const candidates = (attData?.value || []).filter(att =>
+      att["@odata.type"] === "#microsoft.graph.fileAttachment" &&
+      att.isInline && (att.contentType || "").startsWith("image/"));
+    const map = await _fetchInlineImageMap(
+      candidates,
+      (attId) => graphFetch("GET", "/me/messages/" + restId + "/attachments/" + attId, null, token),
+      (attId) => "https://graph.microsoft.com/v1.0/me/messages/" + restId + "/attachments/" + attId + "/$value",
+      token
+    );
+    // Cache ONLY on a successful listing. Caching the empty map from a
+    // transient failure used to strip inline images from every subsequent
+    // save of this email for the rest of the session.
+    if (itemId) _inlineImgCache.set(itemId, map);
+    return map;
+  } catch (e) {
+    console.warn("[inline-img] fetch failed:", e.message);
+    return new Map();
+  }
+}
+
+// Best-effort raster downscale to keep the email log light + fit OneNote's 4MB
+// cap. Returns the ORIGINAL bytes if the canvas path is unavailable or doesn't help.
+const INLINE_IMG_MAX_DIM = 1500;
+async function downscaleInlineImage(bytes, contentType) {
+  try {
+    if (typeof createImageBitmap !== "function") return { bytes, contentType };
+    const bmp = await createImageBitmap(new Blob([bytes], { type: contentType }));
+    const longEdge = Math.max(bmp.width, bmp.height);
+    const scale = Math.min(1, INLINE_IMG_MAX_DIM / longEdge);
+    if (scale >= 1 && bytes.length <= 300000) { if (bmp.close) bmp.close(); return { bytes, contentType }; }
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    let blob;
+    if (typeof OffscreenCanvas === "function") {
+      const cv = new OffscreenCanvas(w, h);
+      cv.getContext("2d").drawImage(bmp, 0, 0, w, h);
+      blob = await cv.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+    } else {
+      const cv = document.createElement("canvas");
+      cv.width = w; cv.height = h;
+      cv.getContext("2d").drawImage(bmp, 0, 0, w, h);
+      blob = await new Promise(res => cv.toBlob(res, "image/jpeg", 0.72));
+    }
+    if (bmp.close) bmp.close();
+    if (!blob) return { bytes, contentType };
+    const out = new Uint8Array(await blob.arrayBuffer());
+    return out.length < bytes.length ? { bytes: out, contentType: "image/jpeg" } : { bytes, contentType };
+  } catch (e) {
+    console.warn("[inline-img] downscale failed:", e.message);
+    return { bytes, contentType };
+  }
+}
+
+function _bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+// Run an async replacer over every regex match (String.replace can't await).
+async function replaceAsyncAddin(str, regex, asyncFn) {
+  const collected = [];
+  str.replace(regex, (...a) => { collected.push(a); return ""; });
+  const reps = await Promise.all(collected.map(a => asyncFn(...a)));
+  let i = 0;
+  return str.replace(regex, () => reps[i++]);
+}
+
+// Matches src="cid:..." / src='cid:...' (quote-aware via the \1 backreference).
+const cidSrcRe = () => /src\s*=\s*(["'])cid:([^"']+)\1/gi;
+
+// Email log: replace cid: refs with downscaled data: URIs so images render in the
+// PMS email viewer. Caps total embedded size; anything over stays a cid (the
+// full-res original is in SharePoint).
+const INLINE_LOG_TOTAL_CAP = 6 * 1024 * 1024;
+async function embedInlineImagesAsDataUris(html, token) {
+  if (!html || !/src\s*=\s*["']cid:/i.test(html)) return html;
+  const imgs = await getInlineImagesForEmail(token);
+  if (!imgs || imgs.size === 0) return html;
+  let total = 0;
+  const done = new Map();
+  return await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (done.has(cid)) return done.get(cid);
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > INLINE_LOG_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const rep = `src=${q}data:${ds.contentType};base64,${_bytesToBase64(ds.bytes)}${q}`;
+    done.set(cid, rep);
+    return rep;
+  });
+}
+
+// Sweep variant of the inline-image resolver: works on an ARBITRARY message
+// (base + Graph id), not the currently-open Office item, so bulk filing can
+// restore inline photos too. Skips tiny images (signature logos, <10KB) — they
+// only clutter and would slow a big backfill (most emails carry a cid: logo).
+// Bodies land in pms_project_emails (the table), not the slimmed inline blob,
+// so this stays clear of the write-contention path the defer fix solved.
+const INLINE_IMG_MIN_BYTES = 10000;
+async function getInlineImagesForMessageId(base, gid, token) {
+  try {
+    // Same $select strategy as getInlineImagesForEmail — never pull every
+    // attachment's contentBytes just to find the inline photos.
+    const attData = await graphFetch("GET", base + "/messages/" + gid + "/attachments" + ATT_LIST_SELECT, null, token);
+    const candidates = (attData?.value || []).filter(att =>
+      att["@odata.type"] === "#microsoft.graph.fileAttachment" &&
+      att.isInline && (att.contentType || "").startsWith("image/") &&
+      (att.size || 0) > INLINE_IMG_MIN_BYTES);   // skip tiny logos
+    return await _fetchInlineImageMap(
+      candidates,
+      (attId) => graphFetch("GET", base + "/messages/" + gid + "/attachments/" + attId, null, token),
+      (attId) => "https://graph.microsoft.com/v1.0" + base + "/messages/" + gid + "/attachments/" + attId + "/$value",
+      token
+    );
+  } catch (e) {
+    console.warn("[inline-img sweep] fetch failed:", e.message);
+    return new Map();
+  }
+}
+
+// Embed a pre-fetched cid->bytes map into HTML as downscaled data: URIs. Same
+// cap/downscale rules as embedInlineImagesAsDataUris, but takes the map so the
+// sweep fetches once per message. cid refs without a (substantial) image stay as-is.
+async function embedInlineImagesFromMap(html, imgs) {
+  if (!html || !imgs || imgs.size === 0 || !/src\s*=\s*["']cid:/i.test(html)) return html;
+  let total = 0;
+  const done = new Map();
+  return await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (done.has(cid)) return done.get(cid);
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > INLINE_LOG_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const rep = `src=${q}data:${ds.contentType};base64,${_bytesToBase64(ds.bytes)}${q}`;
+    done.set(cid, rep);
+    return rep;
+  });
+}
+
+// OneNote: rewrite cid: -> name:imgN and return the binary parts for a multipart
+// create-page POST. Honors OneNote's ~4MB request / 30-image limits.
+const ONENOTE_TOTAL_CAP = 3.5 * 1024 * 1024;
+async function rewriteCidToOneNoteParts(html, imgs) {
+  const parts = [];
+  if (!html || !imgs || imgs.size === 0) return { html, parts };
+  let total = 0, idx = 0;
+  const named = new Map();
+  const out = await replaceAsyncAddin(html, cidSrcRe(), async (m, q, rawCid) => {
+    const cid = String(rawCid).replace(/[<>]/g, "").trim().toLowerCase();
+    const img = imgs.get(cid);
+    if (!img) return m;
+    if (named.has(cid)) return `src=${q}name:${named.get(cid)}${q}`;
+    if (parts.length >= 28) return m;
+    const ds = await downscaleInlineImage(img.bytes, img.contentType);
+    if (total + ds.bytes.length > ONENOTE_TOTAL_CAP) return m;
+    total += ds.bytes.length;
+    const name = "img" + (idx++);
+    named.set(cid, name);
+    parts.push({ name, bytes: ds.bytes, contentType: ds.contentType });
+    return `src=${q}name:${name}${q}`;
+  });
+  return { html: out, parts };
 }
 
 // ── RELIABLE PLAIN-TEXT BODY ─────────────────────────────────────────────────
@@ -4231,28 +5721,28 @@ const EMAIL_OPEN_QUIPS = [
   "*sniffs for change orders*",
 ];
 const MILESTONE_QUIPS_10 = [
-  "🎉 10 saved! That's a respectable start.",
+  "🎉 10 saved{name}! That's a respectable start.",
   "🎉 10 emails — foundation of project memory laid.",
   "🎉 10 down — documenting like a court reporter on caffeine.",
   "🎉 10 saved! Future-You will send a thank-you note.",
   "🎉 10 emails — measure twice, file once. You're doing both.",
 ];
 const MILESTONE_QUIPS_25 = [
-  "🔥 25 this week — strong rhythm!",
+  "🔥 25 this week{name} — strong rhythm!",
   "🔥 25 saved — architects are jealous of your filing game.",
   "🔥 25 emails — the project record gods are pleased.",
   "🔥 25 down — your project history is becoming legendary.",
   "🔥 25 emails — fixing project memory one save at a time.",
 ];
 const MILESTONE_QUIPS_50 = [
-  "🚀 50 emails — on a roll!",
+  "🚀 50 emails{name} — on a roll!",
   "🚀 50 saved! At this rate you'll need a bigger SharePoint folder.",
   "🚀 50 — basically the project's official scribe at this point.",
   "🚀 50 — *applies extra clipboard authority*",
   "🚀 50 emails! Documentation icon status: confirmed.",
 ];
 const MILESTONE_QUIPS_100 = [
-  "🏆 100 emails — legendary week!",
+  "🏆 100 emails — legendary week{name}!",
   "🏆 100 saved — you're now the project archivist. Update LinkedIn.",
   "🏆 100 emails — Setty docs hall of fame.",
   "🏆 100 — you've crossed from 'PM' to 'librarian'.",
@@ -4302,8 +5792,19 @@ function generateSillySavingMessage() {
   return `${e} ${v} ${n}…`;
 }
 
+// First name from the Outlook profile ("Sara Arias" → "Sara") — free
+// personalization, no extra permissions. Quips embed "{name}" where ", First"
+// reads naturally; if the profile is unavailable the token collapses to "".
+function addinFirstName() {
+  try {
+    const dn = (Office.context.mailbox.userProfile.displayName || "").trim();
+    return dn ? dn.split(/\s+/)[0] : "";
+  } catch (_) { return ""; }
+}
 function pickQuip(pool) {
-  return pool[Math.floor(Math.random() * pool.length)];
+  const n = addinFirstName();
+  return pool[Math.floor(Math.random() * pool.length)]
+    .replace(/\{name\}/g, n ? ", " + n : "");
 }
 
 // Lazy-load canvas-confetti on first celebration. Saves the ~5KB download
@@ -4338,42 +5839,42 @@ function pickSavingMessage() {
 // reminders, since those are the hours people actually skip breaks.
 const TIME_GREETINGS = {
   morning: [
-    "☕ Morning — first file of the day. Strong start.",
-    "☕ Filing before 10am? Disciplined.",
-    "🌅 Bright and early. Project record blessed.",
+    "☕ Morning{name} — first file of the day. Strong start.",
+    "☕ Filing before 10am{name}? Disciplined.",
+    "🌅 Bright and early{name}. Project record blessed.",
   ],
   lateBreakfast: [
-    "🥐 Late breakfast filing. Solid.",
-    "🥐 Pre-lunch productivity. Building momentum.",
-    "🍵 Mid-morning groove. Nice pace.",
+    "🥐 Late breakfast filing{name}. Solid.",
+    "🥐 Pre-lunch productivity. Building momentum{name}.",
+    "🍵 Mid-morning groove{name}. Nice pace.",
   ],
   lunch: [
-    "🥪 Lunchtime filing — but eat something too, ok?",
-    "🥪 Filing while you eat? AEC heroics. Don't forget the food.",
-    "🥗 Lunch-hour documentation. Hydrate too.",
-    "🍴 Filing through lunch? At least step away from the screen for 5.",
+    "🥪 Lunchtime filing{name} — but eat something too, ok?",
+    "🥪 Filing while you eat{name}? AEC heroics. Don't forget the food.",
+    "🥗 Lunch-hour documentation{name}. Hydrate too.",
+    "🍴 Filing through lunch{name}? At least step away from the screen for 5.",
   ],
   afternoon: [
-    "📊 Mid-afternoon focus. Respect.",
-    "🧘 Afternoon files going in — also: stand up, stretch, water?",
-    "📊 3pm momentum. You've earned a 5-min break soon.",
-    "👀 Eyes off the screen for a sec? Then back to it.",
-    "☕ Mid-afternoon — second coffee window is officially open.",
+    "📊 Mid-afternoon focus. Respect{name}.",
+    "🧘 Afternoon files going in{name} — also: stand up, stretch, water?",
+    "📊 3pm momentum{name}. You've earned a 5-min break soon.",
+    "👀 Eyes off the screen for a sec{name}? Then back to it.",
+    "☕ Mid-afternoon{name} — second coffee window is officially open.",
   ],
   evening: [
-    "🌅 Evening filing — wrapping up clean.",
-    "🌅 End-of-day cleanup. Tomorrow-You says thanks.",
-    "🌇 Closing the loop on today. Nice.",
+    "🌅 Evening filing{name} — wrapping up clean.",
+    "🌅 End-of-day cleanup{name}. Tomorrow-You says thanks.",
+    "🌇 Closing the loop on today{name}. Nice.",
   ],
   lateEvening: [
-    "🌙 9-to-9 day? Thanks for the dedication.",
-    "🌙 Past 7pm? Make sure dinner happened.",
-    "🌃 Evening shift respect.",
+    "🌙 9-to-9 day{name}? Thanks for the dedication.",
+    "🌙 Past 7pm{name}? Make sure dinner happened.",
+    "🌃 Evening shift respect{name}.",
   ],
   lateNight: [
-    "🦉 Filing past 10pm — admirable. Sleep is also good.",
-    "🌙 Late shift respect. Set a hard stop?",
-    "🦉 The owl hours. Don't let this become a habit.",
+    "🦉 Filing past 10pm{name} — admirable. Sleep is also good.",
+    "🌙 Late shift respect{name}. Set a hard stop?",
+    "🦉 The owl hours{name}. Don't let this become a habit.",
   ],
 };
 function timeOfDayGreeting() {
@@ -4525,7 +6026,64 @@ function _markFirstSaveDone() {
   try { localStorage.setItem(FIRST_SAVE_KEY, "1"); } catch {}
 }
 
+// ── PMS "filed" category chips ────────────────────────────────────────────────
+// Stamp the OPEN email with TWO Outlook categories when it's filed — a generic
+// "Tracked to PMS" status chip + a per-project "📁 <Project>" chip — mirroring the
+// Dynamics "Tracked to Dynamics 365" + regarding-record look. Filed mail is then
+// visible at a glance in the inbox (desktop + web). Uses the add-in's existing
+// ReadWriteMailbox permission (no Graph, no extra consent); open-item only. Needs
+// Mailbox requirement set 1.8; no-ops on older clients. Bulk-sweep tagging
+// (arbitrary messages → Graph → Mail.ReadWrite re-consent) is a follow-up.
+const PMS_TRACKED_CATEGORY = "Tracked to PMS"; // generic status chip
+const PMS_TRACKED_COLOR = "Preset7";           // blue
+const PMS_PROJECT_PREFIX = "📁 ";              // per-project chip, e.g. "📁 Homeport II"
+const PMS_PROJECT_COLOR = "Preset5";           // teal
+let _lastStampedKey = ""; // guards the stamp from re-running per item/project view
+function _categoriesSupported() {
+  try {
+    return !!(Office.context.mailbox.item
+      && Office.context.requirements
+      && Office.context.requirements.isSetSupported("Mailbox", "1.8")
+      && Office.context.mailbox.item.categories
+      && Office.context.mailbox.masterCategories);
+  } catch (e) { return false; }
+}
+function _officeP(fn) {
+  return new Promise((resolve, reject) => {
+    try {
+      fn(res => {
+        if (res && res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
+        else reject(new Error(res && res.error ? res.error.message : "Office async failed"));
+      });
+    } catch (e) { reject(e); }
+  });
+}
+async function _ensureAndAddCategory(catName, color) {
+  const onItem = await _officeP(cb => Office.context.mailbox.item.categories.getAsync(cb));
+  if ((onItem || []).some(c => c.displayName === catName)) return; // already on this item
+  const master = await _officeP(cb => Office.context.mailbox.masterCategories.getAsync(cb));
+  if (!(master || []).some(c => c.displayName === catName)) {
+    // Must exist in the master list (with a color) or newer Outlook won't render it.
+    try {
+      await _officeP(cb => Office.context.mailbox.masterCategories.addAsync(
+        [{ displayName: catName, color: Office.MailboxEnums.CategoryColor[color] }], cb));
+    } catch (e) { /* added concurrently / already exists — fine */ }
+  }
+  await _officeP(cb => Office.context.mailbox.item.categories.addAsync([catName], cb));
+}
+async function stampProjectCategory(project) {
+  if (!project || !_categoriesSupported()) return;
+  const label = (project.name || project.projectNumber || "").trim();
+  try {
+    await _ensureAndAddCategory(PMS_TRACKED_CATEGORY, PMS_TRACKED_COLOR);                    // "Tracked to PMS"
+    if (label) await _ensureAndAddCategory(PMS_PROJECT_PREFIX + label, PMS_PROJECT_COLOR);   // "📁 <Project>"
+  } catch (e) {
+    console.warn("[pms-category] stamp failed:", e.message);
+  }
+}
+
 function recordSaveAndCelebrate() {
+  void stampProjectCategory(selectedProject); // tag the just-filed email with its project chip
   // Check first-save BEFORE bumping the weekly counter so the welcome fires
   // even if this is also weekly-count #1.
   const isFirstEver = _isFirstSaveEver();
@@ -4654,15 +6212,21 @@ function encodeDrivePath(path) {
     .map(p => encodeURIComponent(p))
     .join("/");
 }
-// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders)
+// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders).
+// Retries transient failures and logs non-OK responses — a silently failed
+// create used to surface later as confusing 404s on the uploads into it.
+// Still never throws: the subsequent upload is the authoritative failure signal.
 async function ensureSpFolder(driveId, token, parentPath, name) {
   try {
-    await fetch("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
+    const res = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
-    });
-  } catch {}
+    }, { label: "graph ensure folder" });
+    if (!res.ok && res.status !== 409) {
+      console.warn("[sp-folder] create HTTP", res.status, "for", parentPath + "/" + name);
+    }
+  } catch (e) { console.warn("[sp-folder] create failed:", name, e.message); }
   return parentPath + "/" + name;
 }
 // Extract the drive-relative path from a full SharePoint web URL
@@ -4700,7 +6264,7 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
   // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
   // sha256 + verified once read-back lands.
   lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [] };
-  const bodyHtml = await getEmailBodyHtml(token);
+  const bodyHtml = await getEmailBodyHtml(token, item); // snapshot — see header comment
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
   const emailHtmlPromise = fetch(
@@ -4908,18 +6472,29 @@ async function getOfficeFileAttachments(item) {
     });
   });
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
-  const out = [];
-  for (const att of fileAtts) {
-    const content = await new Promise((resolve, reject) => {
+  // Fetch attachment bytes with bounded concurrency. This used to be a serial
+  // for..await loop — with several attachments (esp. in Outlook on the web,
+  // where getAttachmentContentAsync is a network call) the byte fetch was the
+  // bottleneck even though the uploads downstream run 3-wide. Results are
+  // collected by index so `out` keeps fileAtts order (the uploader's
+  // name-uniquifying assumes stable ordering).
+  const FETCH_CONCURRENCY = 3;
+  const contents = new Array(fileAtts.length).fill(null);
+  for (let i = 0; i < fileAtts.length; i += FETCH_CONCURRENCY) {
+    const batch = fileAtts.slice(i, i + FETCH_CONCURRENCY);
+    await Promise.all(batch.map((att, bi) => new Promise((resolve, reject) => {
       // CRITICAL: use the captured `item`, not the live module global.
       item.getAttachmentContentAsync(att.id, (res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
         else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
       });
-    }).catch((e) => {
-      console.warn("Office attachment content failed:", att.name, e.message);
-      return null;
-    });
+    }).then(content => { contents[i + bi] = content; })
+      .catch((e) => { console.warn("Office attachment content failed:", att.name, e.message); })));
+  }
+  const out = [];
+  for (let idx = 0; idx < fileAtts.length; idx++) {
+    const att = fileAtts[idx];
+    const content = contents[idx];
     if (!content || content.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) continue;
     const bytes = toBytesFromBase64(content.content);
     // Skip small inline images (signature logos, social icons, banners) — same
@@ -4947,7 +6522,11 @@ async function getOfficeFileAttachments(item) {
 // returns 413 (or in some corner cases, just hangs) and the file fails to
 // upload. We auto-dispatch to the upload-session API for anything > threshold.
 const SP_SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024;          // 4 MiB
-const SP_UPLOAD_CHUNK_SIZE = 5 * 320 * 1024;           // 1.6 MiB — multiple of 320 KiB (Graph requirement)
+const SP_UPLOAD_CHUNK_SIZE = 32 * 320 * 1024;          // 10 MiB — multiple of 320 KiB (Graph requirement).
+// Graph recommends 5–10 MiB chunks; the old 1.6 MiB made a 40MB file take ~25
+// serial round-trip PUTs. Bigger chunks = far fewer round trips on big files,
+// and the per-chunk retry in uploadLargeAttachmentToSharePoint still bounds
+// how much a transient failure re-sends.
 
 // ─── INTEGRITY HASHING ───────────────────────────────────────────────────────
 // SHA-256 of the local bytes via Web Crypto. Used by the read-back verification
@@ -4962,156 +6541,6 @@ async function sha256Hex(bytes) {
   return hex;
 }
 
-// Microsoft Graph's QuickXorHash — a custom XOR-with-rotation digest used by
-// OneDrive/SharePoint. We only need this when sha256Hash isn't present on the
-// DriveItem (SharePoint's `file.hashes` facet usually returns quickXorHash by
-// default, sometimes sha1Hash; sha256Hash requires explicit enablement).
-// Spec: https://learn.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash
-// Implementation translated from the reference C# / Python.
-async function quickXorHashBase64(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const BITS_IN_LAST_CELL = 32;
-  const SHIFT = 11;
-  const WIDTH_BITS = 160;
-  const WIDTH_BYTES = 20;
-  // We maintain 160 bits as 5 × 32-bit lanes (little-endian inside each lane).
-  const lanes = new Uint32Array(5);
-  let shiftSoFar = 0;
-  let lengthSoFar = 0;
-
-  // Rotate-left of the lanes array by `bits`. Done by streaming each input byte
-  // into a moving 8-bit window. For performance + readability we operate on
-  // 8-bit groups and recompute the destination bit/lane each step.
-  for (let i = 0; i < bytes.length; i++) {
-    const currentShift = shiftSoFar;
-    const vectorArrayIndex = Math.floor(currentShift / 32) % 5;
-    const vectorOffset = currentShift % 32;
-    const nextVectorIndex = (vectorArrayIndex + 1) % 5;
-    const xoredByte = bytes[i];
-    // Lower bits of the byte XOR into the current lane shifted into position.
-    lanes[vectorArrayIndex] = (lanes[vectorArrayIndex] ^ (xoredByte << vectorOffset)) >>> 0;
-    // Bits that overflow the lane go into the next lane.
-    if (vectorOffset > 24) {
-      lanes[nextVectorIndex] = (lanes[nextVectorIndex] ^ (xoredByte >>> (32 - vectorOffset))) >>> 0;
-    }
-    shiftSoFar = (shiftSoFar + SHIFT) % WIDTH_BITS;
-    lengthSoFar++;
-  }
-
-  // Finalize by XORing the message length (8 bytes, little-endian) into the
-  // last 64 bits of the 160-bit state.
-  const out = new Uint8Array(WIDTH_BYTES);
-  for (let i = 0; i < 5; i++) {
-    out[i * 4 + 0] = (lanes[i] >>>  0) & 0xff;
-    out[i * 4 + 1] = (lanes[i] >>>  8) & 0xff;
-    out[i * 4 + 2] = (lanes[i] >>> 16) & 0xff;
-    out[i * 4 + 3] = (lanes[i] >>> 24) & 0xff;
-  }
-  // XOR the message length (in bytes, as 8-byte LE) into the last 8 bytes
-  let len = lengthSoFar;
-  for (let i = 0; i < 8; i++) {
-    out[WIDTH_BYTES - 8 + i] ^= (len & 0xff);
-    len = Math.floor(len / 256);
-  }
-  // base64 of the 20 bytes
-  let bin = "";
-  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i]);
-  return btoa(bin);
-}
-
-// SHA-1 (still occasionally surfaced by Graph). Web Crypto handles it.
-async function sha1Hex(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  const digest = await crypto.subtle.digest("SHA-1", bytes);
-  const view = new Uint8Array(digest);
-  let hex = "";
-  for (let i = 0; i < view.length; i++) hex += view[i].toString(16).padStart(2, "0");
-  return hex.toUpperCase(); // Graph reports SHA-1 in uppercase hex
-}
-
-// Fetch metadata for a just-uploaded file. Returns { size, hashes } or null.
-async function fetchSpFileMetadata(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName) +
-      "?select=size,file";
-    const res = await fetchWithRetry(url, {
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph verify GET", maxAttempts: 3 });
-    if (!res.ok) return null;
-    const item = await res.json();
-    return {
-      size:   item?.size ?? null,
-      hashes: item?.file?.hashes || {},
-    };
-  } catch (e) {
-    console.warn("[verify] metadata GET failed:", safeName, e.message);
-    return null;
-  }
-}
-
-// Verify a just-uploaded file matches the local bytes we tried to send.
-// Returns:
-//   { ok: true,  algo, localHash, remoteHash } — verified clean
-//   { ok: false, reason } — mismatch or unable to verify
-async function verifyUploadedFile(driveId, token, targetPath, safeName, bytes) {
-  const meta = await fetchSpFileMetadata(driveId, token, targetPath, safeName);
-  if (!meta) return { ok: false, reason: "metadata GET failed" };
-
-  // Size check — fastest, most important. Any mismatch here is a hard fail
-  // regardless of which hash algorithm the server reports.
-  if (typeof meta.size === "number" && meta.size !== bytes.length) {
-    return {
-      ok: false,
-      reason: `size mismatch: local=${bytes.length} remote=${meta.size}`,
-    };
-  }
-
-  const hashes = meta.hashes || {};
-  // Prefer SHA-256 (only present if the tenant has it enabled), then SHA-1
-  // (deprecated but widely present), then quickXorHash (the SharePoint default).
-  if (hashes.sha256Hash) {
-    const local = (await sha256Hex(bytes)).toUpperCase();
-    const remote = String(hashes.sha256Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha256", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha256 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.sha1Hash) {
-    const local = await sha1Hex(bytes);
-    const remote = String(hashes.sha1Hash).toUpperCase();
-    return local === remote
-      ? { ok: true,  algo: "sha1", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `sha1 mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  if (hashes.quickXorHash) {
-    const local = await quickXorHashBase64(bytes);
-    const remote = String(hashes.quickXorHash);
-    return local === remote
-      ? { ok: true,  algo: "quickXor", localHash: local, remoteHash: remote }
-      : { ok: false, reason: `quickXor mismatch: local=${local.slice(0,12)}… remote=${remote.slice(0,12)}…` };
-  }
-  // Server returned no hashes — fall back to size-only (already checked above
-  // and matched). Better than nothing.
-  return { ok: true, algo: "size-only", localHash: String(bytes.length), remoteHash: String(meta.size) };
-}
-
-// Delete an item at a path. Used by the verify-then-retry path when the
-// first upload landed corrupt and we need to clear the bad file before re-PUT.
-async function deleteSpFile(driveId, token, targetPath, safeName) {
-  try {
-    const url = "https://graph.microsoft.com/v1.0/drives/" + driveId +
-      "/root:/" + encodeDrivePath(targetPath + "/" + safeName);
-    const res = await fetchWithRetry(url, {
-      method: "DELETE",
-      headers: { "Authorization": "Bearer " + token },
-    }, { label: "graph delete bad file", maxAttempts: 2 });
-    return res.ok || res.status === 404;
-  } catch (e) {
-    console.warn("[verify] delete failed:", safeName, e.message);
-    return false;
-  }
-}
 
 // Upload + verify. Strategy (corrected — see comment block below):
 //   1. PUT bytes
@@ -5430,12 +6859,41 @@ async function withFilingScaffold(opts, runUpload) {
 }
 
 // ─── SAVE TO SHAREPOINT ───────────────────────────────────────────────────────
+// Update an already-saved email's SharePoint + body fields in pms_project_emails
+// (used when Save to SharePoint runs on a record that auto-save created earlier —
+// avoids a duplicate row). PATCH by record_id; no unique-constraint dependency.
+async function patchEmailSpFields(recordId, fields) {
+  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?record_id=eq." + encodeURIComponent(recordId);
+  const res = await fetchWithRetry(url, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(fields),
+  }, { label: "sb project_emails sp-update" });
+  if (!res.ok) throw new Error("pms_project_emails PATCH HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+}
+// Patch by (project_id, msg_id) instead of the surrogate record_id. msg_id is the
+// stable business key, so the SharePoint link lands on the correct row even if the
+// inline record's id ever drifted — this is the direct cure for "saved to
+// SharePoint but the link didn't stick."
+async function patchEmailSpFieldsByMsg(projectId, msgId, fields) {
+  if (!projectId || !msgId) return;
+  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE +
+    "?project_id=eq." + encodeURIComponent(projectId) +
+    "&msg_id=eq." + encodeURIComponent(msgId);
+  const res = await fetchWithRetry(url, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(fields),
+  }, { label: "sb project_emails sp-update-by-msg" });
+  if (!res.ok) throw new Error("pms_project_emails PATCH(by msg) HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+}
 async function doSaveToSharePoint() {
   return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
 }
 async function _doSaveToSharePoint() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder on this project. Create one in the PMS first."); return; }
+await ensureInternetMessageId(); // STABLE id so existingRecord + the SP patch resolve to the right row
 const currentMsgId = getCurrentMessageRecordId();
 const existingRecord = findSavedEmailRecord(selectedProject, currentMsgId);
 // Read the Link To target up front so we can branch on it BEFORE the
@@ -5472,8 +6930,11 @@ if (existingRecord) {
     try { refreshLinkToTargetDropdown(); } catch {}
     return;
   }
-  refreshEmailSavedIndicator();
-  return;
+  // Already filed to SharePoint → nothing to upload; just refresh the indicator.
+  if (existingRecord.spFolderUrl) { refreshEmailSavedIndicator(); return; }
+  // Otherwise this email was logged to the project record (e.g. by auto-save on
+  // tag) but never pushed to SharePoint. Fall through to upload the attachments
+  // and UPDATE this same record below — don't bail, and don't duplicate the row.
 }
   // Snapshot all per-item data SYNCHRONOUSLY before any await. Without this,
   // a fast item-switch (Office swaps mailbox.item silently on pinned panes)
@@ -5481,8 +6942,10 @@ if (existingRecord) {
   // date, sender, or attachments into the current project's folder. The
   // generation counter alone can't protect later sync reads of `emailItem.*`.
   const snapItem = emailItem;
-  const snapSubject = snapItem?.subject || "";
-  const snapDate = snapItem?.dateTimeCreated;
+  // Guard against compose-mode appointments where subject is an async object,
+  // not a string — a raw object here would blow up the later safeSubject.replace().
+  const snapSubject = (typeof snapItem?.subject === "string") ? snapItem.subject : getResolvedItemSubject();
+  const snapDate = await getEmailDateReliable();
   const snapFromName = snapItem?.from?.displayName || "";
   const snapFromAddr = snapItem?.from?.emailAddress || "";
   // Capture recipients in the same snapshot so an item-switch mid-save can't
@@ -5514,8 +6977,16 @@ if (existingRecord) {
     // Track body-fetch failure separately so we can surface it in the success
     // message — previously a silent "" fallback meant the user thought everything
     // worked but the email record had no readable body.
-    const bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token, snapItem);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
+    // Inline images arrive as cid: refs (bytes live as inline attachments) and
+    // don't render in the PMS log — re-embed them as downscaled data: URIs so they
+    // show. Best-effort; on failure the original body is kept (SharePoint has the
+    // full-res originals regardless).
+    if (bodyHtml) {
+      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
+    }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(snapDate);
@@ -5547,14 +7018,14 @@ if (existingRecord) {
     // even if some uploads later failed — the email still HAS the attachments.
     const attachmentNames = (lastAttachmentUploadStats?.attemptedNames || []).slice();
     const emailRecord = {
-      id: uid(), msgId,
+      id: existingRecord ? existingRecord.id : uid(), msgId,
       subject: snapSubject,
       from: snapFromName,
       fromAddress: snapFromAddr,
       to: snapTo,
       cc: snapCc,
       date: snapDate,
-      bodyText: "",
+      bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
       hasAttachments: attachmentNames.length > 0,
@@ -5563,17 +7034,43 @@ if (existingRecord) {
       savedAt: new Date().toISOString(),
       savedBy: _getCurrentUserEmail() || "",
     };
+    // If this email was already logged (auto-save) and THIS pass couldn't fetch a
+    // body, keep the body the earlier save captured — don't blank it out.
+    if (existingRecord && !(emailRecord.bodyHtmlSize > 0)) {
+      emailRecord.bodyText = existingRecord.bodyText || emailRecord.bodyText;
+      emailRecord.bodyHtmlCompressed = existingRecord.bodyHtmlCompressed || emailRecord.bodyHtmlCompressed;
+      emailRecord.bodyHtmlSize = existingRecord.bodyHtmlSize || emailRecord.bodyHtmlSize;
+    }
     // Re-fetch latest projects, then append email to the FRESH copy of this project.
     // Prevents the add-in from overwriting concurrent PMS edits made during this session.
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      emails: [...(fresh.emails || []), emailRecord],
-    }));
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      // Replace any existing entry for this email (auto-save may have logged it
+      // already) so the SharePoint URL lands on ONE record instead of duplicating.
+      const others = (fresh.emails || []).filter(e => e.id !== emailRecord.id && e.msgId !== emailRecord.msgId);
+      return { ...fresh, emails: [...others, emailRecord] };
+    });
     let indexSaveFailed = false;
     try {
-      await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+      if (existingRecord) {
+        // Auto-save already inserted the search-index row; just patch in the
+        // SharePoint URL + attachment names (and refresh the body if we got one)
+        // so we update that one row instead of inserting a duplicate.
+        // Patch by the record's STORED msg_id (not its surrogate id), so the link
+        // lands on the right row whether it was keyed by internetMessageId or a
+        // legacy REST id.
+        await patchEmailSpFieldsByMsg(selectedProject.id, existingRecord.msgId || currentMsgId, {
+          sp_folder_url: spFolderUrl || "",
+          saved_to_sharepoint: true,
+          attachment_names: attachmentNames || [],
+          body_text: emailRecord.bodyText || "",
+          body_html_compressed: emailRecord.bodyHtmlCompressed || null,
+          body_html_size: emailRecord.bodyHtmlSize || 0,
+        });
+      } else {
+        await saveProjectEmailRow(selectedProject.id, emailRecord, true);
+      }
     } catch (idxErr) {
-      console.warn("saveProjectEmailRow failed:", idxErr);
+      console.warn("project_emails index write failed:", idxErr);
       indexSaveFailed = true;
     }
     // Optional: if the user picked a "Link to RFI/Sub" target, copy the email
@@ -5662,17 +7159,29 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // + caption) is the soft nudge toward SharePoint when attachments exist.
   // No confirm dialog: trust the user's intent, surface the consequence in the
   // post-save card ("3 attachments not filed").
+  await ensureInternetMessageId(); // STABLE id before we key/look-up the record
   const msgId = getCurrentMessageRecordId();
   if (findSavedEmailRecord(selectedProject, msgId)) {
     refreshEmailSavedIndicator();
     return;
   }
-  if (!quiet) setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
+  // Always show an in-progress indicator (even on quiet auto-save) so users don't
+  // click off the email mid-capture. Quiet only suppresses the celebration.
+  setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
+  let ok = false;
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await getToken();
-    const bodyHtml = await getEmailBodyHtml(token);
+    let bodyHtml = await getEmailBodyHtml(token);
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
+    // Inline images arrive as cid: refs (bytes live as inline attachments) and
+    // don't render in the PMS log — re-embed them as downscaled data: URIs so they
+    // show. Best-effort; on failure the original body is kept (SharePoint has the
+    // full-res originals regardless).
+    if (bodyHtml) {
+      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
+    }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
     const from = emailItem.from;
     const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
@@ -5688,7 +7197,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       fromAddress: from?.emailAddress || "",
       to,
       cc,
-      date: emailItem.dateTimeCreated,
+      date: await getEmailDateReliable(),
       bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
@@ -5699,10 +7208,13 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       savedBy: _getCurrentUserEmail() || "",
       savedToSharePoint: false,
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
-      ...fresh,
-      emails: [...(fresh.emails || []), emailRecord],
-    }));
+    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+      // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
+      // uniqueness: if this email was filed here since our pane last synced
+      // (another user, or a prior auto-save), don't append a second copy.
+      if ((fresh.emails || []).some(e => e.msgId && e.msgId === emailRecord.msgId)) return fresh;
+      return { ...fresh, emails: [...(fresh.emails || []), emailRecord] };
+    });
     let indexSaveFailed = false;
     try {
       await saveProjectEmailRow(selectedProject.id, emailRecord, false);
@@ -5720,9 +7232,22 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     }
     if (!quiet) recordSaveAndCelebrate();
     refreshEmailSavedIndicator(!quiet);
+    ok = true;
   } catch (e) {
     if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     else console.warn("auto-save record failed:", e);
+  } finally {
+    // Never strand the "⏳ Logging email to project…" transient as a perpetual
+    // spinner. If it's STILL the active status after we finish — a quiet auto-save
+    // that failed on a transient conflict (common while a sweep is churning project
+    // versions), or a post-save refresh that didn't find the record — resolve it:
+    // clear on success, or point at the manual Save button on failure. Guarded on
+    // the in-progress text, so real "Saved"/"Logged"/"Auto-tagged" messages survive.
+    const el = document.getElementById("actionStatus");
+    if (el && (el.textContent || "").includes("Logging email to project")) {
+      if (ok) setStatus("actionStatus", "", "");
+      else setStatus("actionStatus", "info", "Couldn't auto-log this email — reopen it or use 🗂️ Save to Project.");
+    }
   }
 }
 // ─── LOG NOTE ─────────────────────────────────────────────────────────────────
@@ -5806,7 +7331,7 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
   return ""
     + "<div style='max-width:7.5in;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:" + TEXT_DARK + ";line-height:1.5'>"
     + projSubtitle
-    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>Meeting Minutes</h1>"
+    + "<h1 style='font-family:Calibri,Arial,sans-serif;font-size:20pt;color:" + NAVY + ";margin:0 0 6px;padding-bottom:6px;border-bottom:2px solid " + NAVY + "'>" + (category === "Site Visit" ? "Site Visit" : "Meeting Minutes") + "</h1>"
     + "<div style='font-family:Calibri,Arial,sans-serif;font-size:13pt;font-weight:600;color:" + NAVY + ";margin-bottom:14px'>" + safeTitle + "</div>"
     // Bordered box for meeting details — same visual treatment as the PMS
     // importer. No Notes label / no grey side panel; just a clean polished
@@ -5830,35 +7355,6 @@ function buildAddinMeetingPageHtml(title, category, dateStr, participants, body,
     + "</div>";
 }
 
-// In-memory cache so a second click on Send-to-Teams doesn't re-hit Graph
-// for the channel email. Keyed by teamsChannelId. Reset on page reload —
-// no need to persist beyond a single Outlook session.
-const _channelEmailCache = {};
-
-// READ-ONLY channel email resolution. PMS deliberately doesn't request the
-// ChannelSettings.ReadWrite.All scope needed for `provisionEmail`, so we
-// only read here. If a channel hasn't had its email provisioned yet, the
-// user does it once via Teams ("⋯" menu → "Get email address"); after
-// that the read path returns the address every time.
-async function resolveChannelEmailAddin(project) {
-  const channelId = project?.teamsChannelId;
-  if (!channelId) return "";
-  if (_channelEmailCache[channelId]) return _channelEmailCache[channelId];
-  if (project.teamsChannelEmail) {
-    _channelEmailCache[channelId] = project.teamsChannelEmail;
-    return project.teamsChannelEmail;
-  }
-  try {
-    const ch = await graphFetch("GET", `/teams/${TEAMS_TEAM_ID}/channels/${channelId}?$select=email`);
-    if (ch?.email) { _channelEmailCache[channelId] = ch.email; return ch.email; }
-    throw new Error("__NO_EMAIL__");
-  } catch (e) {
-    if (e.message === "__NO_EMAIL__") {
-      throw new Error('Channel has no email yet. In Teams, click "⋯" next to the channel name → "Get email address" → "Copy". That provisions it; the next click here will work.');
-    }
-    throw new Error("Graph: " + e.message);
-  }
-}
 
 // Fetch the current Outlook email's HTML body for forwarding. Returns ""
 // if no email is selected or the API errors.
@@ -5924,7 +7420,7 @@ async function sendToTeamsChannel() {
   }
   setStatus("actionStatus", "info", "⏳ Posting to Teams channel…");
   try {
-    const subject = emailItem.subject || "(no subject)";
+    const subject = getResolvedItemSubject() || "(no subject)";
     const fromName  = emailItem.from?.displayName  || "";
     const fromEmail = emailItem.from?.emailAddress || "";
     const fromStr   = [fromName, fromEmail ? `&lt;${fromEmail}&gt;` : ""].filter(Boolean).join(" ");
@@ -6052,9 +7548,23 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   // the email-body page where the email IS the content.
   const fromName  = emailItem?.from?.displayName  || "";
   const fromEmail = emailItem?.from?.emailAddress || "";
+  // Resolve inline (cid:) images so they render on the OneNote page. OneNote can't
+  // read cid: or data: URIs — only public URLs or name: parts backed by binary
+  // parts in a multipart POST. Best-effort: on failure we fall back to the plain
+  // HTML page (images just won't show, exactly like before this change).
+  let oneNoteImgParts = [];
+  let emailBodyForNote = emailBodyHtml;
+  if (!isMeetingNoteCategory(category) && emailBodyHtml && /src\s*=\s*["']cid:/i.test(emailBodyHtml)) {
+    try {
+      const imgs = await getInlineImagesForEmail(await getToken());
+      const r = await rewriteCidToOneNoteParts(emailBodyHtml, imgs);
+      emailBodyForNote = r.html;
+      oneNoteImgParts = r.parts;
+    } catch (e) { console.warn("[OneNote inline-img] resolve failed:", e.message); }
+  }
   const bodyHtml = isMeetingNoteCategory(category)
     ? buildAddinMeetingPageHtml(title, category, dateStr, emailParticipants, body, project)
-    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyHtml, body, project);
+    : buildAddinEmailNotePageHtml(title, category, dateStr, fromName, fromEmail, emailBodyForNote, body, project);
   // toAddinOneNoteCreatedLocal fixes the UTC-as-local rendering bug; fall
   // back to a fresh local timestamp if dateStr is missing or unparseable.
   const createdMeta = toAddinOneNoteCreatedLocal(dateStr) || toAddinOneNoteCreatedLocal(new Date().toISOString()) || new Date().toISOString();
@@ -6074,11 +7584,25 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
   const maxAttempts = 3;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
-      body: pageHtml,
-    });
+    // With inline images, send a multipart create-page (HTML "Presentation" part +
+    // one binary part per image, referenced as name:imgN). Otherwise plain text/html
+    // exactly as before. (Don't set Content-Type for FormData — the browser adds the
+    // multipart boundary.)
+    let res;
+    if (oneNoteImgParts.length) {
+      const form = new FormData();
+      form.append("Presentation", new Blob([pageHtml], { type: "text/html" }));
+      for (const part of oneNoteImgParts) {
+        form.append(part.name, new Blob([part.bytes], { type: part.contentType }), part.name);
+      }
+      res = await fetch(url, { method: "POST", headers: { "Authorization": "Bearer " + token }, body: form });
+    } else {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
+        body: pageHtml,
+      });
+    }
     if (res.ok) {
       const page = await res.json();
       const result = { id: page.id, webUrl: page.links?.oneNoteWebUrl?.href || page.webUrl || "" };
@@ -6108,18 +7632,33 @@ async function doSaveNote() {
   if (!selectedProject) { setStatus("noteStatus", "error", "No project selected."); return; }
   if (saveInFlight) { setStatus("noteStatus", "info", "⏳ Another save is in progress; please wait."); return; }
   const category = document.getElementById("noteCategory").value;
-  const body = document.getElementById("noteBody").value.trim();
+  let body = document.getElementById("noteBody").value.trim();
   const isMeeting = isMeetingNoteCategory(category);
-  // Meeting categories require a typed note body — that's the meeting minutes.
-  // Non-meeting categories use the email body as the OneNote content, so a
-  // typed note becomes optional context above the email body.
+  // Site Visit: fold the "staff on site" field into the top of the body so it
+  // is recorded on the PMS note AND rendered on the OneNote page (which draws
+  // its content from the body). Only read the field for the Site Visit
+  // category so a stale value can't leak onto other note types.
+  const siteVisitStaff = category === "Site Visit"
+    ? (document.getElementById("siteVisitStaff")?.value || "").trim()
+    : "";
+  if (siteVisitStaff) {
+    body = "Staff on site: " + siteVisitStaff + (body ? "\n\n" + body : "");
+  }
+  // Meeting categories require content — either typed minutes or, for a site
+  // visit, the recorded staff. Non-meeting categories use the email body as
+  // the OneNote content, so a typed note is optional context above it.
   if (isMeeting && !body) { setStatus("noteStatus", "error", "Note body is empty."); return; }
 
-  // Snapshot per-item identity SYNCHRONOUSLY before any await. If the user
-  // switches items during the OneNote round-trip, these are the values that
-  // should land on the saved note — not whatever item is selected when the
-  // save completes.
-  const snapItemId = emailItem?.itemId || "";
+  // Snapshot per-item identity AND the project/item SYNCHRONOUSLY before any
+  // await. The OneNote round-trip can run ~45s (retry backoff); during that
+  // window the user can switch projects or emails. Without the snapshots the
+  // note record landed on the NEW project while the OneNote page was created
+  // in the OLD project's notebook, and the page could embed a different
+  // email's body than the note's sourceItemId claims.
+  const snapProject = selectedProject;
+  const snapItem = emailItem;
+  const snapKind = currentItemKind;
+  const snapItemId = snapItem?.itemId || "";
   const snapSharedMsgId = getCurrentSharedMessageId() || "";
   const snapICalUId = currentItemICalUId || "";
   const saveGen = itemContextGeneration;
@@ -6132,7 +7671,7 @@ async function doSaveNote() {
   // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
   let oneNoteErr = "";
-  const notebookId = selectedProject.teamsOneNoteNotebookId || selectedProject.oneNoteNotebookId || "";
+  const notebookId = snapProject.teamsOneNoteNotebookId || snapProject.oneNoteNotebookId || "";
   if (!notebookId) {
     oneNoteErr = "No OneNote notebook linked to this project — create one in the PMS first.";
   } else {
@@ -6141,14 +7680,14 @@ async function doSaveNote() {
         // Use the subject element text as fallback — already resolved even in compose mode
         const subjectEl = document.getElementById("emailSubject").textContent;
         const resolvedSubject = (subjectEl && subjectEl !== "(Loading…)") ? subjectEl : null;
-        const title = (typeof emailItem?.subject === "string" ? emailItem.subject : resolvedSubject)
+        const title = (typeof snapItem?.subject === "string" ? snapItem.subject : resolvedSubject)
           || body.split("\n")[0].slice(0, 80) || category;
 
-        // In compose mode emailItem.start is an async Time object — fall back to now
-        const apptStart = emailItem?.start && !emailItem.start?.getAsync ? emailItem.start : null;
-        const dateStr = currentItemKind === "appointment"
+        // In compose mode snapItem.start is an async Time object — fall back to now
+        const apptStart = snapItem?.start && !snapItem.start?.getAsync ? snapItem.start : null;
+        const dateStr = snapKind === "appointment"
           ? new Date(apptStart || Date.now()).toISOString()
-          : new Date(emailItem?.dateTimeCreated || Date.now()).toISOString();
+          : new Date(snapItem?.dateTimeCreated || Date.now()).toISOString();
 
         // For non-meeting categories, the email body IS the OneNote page
         // content. Fetched once here so embedded data:-URI images and inline
@@ -6159,13 +7698,13 @@ async function doSaveNote() {
         if (!isMeeting) {
           try {
             const token = await getToken();
-            emailBodyHtml = await getEmailBodyHtml(token);
+            emailBodyHtml = await getEmailBodyHtml(token, snapItem);
           } catch (e) {
             console.warn("[note] body fetch failed:", e.message);
           }
         }
 
-        const page = await createAddinOneNotePage(selectedProject, title, body, category, dateStr, emailBodyHtml);
+        const page = await createAddinOneNotePage(snapProject, title, body, category, dateStr, emailBodyHtml);
         oneNoteUrl = page.webUrl || "";
       } catch (e) {
         oneNoteErr = e.message;
@@ -6186,12 +7725,17 @@ async function doSaveNote() {
       ...(snapICalUId ? { sourceCalendarUId: snapICalUId } : {}),
       ...(oneNoteUrl ? { oneNoteUrl } : {}),
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+    await applyLocalChangeAndSave(snapProject.id, fresh => ({
       ...fresh,
       notes: [...(fresh.notes || []), note],
     }));
     // Persist the appointment → project mapping so it auto-restores on next open.
-    setSelectedProject(selectedProject, true);
+    // Only when the user is still on the SAME item (this is what saveGen is
+    // for): the persist path tags the LIVE item's msgId/conversation, so doing
+    // it after an item switch would tag a different email with this project.
+    if (saveGen === itemContextGeneration) {
+      setSelectedProject(snapProject, true);
+    }
     const linkEl = document.getElementById("noteOneNoteLink");
     if (oneNoteUrl) {
       setStatus("noteStatus", "success", "✓ Note saved · OneNote page created");
@@ -6226,12 +7770,42 @@ async function doSaveNote() {
   }
 }
 
+// Clear the note view's transient save state every time it's opened. Without
+// this, the "✓ Note saved" status, the 📓 OneNote link, and the disabled Save
+// button all survive from the previous project — so opening the note view for a
+// new project shows it as already-saved, with a link pointing at the old note.
+// (The sibling RFI/Sub/Action forms avoid this via their own prefill* resets.)
+// The note BODY is intentionally left untouched: it's seeded by loadItemContext
+// from the open email/appointment, and clearing it would wipe text the user may
+// have typed before navigating away.
+// Reveal the "Staff on site visit" field only for the Site Visit category.
+// Called on note-view open and whenever the category dropdown changes.
+function toggleSiteVisitStaffField() {
+  const row = document.getElementById("siteVisitStaffRow");
+  if (!row) return;
+  const cat = document.getElementById("noteCategory")?.value;
+  row.style.display = cat === "Site Visit" ? "" : "none";
+}
+
+function resetNoteView() {
+  setStatus("noteStatus", "", "");
+  const linkEl = document.getElementById("noteOneNoteLink");
+  if (linkEl) linkEl.innerHTML = "";
+  const saveNoteBtn = document.getElementById("saveNoteBtn");
+  if (saveNoteBtn) saveNoteBtn.disabled = false;
+  const staff = document.getElementById("siteVisitStaff");
+  if (staff) staff.value = "";
+  toggleSiteVisitStaffField();
+}
+
 function prefillActionItem() {
   const body = document.getElementById("actionItemBody");
   const ownerSelect = document.getElementById("actionItemOwner");
   const dueDate = document.getElementById("actionItemDueDate");
   const teamMembers = getProjectTeamMembers(selectedProject);
-  if (body) body.value = (emailItem?.subject || "").trim();
+  // getResolvedItemSubject: compose-mode appointments expose subject as an
+  // async object — a raw .trim() on it throws.
+  if (body) body.value = getResolvedItemSubject().trim();
   if (ownerSelect) {
     refreshActionItemOwnerOptions();
     const defaultOwner = [msalAccount?.name, msalAccount?.username, emailFrom]
@@ -6240,6 +7814,11 @@ function prefillActionItem() {
     ownerSelect.value = defaultOwner;
   }
   if (dueDate) dueDate.value = addBizDays(new Date(), 5);
+  // Re-enable the Save button on every entry. doSaveActionItem disables it on
+  // save and only re-enables on error, so without this a second action item
+  // (re-entered via "New action item") would hit a dead button.
+  const saveBtn = document.getElementById("saveActionItemBtn");
+  if (saveBtn) saveBtn.disabled = false;
   setStatus("actionItemStatus", "", "");
 }
 
@@ -6272,9 +7851,9 @@ async function doSaveActionItem() {
       body: actionNoteBody,
       category: "Action Item",
       actionItem: true,
-      owner,
-      dueDate,
-      status: "Open",
+      actionOwner: owner,
+      actionDueDate: dueDate,
+      actionStatus: "open",
       author: msalAccount?.name || msalAccount?.username || "Unknown",
       createdAt,
       updatedAt: createdAt,
@@ -6293,23 +7872,18 @@ async function doSaveActionItem() {
     document.getElementById("actionItemBody").value = "";
     document.getElementById("actionItemOwner").value = "";
     document.getElementById("actionItemDueDate").value = "";
+    // Mirror the note-save flow: after a successful save, return the user to
+    // the main view (where the open-action-item chips now reflect the new
+    // item) instead of stranding them on the entry form. Brief delay so the
+    // success status flashes as confirmation before the view changes.
+    refreshOpenActionItemChips();
+    setTimeout(() => showView("mainView"), 700);
   } catch (e) {
     setStatus("actionItemStatus", "error", "✗ " + humanizeError(e));
     if (saveBtn) saveBtn.disabled = false;
   } finally {
     saveInFlight = false;
   }
-}
-// ─── SHARED: file email+attachments into a project subfolder ─────────────────
-// `itemSnapshot` is the captured Office mailbox item — required to prevent
-// attachment-bytes corruption from item-switch races. Callers MUST capture
-// emailItem synchronously before any await and pass it in here.
-async function uploadEmailUnderFolder(driveId, token, projFolderName, subfolder, recordFolderName, metadata = null, itemSnapshot = null) {
-  const subPath    = await ensureSpFolder(driveId, token, projFolderName, subfolder);
-  const recordPath = await ensureSpFolder(driveId, token, subPath, recordFolderName);
-  await uploadEmailAndAttachments(driveId, token, recordPath, itemSnapshot);
-  if (metadata) await writeSpMetadataSidecar(driveId, token, recordPath, metadata);
-  return SP_BASE_URL + "/" + encodeURIComponent(projFolderName) + "/" + encodeURIComponent(subfolder) + "/" + encodeURIComponent(recordFolderName);
 }
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
 function setRfiMode(mode) {
@@ -6327,15 +7901,18 @@ function setSubMode(mode) {
 function renderRfiPicker() {
   const sel  = document.getElementById("rfiExistingSelect");
   const rfis = selectedProject?.rfis || [];
+  // escHtml on title: RFI titles are prefilled from external email subjects,
+  // which can carry & < > " and corrupt the <option> markup unescaped.
   sel.innerHTML = rfis.length
-    ? rfis.map(r => `<option value="${r.id}">${r.number}${r.title ? " — " + r.title.slice(0, 45) : ""}</option>`).join("")
+    ? rfis.map(r => `<option value="${escHtml(r.id)}">${escHtml(r.number)}${r.title ? " — " + escHtml(r.title.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No RFIs on this project</option>';
 }
 function renderSubPicker() {
   const sel  = document.getElementById("subExistingSelect");
   const subs = selectedProject?.submittals || [];
+  // Same escaping rationale as renderRfiPicker.
   sel.innerHTML = subs.length
-    ? subs.map(s => `<option value="${s.id}">${s.number}${s.description ? " — " + s.description.slice(0, 45) : ""}</option>`).join("")
+    ? subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.number)}${s.description ? " — " + escHtml(s.description.slice(0, 45)) : ""}</option>`).join("")
     : '<option value="">No submittals on this project</option>';
 }
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
@@ -6397,6 +7974,7 @@ function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
     <p>Please review the attached RFI and respond by the due date.</p>
+    <p style="background:#eff6ff;border-left:3px solid #2563eb;padding:8px 12px;margin:12px 0;"><strong>📩 To respond:</strong> reply directly to this email with your answer.</p>
     <p><strong>Project:</strong> ${esc(projLabel)}<br>
        <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
        <strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
@@ -6419,6 +7997,7 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
     <p>Please review the attached submittal and return with stamp/comments by the due date.</p>
+    <p style="background:#f5f3ff;border-left:3px solid #7c3aed;padding:8px 12px;margin:12px 0;"><strong>📩 To return:</strong> reply directly to this email with your stamp + comments.</p>
     <p><strong>Project:</strong> ${esc(projLabel)}<br>
        <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
        <strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
@@ -6485,9 +8064,9 @@ function _docxInfoRow(docxLib, label, value, opts = {}) {
 // responder themselves on the COPIES line. Optional override via opts.
 function _resolveRfiResponseRecipients(rfi, project) {
   const recipients = [];
-  // Original sender: look up in project.emails by sourceItemId/sourceMessageId
+  // Original sender: look up in the filed-email metadata by sourceItemId/sourceMessageId
   if (rfi.sourceItemId || rfi.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
       (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
     );
@@ -6709,7 +8288,10 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
       width: { size: w, type: WidthType.DXA },
       children: [new Paragraph({ spacing: { before: 30, after: 30 }, children: [new TextRun({ text: String(text || ""), font: "Calibri", size: 20 })] })],
     });
-    const docxFileName = `${rfiId} Response ${dateSent.replace(/-/g, "")}.pdf`;
+    // Must match the ACTUAL uploaded artifact (submitRfiResponse's safeName) —
+    // this table is an auditable transmittal record; it used to reference a
+    // "<id> Response <date>.pdf" that never existed.
+    const docxFileName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
     return new Table({
       width: { size: 9360, type: WidthType.DXA },
       columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -6848,7 +8430,7 @@ async function buildRfiResponseDocx({ rfi, project, response, dateResponded, sta
 function _resolveSubReviewRecipients(sub, project) {
   const recipients = [];
   if (sub.sourceItemId || sub.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
       (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
     );
@@ -7015,7 +8597,9 @@ async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned,
   }
   const toTable = new Table({ width: { size: 9360, type: WidthType.DXA }, columnWidths: [2200, 2200, 3300, 1660], rows: toRows });
 
-  const docxFileName = `${subId} Review ${dateSent.replace(/-/g, "")}.pdf`;
+  // Must match the ACTUAL uploaded artifact (submitSubReview's safeName) —
+  // same audit-record rationale as the RFI transmittal table.
+  const docxFileName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
   const contentsTable = new Table({
     width: { size: 9360, type: WidthType.DXA },
     columnWidths: [800, 1400, 3760, 1100, 1100, 1200],
@@ -7236,7 +8820,9 @@ function defaultAssigneeToPm(selectId) {
 }
 
 function prefillRfi() {
-  document.getElementById("rfiTitle").value = emailItem?.subject || "";
+  // getResolvedItemSubject guards against the compose-mode async Subject object
+  // (a raw emailItem.subject here saved "[object Object]" as the RFI title).
+  document.getElementById("rfiTitle").value = getResolvedItemSubject();
   document.getElementById("rfiNumber").value = nextAutoRfiNumber();
   document.getElementById("rfiDescription").value = "";
   document.getElementById("rfiNotes").value = "";
@@ -7417,7 +9003,13 @@ async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath,
   const datePart = dateObj.getFullYear() + "-" +
                    String(dateObj.getMonth() + 1).padStart(2, "0") + "-" +
                    String(dateObj.getDate()).padStart(2, "0");
-  const subject = (snapItem?.subject || "Email")
+  // snapItem.subject can be an async Subject object on compose-mode
+  // appointments — an unguarded .replace() here crashed mid-RFI-filing AFTER
+  // the folder tree was created. Fall back to the resolved live subject.
+  const rawSubject = (typeof snapItem?.subject === "string")
+    ? snapItem.subject
+    : getResolvedItemSubject();
+  const subject = (rawSubject || "Email")
     .replace(/[\\/:*?"<>|]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
@@ -7582,9 +9174,9 @@ async function submitRfiResponse() {
 // { email, name } or null.
 function _guessEmailForRfi(rfi, project) {
   // If the original was logged from an email, we may have its from-address on
-  // the email record. The project.emails array has msgId → from/fromAddress.
+  // the email record. Filed-email metadata rows have msgId → from/fromAddress.
   if (rfi.sourceItemId || rfi.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (rfi.sourceItemId && e.msgId === rfi.sourceItemId) ||
       (rfi.sourceMessageId && e.msgId === rfi.sourceMessageId)
     );
@@ -7681,7 +9273,7 @@ function _buildRfiResponseEmailHtml({ rfi, project, response, dateResponded, out
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
     <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
     ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 RFI Response folder (OUT) — cover sheet DOCX</a></p>` : ""}
-    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original RFI folder (IN)</a></p>` : ""}
+    ${""/* client does not need a link back to what they sent — IN folder still created, just not linked here */}
   ` : ""}
 
 </div>
@@ -7785,7 +9377,8 @@ function nextAutoSubNumber() {
 }
 
 function prefillSub() {
-  document.getElementById("subDesc").value = emailItem?.subject || "";
+  // Same compose-mode guard as prefillRfi.
+  document.getElementById("subDesc").value = getResolvedItemSubject();
   document.getElementById("subNumber").value = nextAutoSubNumber();
   document.getElementById("subFullDescription").value = "";
   document.getElementById("subNotes").value = "";
@@ -7929,6 +9522,27 @@ async function doSaveSub() {
     }
   );
 }
+
+// "Log" vs "Log & add another": a single transmittal email often carries several
+// RFIs/Subs. doSaveRfi/doSaveSub return the filing result on success (undefined on a
+// validation bail or error) and leave the form cleared but on-screen. So on a plain
+// Log we return to the main view; on "& add another" we stay put, re-seed the next
+// auto-number, and nudge for the next entry. One source email → many artifacts.
+async function saveArtifactThen(kind, another) {
+  const isRfi = kind === "rfi";
+  const r = isRfi ? await doSaveRfi() : await doSaveSub();
+  if (!r) return; // validation failed or save errored — stay on the form, keep input
+  if (another) {
+    const numEl = document.getElementById(isRfi ? "rfiNumber" : "subNumber");
+    if (numEl) numEl.value = isRfi ? nextAutoRfiNumber() : nextAutoSubNumber();
+    const statusId = isRfi ? "rfiStatus" : "subStatus";
+    const noun = isRfi ? "RFI" : "submittal";
+    setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
+  } else {
+    try { setStatus("actionStatus", "success", r.successMessage || "✓ Logged."); } catch {}
+    showView("mainView");
+  }
+}
 // ─── LOG SUBMITTAL REVIEW ────────────────────────────────────────────────────
 let _activeReviewSubId = "";
 function openSubReviewView(subId) {
@@ -8052,7 +9666,7 @@ async function submitSubReview() {
 
 function _guessEmailForSub(sub, project) {
   if (sub.sourceItemId || sub.sourceMessageId) {
-    const emailRec = (project.emails || []).find(e =>
+    const emailRec = _emailRowsFor(project).find(e =>
       (sub.sourceItemId && e.msgId === sub.sourceItemId) ||
       (sub.sourceMessageId && e.msgId === sub.sourceMessageId)
     );
@@ -8143,7 +9757,7 @@ function _buildSubReviewEmailHtml({ sub, project, stamp, comments, dateReturned,
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:18px 0">
     <p style="margin:6px 0; font-weight:bold;">Transferred Files / Links</p>
     ${outFolderUrl ? `<p style="margin:4px 0"><a href="${esc(outFolderUrl)}">📁 Submittal Review folder (OUT) — cover sheet DOCX</a></p>` : ""}
-    ${inFolderUrl  ? `<p style="margin:4px 0"><a href="${esc(inFolderUrl)}">📁 Original submittal folder (IN)</a></p>` : ""}
+    ${""/* client does not need a link back to what they sent — IN folder still created, just not linked here */}
   ` : ""}
 
 </div>
@@ -8210,8 +9824,11 @@ async function getNYCCalendarId() {
   try {
     const token = await getToken();
     const data  = await graphFetch("GET", "/me/calendars?$top=50", null, token);
+    // (c.name || ""): one null-named calendar in the list used to throw inside
+    // this swallowed try → null return → milestones silently landed on the
+    // user's PERSONAL calendar while the UI implied the shared one.
     const nyc   = (data?.value || []).find(c =>
-      c.name.toLowerCase().includes("nyc") || c.name.toLowerCase().includes("shared")
+      (c.name || "").toLowerCase().includes("nyc") || (c.name || "").toLowerCase().includes("shared")
     );
     if (nyc) {
       _nycCalendarId = nyc.id;
@@ -8225,7 +9842,7 @@ async function createMilestoneCalendarEvent(milestone, project) {
   const endD = new Date(milestone.dueDate + "T12:00:00");
   endD.setDate(endD.getDate() + 1);
   const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
-  const prefix  = project.projectNumber ? "[" + project.projectNumber + "] " : "";
+  const prefix  = project.projectNumber ? project.projectNumber + " " : "";
   const subject = prefix + project.name + " — " + milestone.name;
   const pmName  = (project.settyPm || "").trim();
   const event = {
@@ -8265,6 +9882,40 @@ async function createMilestoneCalendarEvent(milestone, project) {
   } catch(e) {
     return { success: false, error: e.message };
   }
+}
+// Create OR move a milestone's NYC-shared calendar event to its dueDate, from pure
+// milestone data (no email body — unlike createMilestoneCalendarEvent, which files
+// FROM an email). Used by the billable-schedule editor. Returns {success, eventId}.
+async function syncMilestoneCalendar(milestone, project) {
+  if (!milestone.dueDate) return { success: false, error: "no due date" };
+  try {
+    const endD = new Date(milestone.dueDate + "T12:00:00");
+    endD.setDate(endD.getDate() + 1);
+    const endStr = endD.getFullYear() + "-" + String(endD.getMonth()+1).padStart(2,"0") + "-" + String(endD.getDate()).padStart(2,"0");
+    const start = { dateTime: milestone.dueDate + "T00:00:00", timeZone: "Eastern Standard Time" };
+    const end   = { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" };
+    const token = await getToken();
+    const calId = await getNYCCalendarId();
+    if (milestone.calendarEventId) {
+      // Move the existing event in place — keep its subject/body, just shift dates.
+      const path = (calId ? "/me/calendars/" + calId + "/events/" : "/me/events/") + milestone.calendarEventId;
+      await graphFetch("PATCH", path, { isAllDay: true, start, end }, token);
+      return { success: true, eventId: milestone.calendarEventId };
+    }
+    const prefix = project.projectNumber ? project.projectNumber + " " : "";
+    const pmName = (project.settyPm || "").trim();
+    const event = {
+      subject: prefix + project.name + " — " + milestone.name,
+      isAllDay: true,
+      ...(pmName ? { location: { displayName: "PM: " + pmName } } : {}),
+      isReminderOn: false,
+      start, end,
+      categories: ["PMS Milestone"],
+    };
+    const path = calId ? "/me/calendars/" + calId + "/events" : "/me/events";
+    const res = await graphFetch("POST", path, event, token);
+    return { success: true, eventId: res?.id };
+  } catch (e) { return { success: false, error: e.message }; }
 }
 // ─── DUE DATE EXTRACTOR ───────────────────────────────────────────────────────
 // Strip Outlook reply chains so we don't surface dates from older messages
@@ -8451,9 +10102,9 @@ function extractDueDates(rawText, emailReceivedDate) {
     return a.iso.localeCompare(b.iso);
   });
 }
-function escHtml(s) {
-  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-}
+// (A duplicate, weaker escHtml used to live here — function-declaration
+// hoisting made it silently WIN over the 5-char version defined earlier,
+// removing single-quote escaping file-wide. Deleted; one escHtml now.)
 async function showDatesView() {
   showView("datesView");
   document.getElementById("milestoneForm").style.display = "none";
@@ -8487,15 +10138,123 @@ async function showDatesView() {
 }
 function prefillMilestone(iso) {
   document.getElementById("milestoneDate").value = iso;
-  document.getElementById("milestoneName").value = (emailItem?.subject || "").slice(0, 80);
+  document.getElementById("milestoneName").value = getResolvedItemSubject().slice(0, 80);
   document.getElementById("milestoneStatus").className = "status-msg";
   document.getElementById("milestoneStatus").textContent = "";
   const form = document.getElementById("milestoneForm");
   form.style.display = "block";
   form.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
+// ── Billable schedule (add-in) ───────────────────────────────────────────────
+// Lists the project's billable milestones below New Milestone and lets the user
+// adjust due date + % complete (fee is read-only — editing fee amounts belongs to
+// the PMS fee-schedule lock). A manual date edit pins dueDateManual so a later PMS
+// rebuild won't clobber it, matching the PMS convention.
+function renderBillableSchedule() {
+  const body = document.getElementById("billableScheduleBody");
+  if (!body) return;
+  const ms = selectedProject
+    ? (selectedProject.milestones || []).filter(m => m.type === "billable" && !m.cancelled)
+    : [];
+  if (ms.length === 0) {
+    body.innerHTML = `<p style="color:var(--text-soft);font-size:12px;margin:0;">No billable milestones. Finalize the fee schedule in PMS first.</p>`;
+    return;
+  }
+  ms.sort((a, b) => String(a.dueDate || "").localeCompare(String(b.dueDate || "")));
+  const inStyle = "background:var(--bg);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);padding:4px 6px;font-size:12px;margin:0;";
+  body.innerHTML = ms.map(m => {
+    const idAttr = String(m.id).replace(/"/g, "&quot;");
+    const name = String(m.name || m.phase || "Billable").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const fee = m.fee ? "$" + Number(m.fee).toLocaleString() : "";
+    const pct = Number(m.pctComplete || 0);
+    const due = m.dueDate || "";
+    return `<div data-mid="${idAttr}" style="margin-bottom:8px;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;">
+      <div style="font-size:12px;font-weight:600;color:var(--text);margin-bottom:6px;">${name}${fee ? ` <span style="color:var(--success);font-weight:700;">${fee}</span>` : ""}</div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <label style="font-size:11px;color:var(--text-soft);display:flex;align-items:center;gap:4px;">Due <input type="date" data-field="dueDate" value="${due}" style="width:140px;${inStyle}"/></label>
+        <label style="font-size:11px;color:var(--text-soft);display:flex;align-items:center;gap:4px;">% Complete <input type="number" min="0" max="100" step="5" data-field="pctComplete" value="${pct}" style="width:64px;${inStyle}"/></label>
+      </div>
+    </div>`;
+  }).join("");
+  body.onchange = (ev) => {
+    const input = ev.target.closest("input[data-field]");
+    if (!input) return;
+    const row = input.closest("[data-mid]");
+    const mid = row && row.getAttribute("data-mid");
+    if (!mid) return;
+    const field = input.getAttribute("data-field");
+    let value = input.value;
+    if (field === "pctComplete") value = Math.max(0, Math.min(100, Number(value) || 0));
+    void saveBillableMilestoneField(mid, field, value);
+  };
+}
+async function saveBillableMilestoneField(mid, field, value) {
+  if (!selectedProject || !mid) return;
+  if (saveInFlight) { setStatus("billableScheduleStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
+  setStatus("billableScheduleStatus", "info", "⏳ Saving…");
+  try {
+    // Save the field FIRST, then sync the calendar. The old order created the
+    // event before the save — a save failure (version conflict during sweep
+    // churn) lost the fresh eventId, so the next date edit created a DUPLICATE
+    // event on the firm-wide NYC calendar instead of moving the first one.
+    if (field === "dueDate") setStatus("billableScheduleStatus", "info", "⏳ Saving + syncing calendar…");
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      milestones: (fresh.milestones || []).map(m =>
+        m.id === mid
+          ? { ...m, [field]: value, ...(field === "dueDate" ? { dueDateManual: true } : {}) }
+          : m),
+    }));
+    let calNote = "";
+    if (field === "dueDate" && value) {
+      // selectedProject was refreshed by the save above, so this milestone
+      // already carries the new date (and its calendarEventId if it has one).
+      const m = (selectedProject.milestones || []).find(x => x.id === mid) || {};
+      const calRes = await syncMilestoneCalendar(m, selectedProject);
+      calNote = calRes.success ? " · calendar synced" : " · calendar sync failed";
+      if (calRes.success && calRes.eventId && !m.calendarEventId) {
+        // New event — record its id so future edits MOVE it instead of
+        // creating another. Best-effort: the milestone itself is saved.
+        try {
+          await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+            ...fresh,
+            milestones: (fresh.milestones || []).map(x =>
+              x.id === mid ? { ...x, calendarEventId: calRes.eventId } : x),
+          }));
+        } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+      }
+    }
+    setStatus("billableScheduleStatus", "success", "✓ Updated" + calNote + ".");
+  } catch (e) {
+    setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
+    renderBillableSchedule(); // revert inputs to last saved state
+  } finally {
+    saveInFlight = false;
+  }
+}
+function toggleBillableSchedule() {
+  const body = document.getElementById("billableScheduleBody");
+  const toggle = document.getElementById("billableScheduleToggle");
+  if (!body || !toggle) return;
+  const isOpen = body.style.display !== "none";
+  if (isOpen) {
+    body.style.display = "none";
+    toggle.textContent = "▸ Billable Schedule";
+  } else {
+    renderBillableSchedule();
+    body.style.display = "block";
+    toggle.textContent = "▾ Billable Schedule";
+  }
+}
+
 function showManualMilestoneForm() {
   showView("datesView");
+  // Billable schedule starts collapsed each time (clutter-free); expand to edit.
+  const _bsBody = document.getElementById("billableScheduleBody");
+  const _bsTog = document.getElementById("billableScheduleToggle");
+  if (_bsBody) _bsBody.style.display = "none";
+  if (_bsTog) _bsTog.textContent = "▸ Billable Schedule";
   const list = document.getElementById("datesList");
   if (list) list.innerHTML = '<p style="color:#64748b;font-size:12px;text-align:center;padding:16px 0;">Manual mode: enter milestone details below.</p>';
   const defaultDate = new Date();
@@ -8524,20 +10283,34 @@ async function doSaveMilestone() {
       dueDate,
       pctComplete: 0,
       fee:         0,
-      notes:       "From email: " + (emailItem?.subject || ""),
+      notes:       "From email: " + getResolvedItemSubject(),
       cancelled:   false,
       ...(emailItem?.itemId ? { sourceItemId: emailItem.itemId } : {}),
       ...(getCurrentSharedMessageId() ? { sourceMessageId: getCurrentSharedMessageId() } : {}),
     };
-    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
-    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
-    if (calResult.success) milestone.calendarEventId = calResult.eventId;
-
+    // Save FIRST, then create the calendar event, then patch the eventId in.
+    // The old order (event first) meant a save failure + user retry produced
+    // duplicate all-day events on the firm-wide NYC calendar.
     setStatus("milestoneStatus", "info", "⏳ Saving to project…");
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       milestones: [...(fresh.milestones || []), milestone],
     }));
+
+    setStatus("milestoneStatus", "info", "⏳ Syncing to calendar…");
+    const calResult = await createMilestoneCalendarEvent(milestone, selectedProject);
+    if (calResult.success && calResult.eventId) {
+      milestone.calendarEventId = calResult.eventId;
+      // Best-effort: record the event id so later date edits MOVE this event
+      // rather than creating another. The milestone itself is already saved.
+      try {
+        await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+          ...fresh,
+          milestones: (fresh.milestones || []).map(m =>
+            m.id === milestone.id ? { ...m, calendarEventId: calResult.eventId } : m),
+        }));
+      } catch (e2) { console.warn("milestone eventId patch failed:", e2.message); }
+    }
 
     const projLabel = (selectedProject.projectNumber ? selectedProject.projectNumber + " — " : "") + selectedProject.name;
     const pep = pickQuip(NEW_MILESTONE_QUIPS);
@@ -9190,7 +10963,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","actionItemView","rfiView","subView","datesView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","actionItemView","rfiView","subView","rfiResponseView","subReviewView","datesView","peopleView","contactView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
