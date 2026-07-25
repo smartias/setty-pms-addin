@@ -11008,7 +11008,7 @@ function humanizeError(err) {
   console.warn("[error shown to user]", raw);
   const m = raw.toLowerCase();
   if (m.includes("graph 401") || m.includes("interaction_required") || m.includes("login_required") || m.includes("not signed in"))
-    return "Your session expired — sign out (⋯ menu) and back in, then retry.";
+    return "Your session expired — open \"More actions\" at the bottom of the pane, click Sign out, then sign back in and retry.";
   if (m.includes("graph 403"))
     return "You don't have permission for that SharePoint location — check your access with IT.";
   if (m.includes("graph 404"))
