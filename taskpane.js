@@ -458,6 +458,7 @@ function loadItemContext() {
   // Bump the generation. All async work below captures `myGen` at start and
   // bails out before writing module state if the generation has advanced
   // (= user clicked a different email mid-fetch).
+  hideUntagPrompt(); // a remove-logged-email offer is only valid for the email it was shown on
   itemContextGeneration++;
   const myGen = itemContextGeneration;
   emailItem = Office.context.mailbox.item;
@@ -2942,6 +2943,13 @@ function refreshActionItemOwnerOptions() {
   if (previous && teamMembers.includes(previous)) ownerSelect.value = previous;
 }
 async function clearProjectTagForCurrentEmail() {
+  // Snapshot BEFORE any await: the prompt/removal below must act on the email
+  // and project the user was looking at when they clicked ✕, not whatever is
+  // current after the shared-tag round-trip (same race family as the
+  // itemContextGeneration guards).
+  hideUntagPrompt();
+  const prevProject = selectedProject;
+  const recMsgId = getCurrentMessageRecordId();
   const msgId = getCurrentMessageRestId();
   if (msgId) {
     const map = getEmailProjectMap();
@@ -2962,7 +2970,87 @@ async function clearProjectTagForCurrentEmail() {
     await clearSharedConversationProjectTag(sharedKey);
   }
   setSelectedProject(null, false);
-  setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project.");
+  const filed = (recMsgId && prevProject && _autoFiledLog[recMsgId] &&
+                 _autoFiledLog[recMsgId].projectId === prevProject.id) ? _autoFiledLog[recMsgId] : null;
+  if (filed) {
+    showUntagRemovePrompt(filed, recMsgId);
+  } else {
+    setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project.");
+  }
+}
+
+// Un-tag follow-up: offer to also remove the record the tag auto-created.
+// Inline buttons, NOT window.confirm — some Outlook webviews suppress native
+// dialogs. Only offered for auto-files recorded this session (see _autoFiledLog).
+function showUntagRemovePrompt(filed, recMsgId) {
+  const area = document.getElementById("untagPromptArea");
+  if (!area) { setStatus("actionStatus", "info", "Project tag cleared. Search and select the correct project."); return; }
+  setStatus("actionStatus", "", "");
+  area.innerHTML = "";
+  const box = document.createElement("div");
+  box.style.cssText = "margin:8px 0;padding:10px 12px;border:1px solid #edebe9;border-left:3px solid #0078d4;border-radius:4px;background:#faf9f8;font-size:12.5px;line-height:1.45;";
+  const txt = document.createElement("div");
+  txt.textContent = 'Also remove the email logged to "' + (filed.projectName || "this project") + '"? It was filed automatically when the tag was set.';
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;";
+  const yes = document.createElement("button");
+  yes.className = "btn btn-secondary";
+  yes.style.minHeight = "32px";
+  yes.textContent = "🗑 Remove logged email";
+  yes.onclick = async () => {
+    hideUntagPrompt();
+    setStatus("actionStatus", "info", "⏳ Removing logged email…");
+    try {
+      await removeAutoFiledEmail(filed.projectId, recMsgId);
+      delete _autoFiledLog[recMsgId];
+      setStatus("actionStatus", "success", "✓ Tag cleared and logged email removed. Search and select the correct project.");
+    } catch (e) {
+      setStatus("actionStatus", "error", "✗ Tag cleared, but the logged email could not be removed (" + humanizeError(e) + "). Delete it from that project's Emails tab in PMS.");
+    }
+  };
+  const no = document.createElement("button");
+  no.className = "btn btn-ghost";
+  no.style.minHeight = "32px";
+  no.textContent = "Keep it";
+  no.onclick = () => {
+    hideUntagPrompt();
+    setStatus("actionStatus", "info", 'Tag cleared. The email stays logged to "' + (filed.projectName || "the project") + '" — remove it from the PMS Emails tab if that was a mis-tap.');
+  };
+  row.appendChild(yes);
+  row.appendChild(no);
+  box.appendChild(txt);
+  box.appendChild(row);
+  area.appendChild(box);
+  area.style.display = "block";
+}
+function hideUntagPrompt() {
+  const area = document.getElementById("untagPromptArea");
+  if (area) { area.style.display = "none"; area.innerHTML = ""; }
+}
+
+// Deletes exactly what the quiet auto-save created: the inline project.emails[]
+// entry and the pms_project_emails index row for (projectId, msgId). SharePoint
+// artifacts are never touched — only the explicit Save-to-SharePoint flow
+// creates those, and it is not part of auto-filing.
+async function removeAutoFiledEmail(projectId, msgId) {
+  await applyLocalChangeAndSave(projectId, fresh => {
+    const list = fresh.emails || [];
+    const next = list.filter(e => !(e && e.msgId === msgId));
+    return next.length === list.length ? fresh : { ...fresh, emails: next };
+  });
+  const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE +
+    "?project_id=eq." + encodeURIComponent(projectId) + "&msg_id=eq." + encodeURIComponent(msgId), {
+    method: "DELETE",
+    headers: { ...SB_HEADERS },
+  }, { label: "sb project_emails delete" });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error("pms_project_emails DELETE HTTP " + res.status + ": " + errText.slice(0, 150));
+  }
+  // Refresh the filed-email metadata cache so the saved-indicator and the
+  // auto-save dedup gate stop seeing the removed record.
+  try { await ensureProjectEmailMeta(projectId, { force: true }); } catch (e) { /* cache self-heals on TTL */ }
+  refreshEmailSavedIndicator();
 }
 
 // ── JOBCARD ──────────────────────────────────────────────────────────────────
@@ -3157,6 +3245,12 @@ function setSelectedProject(project, persistForEmail = false) {
 // no "save to record" click needed (capture everything; the SharePoint button is
 // still used to file attachments down). Read-mode + dedup guarded.
 let _autoSavingMsgId = null; // in-flight guard so rapid restores don't double-save
+// Session log of quiet auto-files (msgId → {projectId, projectName, at}) so
+// clearing a tag can offer to remove the record it auto-created. In-memory on
+// purpose: after a pane reload there is no reliable "I auto-filed this" signal
+// (the email-meta cache doesn't carry saved_by), and we'd rather skip the offer
+// than risk deleting a record a colleague filed deliberately.
+const _autoFiledLog = Object.create(null);
 async function autoSaveEmailToRecord() {
   try {
     if (!selectedProject) return;
@@ -7337,7 +7431,8 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       savedBy: _getCurrentUserEmail() || "",
       savedToSharePoint: false,
     };
-    await applyLocalChangeAndSave(selectedProject.id, fresh => {
+    const projAtSave = selectedProject; // pin the target; selectedProject can change during the awaits below
+    await applyLocalChangeAndSave(projAtSave.id, fresh => {
       // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
       // uniqueness: if this email was filed here since our pane last synced
       // (another user, or a prior auto-save), don't append a second copy.
@@ -7346,7 +7441,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     });
     let indexSaveFailed = false;
     try {
-      await saveProjectEmailRow(selectedProject.id, emailRecord, false);
+      await saveProjectEmailRow(projAtSave.id, emailRecord, false);
     } catch (idxErr) {
       console.warn("saveProjectEmailRow failed:", idxErr);
       indexSaveFailed = true;
@@ -7362,6 +7457,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     if (!quiet) recordSaveAndCelebrate();
     refreshEmailSavedIndicator(!quiet);
     ok = true;
+    if (quiet) _autoFiledLog[msgId] = { projectId: projAtSave.id, projectName: projAtSave.name || "", at: Date.now() };
   } catch (e) {
     if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     else console.warn("auto-save record failed:", e);
