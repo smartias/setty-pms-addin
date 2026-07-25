@@ -1024,7 +1024,12 @@
         <input type="text" id="sweepProject" autocomplete="off" spellcheck="false"
           placeholder="Limit to one project? type its number or name (blank = all projects)"
           style="width:100%;box-sizing:border-box;margin:0 0 4px;padding:3px 6px;font-size:11px;color:#444;border:1px solid #ddd;border-radius:3px;" />
+        <!-- Rehydrate banner: a pane reload used to silently discard the in-memory
+             review queue; taskpane.js persists it per-mailbox and offers a resume here. -->
+        <div id="sweepResumeBanner" style="display:none;font-size:12px;color:#444;background:#f0f6ff;border:1px solid #c7ddf5;border-radius:3px;padding:5px 6px;margin:4px 0;"></div>
         <div id="sweepStatus" style="font-size:12px;color:#666;margin:4px 0;"></div>
+        <!-- Shown while a run is in progress — a pane unload kills the run silently. -->
+        <div id="sweepRunNote" style="display:none;font-size:11px;color:#8a6d1a;background:#fff8e1;border:1px solid #f0e0a0;border-radius:3px;padding:4px 6px;margin:2px 0 4px;">⏳ Keep this pane open until the run finishes — Stop is safe anytime.</div>
         <div id="sweepResults" style="max-height:280px;overflow:auto;"></div>
         <button type="button" id="sweepMoreBtn" class="watchlist-refresh" style="display:none;width:100%;margin-top:6px;" title="Scan and file the next batch from this mailbox">⬇️ Load more from this mailbox</button>
       </div>
@@ -1341,6 +1346,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-07-25-ux-wave1"></script>
+<script src="taskpane.js?v=2026-07-25-ux-wave2-sweep-persist"></script>
 </body>
 </html>

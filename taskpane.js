@@ -232,6 +232,8 @@ function setupEventListeners() {
   if (sweepClearBtn) sweepClearBtn.onclick = () => sweepClearResults();
   const sweepMoreBtn = document.getElementById("sweepMoreBtn");
   if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
+  // A previous session's review queue may be waiting in localStorage — offer a resume.
+  sweepCheckStoredReview();
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   const linkArtifactBtn = document.getElementById("linkArtifactBtn");
@@ -3885,6 +3887,105 @@ let _sweepReview = []; // ambiguous items awaiting confirm after a Run & file
 const sweepEsc = (s) => String(s == null ? "" : s)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+// ── Review-queue persistence ─────────────────────────────────────────────────
+// A pane reload (unpin, Outlook restart, WebView recycle) used to silently
+// discard the whole triage queue after a big Run-to-end. The queue is now
+// mirrored to localStorage, keyed per target mailbox, as SLIM rows carrying
+// only what renderSweepReviewQueue + sweepFileItems actually use. All storage
+// access is try/catch'd — if localStorage is unavailable/full we degrade
+// silently to the old in-memory-only behavior.
+const SWEEP_REVIEW_STORE_PREFIX = "pms_sweep_review::";
+const SWEEP_REVIEW_STORE_MAX = 500; // cap stored rows so one giant run can't blow the quota
+let _sweepReviewStoreKey = null;    // key for the CURRENT queue's mailbox; null until a run/restore sets it
+
+// "/me" runs share one bucket ("self"); a colleague's mailbox gets its own.
+function sweepReviewKeyFor(mb) {
+  return SWEEP_REVIEW_STORE_PREFIX +
+    (mb && mb.shared ? String(mb.label || "").trim().toLowerCase() : "self");
+}
+// Slim a review item to the fields render + filing use — drop anything bulky
+// and normalize the transient "filing" spinner state back to actionable.
+function sweepSlimReviewItem(e) {
+  return {
+    gid: e.gid, convId: e.convId || "", msgId: e.msgId,
+    subject: e.subject, from: e.from, fromAddress: e.fromAddress || "",
+    to: e.to || "", cc: e.cc || "", date: e.date || "",
+    hasAttachments: !!e.hasAttachments,
+    _src: e._src ? { base: e._src.base, shared: !!e._src.shared } : null,
+    candidates: (e.candidates || []).filter((c) => c && c.project).map((c) => ({
+      score: c.score,
+      project: { id: c.project.id, name: c.project.name || "", projectNumber: c.project.projectNumber || "" },
+    })),
+    _filedTo: (e._filedTo || []).map((f) => ({ id: f.id, name: f.name })),
+    _done: e._done === "filing" ? null : (e._done || null),
+  };
+}
+// Write-through mirror of _sweepReview. Called after every queue change (the
+// tail of renderSweepReviewQueue — every mutation path re-renders). Clears the
+// key once nothing is left to triage.
+function sweepPersistReview() {
+  if (!_sweepReviewStoreKey) return;
+  try {
+    const rows = _sweepReview
+      .filter((e) => e && e._done !== "skip")
+      .slice(0, SWEEP_REVIEW_STORE_MAX)
+      .map(sweepSlimReviewItem);
+    const pending = rows.filter((e) => !e._done && !(e._filedTo && e._filedTo.length)).length;
+    if (!pending) { localStorage.removeItem(_sweepReviewStoreKey); return; }
+    localStorage.setItem(_sweepReviewStoreKey, JSON.stringify({ v: 1, savedAt: new Date().toISOString(), rows }));
+  } catch (err) { /* storage unavailable/full — stay in-memory only */ }
+}
+// Pane-load check: if a stored queue with pending items exists, offer a resume
+// banner in the sweep block. Empty/unparseable leftovers are tidied up here.
+function sweepCheckStoredReview() {
+  const banner = document.getElementById("sweepResumeBanner");
+  if (!banner) return;
+  let key = null, rows = null;
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf(SWEEP_REVIEW_STORE_PREFIX) === 0) keys.push(k);
+    }
+    for (const k of keys) {
+      let parsed = null;
+      try { parsed = JSON.parse(localStorage.getItem(k) || ""); } catch (_) {}
+      const r = parsed && Array.isArray(parsed.rows) ? parsed.rows : null;
+      const pending = r ? r.filter((e) => e && !e._done && !(e._filedTo && e._filedTo.length)).length : 0;
+      if (!pending) { try { localStorage.removeItem(k); } catch (_) {} continue; } // stale leftover — tidy
+      if (!key) { key = k; rows = r; } // first mailbox with pending items wins
+    }
+  } catch (err) { return; } // storage unavailable — no banner
+  if (!key) { banner.style.display = "none"; return; }
+  const pending = rows.filter((e) => e && !e._done && !(e._filedTo && e._filedTo.length)).length;
+  const mbTag = key.slice(SWEEP_REVIEW_STORE_PREFIX.length);
+  const whose = mbTag === "self" ? "your last sweep" : "your last sweep of " + sweepEsc(mbTag);
+  banner.innerHTML =
+    "📋 Resume review — <b>" + pending + "</b> email" + (pending === 1 ? "" : "s") +
+    " from " + whose + " await" + (pending === 1 ? "s" : "") + " triage " +
+    '<button type="button" id="sweepResumeBtn" class="watchlist-refresh" style="margin-left:4px;">Resume</button> ' +
+    '<button type="button" id="sweepResumeDiscard" class="watchlist-refresh" title="Forget the saved queue — emails already filed stay safe">Discard</button>';
+  banner.style.display = "";
+  const resume = document.getElementById("sweepResumeBtn");
+  if (resume) resume.onclick = () => {
+    if (_sweepAutoRunning) return; // never swap the queue out from under a live run
+    _sweepReviewStoreKey = key;
+    // _restored marks rows whose emails may have moved/been deleted since the
+    // sweep — sweepConfirmReview drops them (instead of endless retries) if
+    // filing keeps failing.
+    _sweepReview = rows.map((e) => ({ ...e, _done: e._done === "filing" ? null : (e._done || null), _restored: true }));
+    banner.style.display = "none";
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent = "📋 Restored " + pending + " review item" + (pending === 1 ? "" : "s") + " from your last sweep.";
+    renderSweepReviewQueue();
+  };
+  const discard = document.getElementById("sweepResumeDiscard");
+  if (discard) discard.onclick = () => {
+    try { localStorage.removeItem(key); } catch (_) {}
+    banner.style.display = "none";
+  };
+}
+
 // ── Mailbox source resolution ────────────────────────────────────────────────
 // Empty field (or your own address) → "/me"; a colleague's address → "/users/{addr}"
 // so the same scan code can target a departed PM's shared mailbox.
@@ -4203,7 +4304,14 @@ async function sweepRunAndFile(reset = true) {
   if (moreBtn) moreBtn.disabled = true;
   if (statusEl) statusEl.textContent = reset ? "⏳ Scanning and filing confident matches…" : "⏳ Loading the next batch…";
   try {
-    if (reset) _sweepReview = [];
+    if (reset) {
+      _sweepReview = [];
+      // Fresh run: point the persisted mirror at THIS run's mailbox and retire
+      // any resume offer — the new run supersedes the stored queue.
+      _sweepReviewStoreKey = sweepReviewKeyFor(sweepResolveMailbox());
+      const banner = document.getElementById("sweepResumeBanner");
+      if (banner) banner.style.display = "none";
+    }
     const r = await sweepResolveScan(reset);
     // Snapshot the scan source onto every item — review items can be confirmed
     // after the mailbox box changes, and must file from where they were found.
@@ -4246,6 +4354,11 @@ function _setSweepAutoUI(running) {
   }
   const stop = document.getElementById("sweepStopBtn");
   if (stop) stop.style.display = running ? "" : "none";
+  // While a run is going, warn that a pane unload kills it silently (same
+  // failure family as the discarded review queue). Cleared by every finally
+  // path that calls _setSweepAutoUI(false).
+  const note = document.getElementById("sweepRunNote");
+  if (note) note.style.display = running ? "" : "none";
 }
 
 // Clear the on-screen sweep results + review list and reset the batch cursor, WITHOUT
@@ -4254,6 +4367,7 @@ function _setSweepAutoUI(running) {
 function sweepClearResults() {
   if (_sweepAutoRunning) return; // never yank state out from under a live run
   _sweepReview = [];
+  sweepPersistReview(); // empty queue → clears the stored mirror for this mailbox
   _sweepCursor = null;
   _sweepTotals = { scanned: 0, skip: 0, alreadyFiled: 0, filed: 0 };
   _sweepConvoSeen = new Map();
@@ -4324,7 +4438,11 @@ function renderSweepReviewQueue() {
   const isFiled = (e) => !!(e._filedTo && e._filedTo.length);
   const needsAttention = (e) => !e._done && !isFiled(e);
   const visible = _sweepReview.filter((e) => e._done !== "skip"); // hide skipped; keep ✓ confirmations
-  if (!visible.length) { resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>'; return; }
+  if (!visible.length) {
+    resultsEl.innerHTML = '<span style="color:#888;">Review queue clear.</span>';
+    sweepPersistReview(); // nothing left to triage → clears the stored mirror
+    return;
+  }
   const bcss = 'style="margin:2px 4px 2px 0;padding:2px 8px;font-size:12px;cursor:pointer;"';
   const rows = ['<div style="font-weight:600;margin:8px 0 4px;">🟡 Review (' + _sweepReview.filter(needsAttention).length + ' left)</div>'];
   _sweepReview.forEach((e, i) => {
@@ -4389,6 +4507,9 @@ function renderSweepReviewQueue() {
       }
     };
   });
+  // Write-through: every queue mutation ends in a re-render, so mirroring here
+  // keeps localStorage current (pushes during a run, skip/done/confirm in review).
+  sweepPersistReview();
 }
 
 async function sweepConfirmReview(i, ci) {
@@ -4411,8 +4532,16 @@ async function sweepConfirmReview(i, ci) {
   }
   e._done = null;
   if (filed) {
+    e._failCount = 0;
     e._filedTo.push({ id: proj.id, name: (proj.name || proj.projectNumber || "project") });
     e._expand = false; // collapse to the ✓ confirmation; "＋ also file" re-expands to copy to another job
+  } else if (e._restored && (e._failCount = (e._failCount || 0) + 1) >= 2) {
+    // A row restored from a previous session may be stale (the email was filed,
+    // moved, or deleted since the sweep). After a retry has also failed, drop it
+    // from the queue + stored mirror instead of wedging on endless failures.
+    e._done = "skip";
+    const s = document.getElementById("sweepStatus");
+    if (s) s.textContent = "✗ Couldn't file that one — it may have moved since the sweep. Removed it from the review queue.";
   } else {
     const s = document.getElementById("sweepStatus"); if (s) s.textContent = "✗ Filing failed — try again.";
   }
