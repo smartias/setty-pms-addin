@@ -2471,6 +2471,19 @@ function _recordEmailMetaLocal(projectId, rec) {
   c.rows.unshift(rec);
 }
 
+// Local field-patch after a successful PATCH to pms_project_emails. The insert
+// path has _recordEmailMetaLocal; the UPDATE path had nothing, so a Save-to
+// SharePoint on an already-auto-logged email wrote sp_folder_url to the table
+// but left this cache holding the pre-save row (spFolderUrl ""). Because
+// _emailRowsFor prefers the cache over project.emails, refreshEmailSavedIndicator
+// then read wasFiledToSharePoint === false and hid the "Open SharePoint folder"
+// link on a save that had in fact succeeded.
+function _patchEmailMetaLocal(projectId, msgId, patch) {
+  const c = _projEmailMetaCache.get(projectId);
+  if (!c || !c.rows || !msgId) return;
+  c.rows = c.rows.map(e => (e.msgId === msgId ? { ...e, ...patch } : e));
+}
+
 function updateProjectInList(updatedProject) {
   allProjects = allProjects.map(p => p.id === updatedProject.id ? updatedProject : p);
 }
@@ -7085,30 +7098,41 @@ async function withFilingScaffold(opts, runUpload) {
 // Update an already-saved email's SharePoint + body fields in pms_project_emails
 // (used when Save to SharePoint runs on a record that auto-save created earlier —
 // avoids a duplicate row). PATCH by record_id; no unique-constraint dependency.
+//
+// Both patch helpers return the NUMBER OF ROWS THEY ACTUALLY UPDATED. A PostgREST
+// PATCH whose filter matches nothing still answers 200, so "it didn't throw" is not
+// evidence the link landed. `select=record_id` keeps return=representation cheap:
+// without it the response would echo body_html_compressed for every matched row.
 async function patchEmailSpFields(recordId, fields) {
-  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE + "?record_id=eq." + encodeURIComponent(recordId);
+  if (!recordId) return 0;
+  const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE +
+    "?record_id=eq." + encodeURIComponent(recordId) + "&select=record_id";
   const res = await fetchWithRetry(url, {
     method: "PATCH",
-    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=representation" },
     body: JSON.stringify(fields),
   }, { label: "sb project_emails sp-update" });
   if (!res.ok) throw new Error("pms_project_emails PATCH HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+  const updated = await res.json().catch(() => []);
+  return Array.isArray(updated) ? updated.length : 0;
 }
 // Patch by (project_id, msg_id) instead of the surrogate record_id. msg_id is the
 // stable business key, so the SharePoint link lands on the correct row even if the
 // inline record's id ever drifted — this is the direct cure for "saved to
 // SharePoint but the link didn't stick."
 async function patchEmailSpFieldsByMsg(projectId, msgId, fields) {
-  if (!projectId || !msgId) return;
+  if (!projectId || !msgId) return 0;
   const url = SUPABASE_URL + "/rest/v1/" + PROJECT_EMAILS_TABLE +
     "?project_id=eq." + encodeURIComponent(projectId) +
-    "&msg_id=eq." + encodeURIComponent(msgId);
+    "&msg_id=eq." + encodeURIComponent(msgId) + "&select=record_id";
   const res = await fetchWithRetry(url, {
     method: "PATCH",
-    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=representation" },
     body: JSON.stringify(fields),
   }, { label: "sb project_emails sp-update-by-msg" });
   if (!res.ok) throw new Error("pms_project_emails PATCH(by msg) HTTP " + res.status + ": " + (await res.text()).slice(0, 150));
+  const updated = await res.json().catch(() => []);
+  return Array.isArray(updated) ? updated.length : 0;
 }
 async function doSaveToSharePoint() {
   return withSaveGuard("save-sp", _doSaveToSharePoint, ["saveSpBtn", "saveRecordBtn"]);
@@ -7273,6 +7297,7 @@ if (existingRecord) {
       return { ...fresh, emails: [...others, emailRecord] };
     });
     let indexSaveFailed = false;
+    let spLinkAttachFailed = false;
     try {
       if (existingRecord) {
         // Auto-save already inserted the search-index row; just patch in the
@@ -7281,14 +7306,40 @@ if (existingRecord) {
         // Patch by the record's STORED msg_id (not its surrogate id), so the link
         // lands on the right row whether it was keyed by internetMessageId or a
         // legacy REST id.
-        await patchEmailSpFieldsByMsg(selectedProject.id, existingRecord.msgId || currentMsgId, {
+        const patchMsgId = existingRecord.msgId || currentMsgId;
+        const spPatchFields = {
           sp_folder_url: spFolderUrl || "",
           saved_to_sharepoint: true,
           attachment_names: attachmentNames || [],
           body_text: emailRecord.bodyText || "",
           body_html_compressed: emailRecord.bodyHtmlCompressed || null,
           body_html_size: emailRecord.bodyHtmlSize || 0,
-        });
+        };
+        let matched = await patchEmailSpFieldsByMsg(selectedProject.id, patchMsgId, spPatchFields);
+        // A 0-row match means msg_id drifted between the auto-save and now, so the
+        // PATCH quietly updated nothing. Retry against the surrogate record_id
+        // before giving up: that key can survive an id change the business key
+        // did not. This is the "saved to SharePoint but the link didn't stick"
+        // failure, now detected instead of assumed away.
+        if (matched === 0 && existingRecord.id) {
+          console.warn("[sp-link] PATCH by msg_id matched 0 rows; retrying by record_id", patchMsgId);
+          matched = await patchEmailSpFields(existingRecord.id, spPatchFields);
+        }
+        if (matched === 0) {
+          // Nothing in pms_project_emails carries the folder URL. Leave the cache
+          // untouched so the indicator keeps the link hidden, and tell the user
+          // rather than showing a link the project record cannot back up.
+          spLinkAttachFailed = true;
+          console.warn("[sp-link] no pms_project_emails row updated for", selectedProject.id, patchMsgId);
+        } else {
+          // Keep the filed-email metadata cache in step with the PATCH. Without
+          // this the indicator re-reads the stale cached row and hides the folder
+          // link even though the save succeeded.
+          _patchEmailMetaLocal(selectedProject.id, patchMsgId, {
+            spFolderUrl: spFolderUrl || "",
+            savedToSharePoint: true,
+          });
+        }
       } else {
         await saveProjectEmailRow(selectedProject.id, emailRecord, true);
       }
@@ -7315,6 +7366,7 @@ if (existingRecord) {
       warnings.push("⚠ Only " + attCount + "/" + attempted + " attachments uploaded" + (failedNames ? " (failed: " + failedNames + ")" : "") + ".");
     }
     if (indexSaveFailed) warnings.push("⚠ Email saved to project, but search-index write failed — it may not appear in PMS email searches until you resave or PMS is reloaded.");
+    if (spLinkAttachFailed) warnings.push("⚠ Files are in SharePoint, but the project record link did not attach. Open the folder from the project in PMS, or re-save this email to retry the link.");
 
     const linkSuffix = linkResult.label || "";
     if (attempted > 0 && attCount === 0) {
@@ -7330,9 +7382,14 @@ if (existingRecord) {
     // Append to the filing-integrity audit log so PMS can reconcile this save.
     // Status reflects whether the upload was clean or partial — verified flag
     // gets set by Phase 2 read-back once that lands. Fire-and-forget.
+    // A detached SP link counts as partial: the bytes are filed but the project
+    // record can't point at them, which is exactly what a reconcile sweep needs
+    // to see. Without this the row would log clean and the miss would be
+    // invisible to everything except the user who happened to read the banner.
     const status =
       (attempted > 0 && attCount === 0)            ? "failed" :
       (attempted > 0 && attCount < attempted)      ? "partial" :
+      spLinkAttachFailed                           ? "partial" :
       "success";
     void logFilingOp({
       project_id:    selectedProject.id,
