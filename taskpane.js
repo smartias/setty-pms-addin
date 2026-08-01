@@ -980,7 +980,7 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
     // was originally logged.
     let rootPath = spDrivePath(target.spFolderUrl);
     if (!rootPath) {
-      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
       const discCode = getDisciplineCode(target.discipline);
       const safeNumber = (target.number || (kind === "rfi" ? "RFI-???" : "SUB-???"))
         .replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
@@ -6441,6 +6441,25 @@ function compressHtmlAddin(html) {
 }
 // ─── SP / EMAIL HELPERS ──────────────────────────────────────────────────────
 const SP_BASE_URL = "https://setty.sharepoint.com/sites/NYCProjects/Project%20Document%20Library";
+// decodeURIComponent that tolerates already-decoded URLs. SharePoint folder
+// names legitimately carry a literal "%": AEC submission sets are named
+// "100% CD", "50% DD", "2024-10-24_Revised 100% CD Submission", and email
+// folders inherit the subject line, which is not stripped of "%". Folder
+// URLs reach us already decoded on several routes (URLSearchParams.get()
+// decodes a ?folder= param once, and the Overview folder box is a free-text
+// paste). A second decode then throws URIError("URI malformed") and takes
+// the whole caller down. Decode RUNS of well-formed escapes so a bare "%"
+// survives, decoding each run as a unit to keep multi-byte sequences
+// (%E2%80%93) intact. Returns decodeURIComponent()'s exact result whenever
+// that succeeds, so every path that works today is byte-for-byte unchanged.
+function safeDecodeFolderUrl(u) {
+  const s = String(u || "");
+  try { return decodeURIComponent(s); } catch (e) {}
+  return s.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (run) {
+    try { return decodeURIComponent(run); } catch (e2) { return run; }
+  });
+}
+
 function encodeDrivePath(path) {
   return String(path || "")
     .split("/")
@@ -6469,7 +6488,7 @@ async function ensureSpFolder(driveId, token, parentPath, name) {
 function spDrivePath(spFolderUrl) {
   const base = SP_BASE_URL + "/";
   if (!spFolderUrl || !spFolderUrl.startsWith(base)) return null;
-  return decodeURIComponent(spFolderUrl.slice(base.length));
+  return safeDecodeFolderUrl(spFolderUrl.slice(base.length));
 }
 // Build the email HTML file content from the current emailItem
 // `item` is the Office mailbox-item snapshot captured by the caller. Falls
@@ -7235,7 +7254,7 @@ if (existingRecord) {
       catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
     }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
-    const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+    const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
     const d = new Date(snapDate);
     // Folder name = YYYY_MM_DD + (custom name if user set one, else cleaned subject).
     const customCleaned = _customSpFolderName
@@ -9174,7 +9193,7 @@ async function doSaveRfi() {
         try {
           const token = await getToken();
           const { driveId } = await resolveSpIds();
-          const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
+          const projFolderName = safeDecodeFolderUrl(freshProject.projectFolderUrl.split("/").pop());
           const safeRfiNumber = rfiNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
           const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
           const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
@@ -9369,7 +9388,7 @@ async function submitRfiResponse() {
       // at the old flat folder, but the response transmittal should land in
       // the canonical new path so the team can find it predictably. The new
       // discipline-coded path is created if it doesn't exist.
-      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
       const discCode = getDisciplineCode(rfi.discipline);
       const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
       const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
@@ -9578,7 +9597,7 @@ async function doFileToExistingRfi() {
       let rfiRootPath = spDrivePath(rfi.spFolderUrl);
       if (!rfiRootPath) {
         if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
         const discCode = getDisciplineCode(rfi.discipline);
         const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
         const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
@@ -9722,7 +9741,7 @@ async function doSaveSub() {
         try {
           const token = await getToken();
           const { driveId } = await resolveSpIds();
-          const projFolderName = decodeURIComponent(freshProject.projectFolderUrl.split("/").pop());
+          const projFolderName = safeDecodeFolderUrl(freshProject.projectFolderUrl.split("/").pop());
           const safeSubNumber = subNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
           const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
           const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
@@ -9869,7 +9888,7 @@ async function submitSubReview() {
       // ALWAYS construct the new-structure path for review OUT regardless of
       // where the submittal was originally filed. Matches the RFI Log Response
       // behavior — review transmittal lands at Submittals/<DiscCode>/SUB-NNN/OUT/.
-      const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+      const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
       const discCode = getDisciplineCode(sub.discipline);
       const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
       const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
@@ -10061,7 +10080,7 @@ async function doFileToExistingSub() {
       let subRootPath = spDrivePath(sub.spFolderUrl);
       if (!subRootPath) {
         if (!selectedProject.projectFolderUrl) throw new Error("No SharePoint folder on this project. Create one in the PMS first.");
-        const projFolderName = decodeURIComponent(selectedProject.projectFolderUrl.split("/").pop());
+        const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
         const discCode = getDisciplineCode(sub.discipline);
         const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
         const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
