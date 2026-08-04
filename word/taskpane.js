@@ -7,7 +7,11 @@ const MSAL_CONFIG = {
   },
   cache: { cacheLocation: "localStorage" }
 };
-const GRAPH_SCOPES = ["User.Read", "Notes.ReadWrite", "Files.ReadWrite.All"];
+// Files.ReadWrite.All removed 2026-08-04: never admin-consented for this app, so requesting
+// it at sign-in walled the whole add-in behind "Approval required" (user self-consent is off).
+// The "save .docx to SharePoint" checkbox will 403 until it is re-wired to the narrow
+// Sites.Selected scope (single-site grant on NYCProjects) instead of firm-wide "all files".
+const GRAPH_SCOPES = ["User.Read", "Notes.ReadWrite"];
 // Requested ON-DEMAND only (same pattern as the Outlook pane's shared-mail
 // scope): kept out of the default sign-in so first-run consent is unchanged.
 // The first click of "Send in Email" triggers a one-time per-user consent

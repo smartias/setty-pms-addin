@@ -11,9 +11,14 @@ const MSAL_CONFIG = {
 const GRAPH_SCOPES = [
   "User.Read",
   "Mail.Read",
-  "Files.ReadWrite.All",
   "Calendars.ReadWrite.Shared",
   "Notes.ReadWrite",      // needed for OneNote page creation — no admin consent required
+  // Files.ReadWrite.All removed 2026-08-04: it was never admin-consented for this app,
+  // so requesting it at sign-in walled the ENTIRE add-in behind "Approval required"
+  // (tenant has user self-consent disabled). Every other scope here is already consented.
+  // Save-to-SharePoint (doSaveToSharePoint) will 403 until it is re-wired to the narrow
+  // Sites.Selected scope (single-site grant on NYCProjects) — the least-privilege
+  // replacement that avoids the firm-wide "all files" grant IT is uncomfortable with.
   // Sites.Read.All removed — site and drive IDs are hardcoded below (no admin consent needed)
 ];
 // Scopes requested ON-DEMAND only — kept out of the default sign-in flow so
