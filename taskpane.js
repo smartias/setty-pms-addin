@@ -3140,15 +3140,28 @@ function renderJobcard(project) {
   }
 
   // Ask Claude about this job — opens the user's OWN Claude (their existing seat) with a
-  // prefilled prompt. The job snapshot is embedded INLINE so the answer works EVERYWHERE
-  // (web, desktop, mobile, even a free account) with no connector dependency — the connector
-  // is desktop-only and not yet approved org-wide, so a connector-only prompt would come back
-  // empty on web. A soft connector line lets desktop users who do have it pull live email/
-  // document detail too. $0: no API key, no metering, no new service.
+  // prefilled prompt. $0: no API key, no metering, no new service.
+  //
+  // The connector went live org-wide on 2026-08-05, which changes what this prompt should
+  // say. It used to hedge ("if you have the connector enabled... otherwise brief me from
+  // the snapshot") because the connector was not approved yet and a connector-first prompt
+  // would have come back empty. That hedge now costs us the good answer: told the connector
+  // is optional, Claude often settles for the snapshot below instead of reading the actual
+  // email and documents, which is the whole point.
+  //
+  // So: instruct the connector FIRST and name the email explicitly, since correspondence is
+  // where the real answer lives. The inline snapshot stays as a fallback for anyone who has
+  // not switched the connector on yet, or is on mobile, and it costs nothing to carry.
   const askLines = [
     "Brief me on " + (project.projectNumber ? project.projectNumber + " " : "") +
     (project.name || "this project") +
-    ". Here is the current snapshot from our PMS — tell me what needs my attention, what's at risk, and what to do next:",
+    ". Tell me what needs my attention, what's at risk, and what to do next.",
+    "",
+    "Use the Setty PMS connector to answer. Read the recent email history for this project " +
+    "first (including anything I still owe a reply on), then the meeting notes and documents, " +
+    "and cite the specific emails or files you used.",
+    "",
+    "Snapshot from our PMS, as a starting point and a fallback if the connector is unavailable:",
   ];
   if (project.status) askLines.push("- Status: " + project.status);
   if (nextM) askLines.push("- Next milestone: " + (nextM.name || "Milestone") + " due " + nextM.dueDate);
@@ -3157,9 +3170,6 @@ function renderJobcard(project) {
     (nextAction ? " (next due " + nextAction.actionDueDate + ")" : ""));
   if (openRfis > 0) askLines.push("- Open RFIs: " + openRfis);
   if (openSubs > 0) askLines.push("- Submittals in review: " + openSubs);
-  askLines.push(
-    "If you have the Setty PMS connector enabled, use it to pull the latest emails and documents " +
-    "(including anything I still owe a reply on) and cite sources; otherwise brief me from the snapshot above.");
   const askPrompt = askLines.join("\n");
   const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
   rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
