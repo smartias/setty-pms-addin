@@ -3174,6 +3174,15 @@ function renderJobcard(project) {
   const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
   rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
 
+  // Open the project's LOCAL synced folder in File Explorer. The task pane
+  // can only open http/https (openBrowserWindow rejects custom protocols),
+  // so this routes through the PMS's bridge page, which fires the settypms:
+  // handler from the real browser. Machines without the handler get the
+  // bridge page's setup pointers and copy-path fallback instead of a dead end.
+  if (project.projectFolderUrl) {
+    rows.push('<a href="#" id="jcOpenExplorer" style="display:inline-flex;align-items:center;gap:5px;margin-top:4px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">📂 Open folder in Explorer →</a>');
+  }
+
   el.innerHTML = rows.join("");
   el.style.display = "block"; // the Ask-Claude link always renders, so the body always shows
 
@@ -3181,6 +3190,18 @@ function renderJobcard(project) {
   if (askEl) askEl.onclick = (e) => {
     e.preventDefault();
     try { openExternalUrl(askUrl); } catch (err) { console.warn("[jobcard] open Claude failed:", err); }
+  };
+
+  const expEl = document.getElementById("jcOpenExplorer");
+  if (expEl) expEl.onclick = (e) => {
+    e.preventDefault();
+    try {
+      // Same folder-name extraction as the filing paths: last URL segment,
+      // tolerant decode (folder names legitimately carry a literal %).
+      const name = safeDecodeFolderUrl(String(project.projectFolderUrl).replace(/\/+$/, "").split("/").pop() || "").trim();
+      if (!name) return;
+      openExternalUrl("https://smartias.github.io/setty-pms/explorer-bridge/open.html?folder=" + encodeURIComponent(name));
+    } catch (err) { console.warn("[jobcard] open Explorer failed:", err); }
   };
 }
 
