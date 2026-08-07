@@ -920,8 +920,10 @@
   <!-- Quick access — surfaces the two most-used project-context jumps right next to
        the project name, so they read as part of the project card, not buried in "More". -->
   <div id="projectQuickLinks" class="quick-links" style="display:none;">
-    <button class="btn btn-ghost" id="openPmsBtn" disabled>🔗 Open in PMS</button>
-    <button class="btn btn-ghost" id="openSpFolderBtn" disabled>📂 SharePoint Folder</button>
+    <button class="btn btn-ghost" id="openPmsBtn" disabled title="Open this project's page in the PMS">🔗 PMS</button>
+    <button class="btn btn-ghost" id="openSpFolderBtn" disabled title="Project folder on SharePoint (web) — for browsing and sharing links">🌐 SharePoint</button>
+    <button class="btn btn-ghost" id="openExplorerBtn" disabled title="Project folder on YOUR computer (synced OneDrive copy) — for real file work like PDFs and zips">📂 Explorer</button>
+    <button class="btn btn-ghost" id="askClaudeBtn" disabled title="Open Claude with a briefing prompt for this project — reads the filed emails, minutes and documents">💬 Ask Claude</button>
   </div>
 
   <div id="actionStatus" class="status-msg"></div>
@@ -1350,6 +1352,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-08-06-jobcard-open-explorer"></script>
+<script src="taskpane.js?v=2026-08-06-jobcard-actions-row"></script>
 </body>
 </html>

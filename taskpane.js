@@ -45,6 +45,9 @@ let msalAccount = null;
 let allProjects = [];
 let allClients = [];
 let selectedProject = null;
+// Ask-Claude URL for the CURRENT jobcard — built by renderJobcard (it already
+// has the milestone/RFI snapshot in hand), consumed by the quick-links button.
+let jobcardAskUrl = "";
 let emailItem = null;
 let emailBody = "";
 let emailFrom = "";
@@ -332,6 +335,8 @@ function setupEventListeners() {
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
+  document.getElementById("openExplorerBtn").onclick = openSelectedProjectExplorer;
+  document.getElementById("askClaudeBtn").onclick = askClaudeAboutSelectedProject;
   document.getElementById("openDashboardBtn").onclick = openPmsDashboard;
   // Quick text + templates — clipboard-based, no Outlook compose API needed.
   // Event delegation on the parent: click any .btn-quick → copy its template.
@@ -2883,6 +2888,8 @@ function applyPipelineUiRules() {
     "saveRecordBtn",
     "openPmsBtn",
     "openSpFolderBtn",
+    "openExplorerBtn",
+    "askClaudeBtn",
     "openDashboardBtn",
     "logNoteBtn",
     "sendToTeamsBtn",
@@ -3078,7 +3085,7 @@ async function removeAutoFiledEmail(projectId, msgId) {
 function renderJobcard(project) {
   const el = document.getElementById("jobcardBody");
   if (!el) return;
-  if (!project) { el.style.display = "none"; el.innerHTML = ""; return; }
+  if (!project) { el.style.display = "none"; el.innerHTML = ""; jobcardAskUrl = ""; return; }
 
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -3171,38 +3178,14 @@ function renderJobcard(project) {
   if (openRfis > 0) askLines.push("- Open RFIs: " + openRfis);
   if (openSubs > 0) askLines.push("- Submittals in review: " + openSubs);
   const askPrompt = askLines.join("\n");
-  const askUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
-  rows.push('<a href="#" id="jcAskClaude" style="display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">💬 Ask Claude about this job →</a>');
-
-  // Open the project's LOCAL synced folder in File Explorer. The task pane
-  // can only open http/https (openBrowserWindow rejects custom protocols),
-  // so this routes through the PMS's bridge page, which fires the settypms:
-  // handler from the real browser. Machines without the handler get the
-  // bridge page's setup pointers and copy-path fallback instead of a dead end.
-  if (project.projectFolderUrl) {
-    rows.push('<a href="#" id="jcOpenExplorer" style="display:inline-flex;align-items:center;gap:5px;margin-top:4px;font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;">📂 Open folder in Explorer →</a>');
-  }
+  // Ask Claude and Open-in-Explorer moved OUT of the card body into the
+  // quick-links action row (2026-08-06 cleanup): the card is informational,
+  // the four matching buttons below it are the actions. The URL is stashed
+  // for askClaudeAboutSelectedProject.
+  jobcardAskUrl = "https://claude.ai/new?q=" + encodeURIComponent(askPrompt);
 
   el.innerHTML = rows.join("");
-  el.style.display = "block"; // the Ask-Claude link always renders, so the body always shows
-
-  const askEl = document.getElementById("jcAskClaude");
-  if (askEl) askEl.onclick = (e) => {
-    e.preventDefault();
-    try { openExternalUrl(askUrl); } catch (err) { console.warn("[jobcard] open Claude failed:", err); }
-  };
-
-  const expEl = document.getElementById("jcOpenExplorer");
-  if (expEl) expEl.onclick = (e) => {
-    e.preventDefault();
-    try {
-      // Same folder-name extraction as the filing paths: last URL segment,
-      // tolerant decode (folder names legitimately carry a literal %).
-      const name = safeDecodeFolderUrl(String(project.projectFolderUrl).replace(/\/+$/, "").split("/").pop() || "").trim();
-      if (!name) return;
-      openExternalUrl("https://smartias.github.io/setty-pms/explorer-bridge/open.html?folder=" + encodeURIComponent(name));
-    } catch (err) { console.warn("[jobcard] open Explorer failed:", err); }
-  };
+  el.style.display = rows.length ? "block" : "none";
 }
 
 function setSelectedProject(project, persistForEmail = false) {
@@ -10956,6 +10939,10 @@ function updateProjectQuickLinks() {
   if (!pmsBtn || !spBtn) return;
   pmsBtn.disabled = !projectPmsUrl(selectedProject);
   spBtn.disabled = !selectedProject?.projectFolderUrl;
+  const expBtn = document.getElementById("openExplorerBtn");
+  if (expBtn) expBtn.disabled = !selectedProject?.projectFolderUrl;
+  const askBtn = document.getElementById("askClaudeBtn");
+  if (askBtn) askBtn.disabled = !selectedProject;
   if (wrap) wrap.style.display = selectedProject ? "grid" : "none";
   // Pre-emptive hint when the selected project has no SharePoint folder yet.
   // Catches the user before they click "Save to SharePoint" and hit the
@@ -10975,6 +10962,24 @@ function openSelectedProjectSpFolder() {
   if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
   if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
   openExternalUrl(selectedProject.projectFolderUrl);
+}
+// The project's LOCAL synced folder. The task pane can only open http/https
+// (openBrowserWindow rejects custom protocols), so this routes through the
+// PMS's bridge page, which fires the settypms: handler from the real browser.
+// Machines without the handler get the bridge page's setup pointers and
+// copy-path fallback instead of a dead end.
+function openSelectedProjectExplorer() {
+  if (!selectedProject) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  if (!selectedProject.projectFolderUrl) { setStatus("actionStatus", "error", "No SharePoint folder URL is set on this project."); return; }
+  // Same folder-name extraction as the filing paths: last URL segment,
+  // tolerant decode (folder names legitimately carry a literal %).
+  const name = safeDecodeFolderUrl(String(selectedProject.projectFolderUrl).replace(/\/+$/, "").split("/").pop() || "").trim();
+  if (!name) { setStatus("actionStatus", "error", "Could not read the folder name from this project's SharePoint URL."); return; }
+  openExternalUrl("https://smartias.github.io/setty-pms/explorer-bridge/open.html?folder=" + encodeURIComponent(name));
+}
+function askClaudeAboutSelectedProject() {
+  if (!selectedProject || !jobcardAskUrl) { setStatus("actionStatus", "error", "Select a project first."); return; }
+  openExternalUrl(jobcardAskUrl);
 }
 function openPmsDashboard() {
   openExternalUrl(PMS_DASHBOARD_URL);
