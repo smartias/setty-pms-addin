@@ -1226,6 +1226,23 @@ function refreshLoggedArtifactChips() {
   };
 }
 // ── Open action items (project-level) ────────────────────────────────────────
+// Friendly short date for UI rows and chips: "Tue 8/18", adding a 2-digit year
+// only when it isn't this year ("Tue 8/18/27"). Weekday answers "how soon?" at
+// a glance — better than "Aug 18" or a raw ISO "2026-08-07" in tight UI.
+// Date-only ISO strings get "T00:00:00" so they parse at LOCAL midnight; bare
+// new Date("2026-08-18") is UTC midnight, which renders as the previous day
+// (and the wrong weekday) anywhere west of Greenwich. Unparseable → raw string.
+function friendlyDate(d) {
+  if (!d) return "";
+  try {
+    const dt = new Date(/^\d{4}-\d{2}-\d{2}$/.test(d) ? d + "T00:00:00" : d);
+    if (isNaN(dt)) return String(d);
+    let out = dt.toLocaleDateString("en-US", { weekday: "short" }) +
+      " " + (dt.getMonth() + 1) + "/" + dt.getDate();
+    if (dt.getFullYear() !== new Date().getFullYear()) out += "/" + String(dt.getFullYear()).slice(-2);
+    return out;
+  } catch { return String(d); }
+}
 // Surfaces the tagged project's open action items as chips with a "Mark Done"
 // button — mirrors refreshLoggedArtifactChips so the user can close items from
 // the email they're working. Capped so it stays compact.
@@ -1243,7 +1260,7 @@ function refreshOpenActionItemChips() {
   const rows = shown.map(n => {
     const task = ((n.body || "").split("\n")[0] || "Action item").slice(0, 56);
     const owner = n.actionOwner || n.owner || "";
-    const due = n.actionDueDate || n.dueDate || "";
+    const due = friendlyDate(n.actionDueDate || n.dueDate || "");
     const meta = [owner, due].filter(Boolean).join(" · ");
     const label = ("✅ " + task + (meta ? "  (" + meta + ")" : "")).replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const idAttr = String(n.id).replace(/"/g, "&quot;");
@@ -3091,7 +3108,7 @@ function renderJobcard(project) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const today = new Date().toISOString().slice(0, 10);
   const ok = (d) => typeof d === "string" && d >= "2015-01-01" && d <= "2100-12-31";
-  const fmt = (d) => { try { return new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return esc(d); } };
+  const fmt = (d) => esc(friendlyDate(d) || d);
 
   const liveMs = (project.milestones || []).filter(m =>
     m && ok(m.dueDate) && !m.cancelled && (m.status || "") !== "Completed");
@@ -5208,7 +5225,7 @@ async function renderResponseWatchlist() {
       const proj    = getProjectById(r.project_id);
       const reasons = Array.isArray(r.reasons) ? r.reasons.join(" · ") : "";
       const due     = r.due_date
-        ? `<span class="wl-due">due ${escHtml(new Date(r.due_date + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }))}</span>`
+        ? `<span class="wl-due">due ${escHtml(friendlyDate(r.due_date))}</span>`
         : "";
       const subjHtml = (r.web_link || r.item_id)
         ? `<button type="button" class="wl-subject wl-open" data-itemid="${escHtml(r.item_id || "")}" data-url="${escHtml(r.web_link || "")}" title="Open the original email">${escHtml(r.subject || "(No subject)")}</button>`
