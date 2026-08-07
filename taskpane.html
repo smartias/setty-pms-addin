@@ -1042,11 +1042,13 @@
     </div>
   </details>
 
-  <!-- Quick text + templates — copy text to clipboard for pasting into a reply.
+  <!-- Quick text + templates: copy text to clipboard for pasting into a reply.
        Wrapped in #quickTemplatesSection so the JS guard can show/hide it as a
        single unit. Only visible in Compose mode (Reply / Forward / New) since
-       that's the only context where the templates are useful. -->
-  <div id="quickTemplatesSection">
+       that's the only context where the templates are useful.
+       Hidden by default: applyComposeModeUiGuard() runs after async MSAL init,
+       so a visible-by-default section flashed on every read-mode pane load. -->
+  <div id="quickTemplatesSection" style="display:none">
     <div class="quick-section-label">✉ Quick text</div>
     <div class="quick-grid">
       <button class="btn-quick" data-tpl="ack">Received</button>
