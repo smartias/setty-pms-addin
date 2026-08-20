@@ -10994,9 +10994,116 @@ function openSelectedProjectExplorer() {
   if (!name) { setStatus("actionStatus", "error", "Could not read the folder name from this project's SharePoint URL."); return; }
   openExternalUrl("https://smartias.github.io/setty-pms/explorer-bridge/open.html?folder=" + encodeURIComponent(name));
 }
+// Ask Claude menu — mirrors the PMS jobcard's AskClaudeMenu, scoped to what
+// makes sense inside Outlook: briefing, respond-to-THIS-email (the add-in's
+// advantage: it knows the open message), meeting prep, open items log.
+// Proposal drafting stays in the PMS Scope tab. Each entry is a prefilled
+// claude.ai/new URL whose first line is the trigger phrasing of the matching
+// claude.ai skill; still just the $0 URL hand-off pattern.
+function buildAskClaudeMenuEntries() {
+  const project = selectedProject;
+  const label = (project.projectNumber ? project.projectNumber + " " : "") + (project.name || "this project");
+  const promptUrl = lines => "https://claude.ai/new?q=" + encodeURIComponent(lines.join("\n"));
+
+  // Current email context. Read mode only: compose items expose subject as an
+  // async OBJECT, not a string — same guard as the compose-subject crash fixes.
+  let emailLead = "I'll paste the email or chain below, or give you the sender and subject so you " +
+    "can find it in the project's filed email history.";
+  try {
+    const item = Office.context.mailbox.item;
+    const subj = item && typeof item.subject === "string" ? item.subject.trim() : "";
+    if (subj) {
+      const fromName = (item.from && (item.from.displayName || item.from.emailAddress)) || "";
+      const recvd = item.dateTimeCreated ? new Date(item.dateTimeCreated).toISOString().slice(0, 10) : "";
+      emailLead = "The email is \"" + subj + "\"" + (fromName ? " from " + fromName : "") +
+        (recvd ? ", dated " + recvd : "") + ". Find it and the rest of its thread in the " +
+        "project's filed email history (search the subject with RE/FW stripped); if it isn't " +
+        "filed I'll paste it.";
+    }
+  } catch (e) { /* keep the generic lead */ }
+
+  const emailResponseUrl = () => promptUrl([
+    "Help me respond to an email on " + label + ".",
+    "",
+    emailLead,
+    "",
+    "Before drafting, reconstruct the thread with the Setty PMS connector: read the earlier " +
+    "messages (especially the last one we sent) and check whether someone already replied. " +
+    "Pull the record behind the topic: meeting minutes decisions, RFIs or submittals, and any " +
+    "documents it references. Then give me: what they're actually asking, the relevant history " +
+    "with sources, a recommended reply I can edit and send myself, and next steps beyond the " +
+    "reply. Flag anything touching scope, fee, or schedule commitments for my judgment " +
+    "instead of answering it for me.",
+  ]);
+
+  const meetingPrepUrl = () => promptUrl([
+    "Prep me for my next meeting on " + label + ".",
+    "",
+    "Use the Setty PMS connector. Find the most recent meeting minutes for this project " +
+    "(search by content, not folder path), read the recent email threads behind each likely " +
+    "agenda item, and check open RFIs, submittals, action items, and upcoming milestones. " +
+    "Then give me a meeting prep brief: where each item stands with sources cited, decisions " +
+    "already made, open questions to raise in the meeting, and anything carried from the last " +
+    "meeting that could get dropped. If you can't find evidence on something, say \"no record " +
+    "found\" rather than guessing.",
+  ]);
+
+  const openItemsUrl = () => promptUrl([
+    "Prepare the open items and design assumptions log for " + label + " ahead of our next deliverable.",
+    "",
+    "Use the Setty PMS connector: pull the open action items, open RFIs and submittals, and " +
+    "anything assumed or awaited from other disciplines in the recent emails and meeting notes. " +
+    "Produce the standard Setty two-tab Open Items & Design Assumptions Log workbook.",
+  ]);
+
+  return [
+    { icon: "💬", title: "Ask about this job", desc: "Briefing: what needs attention, risks, next steps", url: () => jobcardAskUrl },
+    { icon: "✉️", title: "Help me respond to this email", desc: "Thread history, recommended reply, next steps", url: emailResponseUrl },
+    { icon: "📅", title: "Prep my next meeting", desc: "Per-item status, decisions, open questions, sources", url: meetingPrepUrl },
+    { icon: "✅", title: "Build the open items log", desc: "Assumptions and awaited items for the next deliverable", url: openItemsUrl },
+  ];
+}
+
+function closeAskClaudeMenu() {
+  const m = document.getElementById("askClaudeMenu");
+  if (m) m.remove();
+  document.removeEventListener("mousedown", askClaudeMenuAway, true);
+}
+function askClaudeMenuAway(e) {
+  const m = document.getElementById("askClaudeMenu");
+  if (m && !m.contains(e.target) && e.target.id !== "askClaudeBtn") closeAskClaudeMenu();
+}
+
 function askClaudeAboutSelectedProject() {
   if (!selectedProject || !jobcardAskUrl) { setStatus("actionStatus", "error", "Select a project first."); return; }
-  openExternalUrl(jobcardAskUrl);
+  if (document.getElementById("askClaudeMenu")) { closeAskClaudeMenu(); return; }
+  const btn = document.getElementById("askClaudeBtn");
+  const rect = btn.getBoundingClientRect();
+  const menu = document.createElement("div");
+  menu.id = "askClaudeMenu";
+  menu.style.cssText = "position:fixed;left:" + Math.max(4, Math.round(rect.left)) + "px;top:" +
+    Math.round(rect.bottom + 4) + "px;z-index:5000;background:var(--bg);border:1px solid var(--border-strong);" +
+    "border-radius:6px;padding:4px;min-width:240px;max-width:300px;box-shadow:0 6px 20px rgba(0,0,0,0.25);";
+  buildAskClaudeMenuEntries().forEach(entry => {
+    const row = document.createElement("div");
+    row.style.cssText = "padding:8px 10px;border-radius:4px;cursor:pointer;font-size:12px;color:var(--text);";
+    row.onmouseover = () => { row.style.background = "var(--border)"; };
+    row.onmouseout = () => { row.style.background = "transparent"; };
+    row.onclick = () => { closeAskClaudeMenu(); openExternalUrl(entry.url()); };
+    const title = document.createElement("div");
+    title.style.cssText = "font-weight:600;margin-bottom:2px;";
+    title.textContent = entry.icon + " " + entry.title;
+    const desc = document.createElement("div");
+    desc.style.cssText = "font-size:10px;color:var(--text-soft);";
+    desc.textContent = entry.desc;
+    row.appendChild(title); row.appendChild(desc);
+    menu.appendChild(row);
+  });
+  document.body.appendChild(menu);
+  // Keep the panel on-screen in the narrow taskpane.
+  const mw = menu.getBoundingClientRect().width;
+  if (rect.left + mw > window.innerWidth - 4) menu.style.left = Math.max(4, window.innerWidth - mw - 4) + "px";
+  document.addEventListener("mousedown", askClaudeMenuAway, true);
 }
 function openPmsDashboard() {
   openExternalUrl(PMS_DASHBOARD_URL);
