@@ -3390,9 +3390,19 @@ function refreshCalendarStatus() {
 function findMilestoneForCurrentEvent() {
   if (currentItemKind !== "appointment") return null;
   const uid = currentItemICalUId || "";
-  if (uid) {
+  // Same-mailbox Graph event id — matches milestones synced from THIS mailbox
+  // (most were synced by the calendar owner). Most legacy synced milestones
+  // carry only calendarEventId, not the mailbox-independent calendarEventUid.
+  let restId = "";
+  try {
+    if (emailItem?.itemId) restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0) || "";
+  } catch { /* non-fatal */ }
+  if (uid || restId) {
     for (const p of allProjects) {
-      const m = (p.milestones || []).find(x => !x.cancelled && x.calendarEventUid && x.calendarEventUid === uid);
+      const m = (p.milestones || []).find(x => !x.cancelled && (
+        (uid && x.calendarEventUid && x.calendarEventUid === uid) ||
+        (restId && x.calendarEventId && x.calendarEventId === restId)
+      ));
       if (m) return { project: p, milestone: m };
     }
   }
@@ -3555,6 +3565,28 @@ async function restoreProjectSelectionForCurrentEmail() {
           }
           break;
         }
+      }
+    }
+  }
+
+  // FALLBACK — PMS-synced milestone events. If the open appointment IS a
+  // milestone's calendar event (matched by iCalUId, same-mailbox event id, or
+  // the PMS subject format), its project is the answer even though nothing
+  // ever tagged this event. Backfill the maps + cloud shared tag so future
+  // opens — anyone's — hit the fast path. Self-healing, same as note-scan.
+  if (!projectId && currentItemKind === "appointment") {
+    const hit = findMilestoneForCurrentEvent();
+    if (hit) {
+      projectId = hit.project.id;
+      restoredVia = "milestone-event";
+      const sharedKey = currentItemICalUId || (await getCurrentSharedKey());
+      if (myGen !== itemContextGeneration) return; // user moved on — don't tag the wrong item
+      if (sharedKey) {
+        const convoMap = getConversationProjectMap();
+        convoMap[sharedKey] = projectId;
+        saveConversationProjectMap(convoMap);
+        // Fire-and-forget cloud upsert
+        void saveSharedConversationProjectTag(sharedKey, projectId);
       }
     }
   }
