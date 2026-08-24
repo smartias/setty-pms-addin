@@ -928,6 +928,11 @@
 
   <div id="actionStatus" class="status-msg"></div>
 
+  <!-- PMS milestone event card — shown when the OPEN calendar event is a
+       PMS-synced milestone (matched by iCalUId or the PMS subject format).
+       Offers one-click close-out; state reads from the live PMS row. -->
+  <div id="milestoneEventCard" style="display:none"></div>
+
   <!-- Un-tag follow-up: offers to also remove the auto-filed email record.
        Inline buttons, not window.confirm (suppressed in some Outlook webviews). -->
   <div id="untagPromptArea" style="display:none"></div>
@@ -1354,6 +1359,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-08-20-askclaude-menu"></script>
+<script src="taskpane.js?v=2026-08-24-milestone-complete"></script>
 </body>
 </html>

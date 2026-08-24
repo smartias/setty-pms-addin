@@ -510,6 +510,9 @@ function loadItemContext() {
     })();
   }
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
+  // First-pass milestone card: hides on messages, and on appointments may
+  // already match via the subject before the iCalUId fetch re-renders it.
+  try { renderMilestoneEventCard(); } catch (e) { console.warn("milestone card:", e); }
   if (currentItemKind === "appointment") {
     // Restore a previously-saved project association for this appointment.
     // (Same mechanism as emails — keyed on the REST item ID in localStorage.)
@@ -1872,6 +1875,17 @@ function _stripProjectForCache(p) {
       sourceMessageId: m.sourceMessageId,
       dueDate: m.dueDate,
       name: m.name,
+      // Milestone-event card fields: matching an open calendar event to its
+      // milestone (calendarEventUid/Id) and rendering its live state during
+      // the cache window before the fresh fetch lands. Small; safe to keep.
+      type: m.type,
+      phase: m.phase,
+      fee: m.fee,
+      pctComplete: m.pctComplete,
+      status: m.status,
+      cancelled: m.cancelled,
+      calendarEventId: m.calendarEventId,
+      calendarEventUid: m.calendarEventUid,
     })),
     rfis: (p.rfis || []).map(r => ({
       id: r.id,
@@ -2051,6 +2065,9 @@ async function loadProjects() {
         renderCompanySuggestions();
         // Refresh the cache with the latest data
         saveProjectsCache(allProjects, allClients, versionMap);
+        // Milestone-event card may have rendered from the slim cache (or not at
+        // all, on a first-ever pane open) — re-render from the fresh rows.
+        try { renderMilestoneEventCard(); } catch {}
         return;
       }
     }
@@ -3358,6 +3375,101 @@ function refreshCalendarStatus() {
     setStatus("actionStatus", "info",
       "Calendar event detected: use 'Log as Note' (under More actions) for meetings/site visits and 'Add Participant to Contacts' for attendees.");
     if (logNoteBtn) logNoteBtn.disabled = false;
+  }
+  try { renderMilestoneEventCard(); } catch (e) { console.warn("milestone card:", e); }
+}
+
+// ── PMS milestone event card ─────────────────────────────────────────────────
+// When the open calendar event IS a PMS-synced milestone (created by the PMS's
+// NYC Shared Calendar sync, or by this add-in's milestone save), show a card
+// with the milestone's live PMS state and a one-click "Mark Complete".
+// Matching: iCalUId first — mailbox-independent, stamped on the milestone as
+// calendarEventUid at sync time — then the exact "[number] name - milestone"
+// subject the PMS builds, restricted to milestones that HAVE a synced event so
+// an unrelated meeting with a coincidental subject can't match.
+function findMilestoneForCurrentEvent() {
+  if (currentItemKind !== "appointment") return null;
+  const uid = currentItemICalUId || "";
+  if (uid) {
+    for (const p of allProjects) {
+      const m = (p.milestones || []).find(x => !x.cancelled && x.calendarEventUid && x.calendarEventUid === uid);
+      if (m) return { project: p, milestone: m };
+    }
+  }
+  const subj = typeof emailItem?.subject === "string" ? emailItem.subject.trim() : "";
+  if (subj) {
+    for (const p of allProjects) {
+      // Mirrors the PMS's nycEventSubject(): "[number] name - milestone"
+      const prefix = (p.projectNumber ? "[" + p.projectNumber + "] " : "") + (p.name || "Project") + " - ";
+      if (!subj.startsWith(prefix)) continue;
+      const rest = subj.slice(prefix.length).trim();
+      const m = (p.milestones || []).find(x =>
+        !x.cancelled && x.calendarEventId && String(x.name || "").trim() === rest);
+      if (m) return { project: p, milestone: m };
+    }
+  }
+  return null;
+}
+
+function renderMilestoneEventCard() {
+  const card = document.getElementById("milestoneEventCard");
+  if (!card) return;
+  const hit = findMilestoneForCurrentEvent();
+  if (!hit) { card.style.display = "none"; card.innerHTML = ""; return; }
+  const p = hit.project, m = hit.milestone;
+  const esc = s => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const pct = Number(m.pctComplete) || 0;
+  const done = pct >= 100 || m.status === "Completed";
+  const fee = m.type === "billable" && m.fee ? " · $" + Number(m.fee).toLocaleString() : "";
+  const projLabel = (p.projectNumber ? p.projectNumber + " — " : "") + (p.name || "");
+  card.innerHTML =
+    '<div style="margin:8px 0;padding:10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;">' +
+      '<div style="font-size:11px;color:var(--text-soft);margin-bottom:2px;">📅 PMS milestone on this event</div>' +
+      '<div style="font-size:12px;font-weight:600;color:var(--text);">' + esc(m.name) +
+        '<span style="color:var(--text-soft);font-weight:400;">' + esc(fee) + '</span></div>' +
+      '<div style="font-size:11px;color:var(--text-soft);margin-bottom:8px;">' + esc(projLabel) + ' · ' + pct + '% complete</div>' +
+      (done
+        ? '<div style="font-size:12px;font-weight:600;color:var(--success);">✓ Completed in PMS</div>'
+        : '<button class="btn btn-primary" id="completeMilestoneBtn" style="width:100%;">✅ Mark Complete in PMS</button>') +
+      '<div id="milestoneEventStatus" class="status-msg"></div>' +
+    '</div>';
+  card.style.display = "block";
+  const btn = document.getElementById("completeMilestoneBtn");
+  if (btn) btn.onclick = () => void completeMilestoneFromEvent(p.id, m.id);
+}
+
+async function completeMilestoneFromEvent(projectId, mid) {
+  if (saveInFlight) { setStatus("milestoneEventStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  saveInFlight = true;
+  setStatus("milestoneEventStatus", "info", "⏳ Marking complete…");
+  let flaggedInvoice = false;
+  try {
+    await applyLocalChangeAndSave(projectId, fresh => {
+      let found = false;
+      const milestones = (fresh.milestones || []).map(m => {
+        if (m.id !== mid) return m;
+        found = true;
+        // pctComplete is the canonical done signal in the PMS; status is
+        // derived and must be written alongside it so legacy readers agree.
+        const upd = { ...m, pctComplete: 100, status: "Completed" };
+        // The add-in has no invoicing UI — flag billable completions so the
+        // PMS Schedule tab pops its invoice prompt the next time it opens.
+        if (m.type === "billable" && Number(m.fee) > 0 && (Number(m.pctComplete) || 0) < 100) {
+          upd.invoicePromptPending = true;
+          flaggedInvoice = true;
+        }
+        return upd;
+      });
+      if (!found) throw new Error("This milestone is no longer in the project — refresh the pane and try again.");
+      return { ...fresh, milestones };
+    });
+    renderMilestoneEventCard(); // re-render from the saved copy → shows "✓ Completed"
+    setStatus("milestoneEventStatus", "success",
+      "✓ Marked complete in PMS." + (flaggedInvoice ? " The PMS will offer to log the invoice next time this project is opened." : ""));
+  } catch (e) {
+    setStatus("milestoneEventStatus", "error", "✗ " + humanizeError(e));
+  } finally {
+    saveInFlight = false;
   }
 }
 async function restoreProjectSelectionForCurrentEmail() {
