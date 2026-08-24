@@ -55,6 +55,7 @@ let emailFromAddress = "";
 let emailParticipants = []; // { label, displayName, emailAddress }
 let currentItemKind = "message"; // message | appointment
 let currentItemICalUId = "";    // iCalUId for appointments — same across all attendees' mailboxes
+let currentItemRestId = "";     // Graph REST id for appointments — resolved async in compose mode
 let lastAttachmentUploadStats = null;
 let currentConversationId = "";
 // Context generation: incremented every time loadItemContext fires (= every
@@ -475,6 +476,7 @@ function loadItemContext() {
   refreshTeamsBtn();
   currentConversationId = "";
   currentItemICalUId = "";
+  currentItemRestId = "";
   emailParticipants = [];
   // Per-item ✓ "added this session" marks reset when item changes
   _sessionSavedContactEmails.clear();
@@ -487,12 +489,32 @@ function loadItemContext() {
   // last email's chosen name doesn't accidentally get applied to a new save.
   _customSpFolderName = "";
   if (!emailItem) return;
-  // For appointments, fetch the iCalUId in the background — it's the same across
-  // all attendees' mailboxes so we can use it to match notes saved by anyone on the team.
+  // For appointments, resolve the item id + iCalUId in the background.
+  // READ mode exposes item.itemId directly; COMPOSE mode (the organizer/edit
+  // view — the NORMAL way the calendar owner and shared-calendar editors open
+  // an event) only exposes it via getItemIdAsync (Mailbox 1.8). Before 8/24
+  // this used emailItem.itemId unconditionally, so in compose mode the
+  // convertToRestId call threw and BOTH ids stayed empty — the milestone-event
+  // card and iCalUId-keyed note matching silently never worked there.
   if (emailItem.itemType === Office.MailboxEnums.ItemType.Appointment) {
     void (async () => {
       try {
-        const restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0);
+        const rawId = await new Promise(resolve => {
+          if (emailItem?.itemId) return resolve(emailItem.itemId);
+          if (typeof emailItem?.getItemIdAsync === "function") {
+            try {
+              emailItem.getItemIdAsync(r => resolve(r?.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : ""));
+              return;
+            } catch { /* fall through */ }
+          }
+          resolve("");
+        });
+        if (myGen !== itemContextGeneration || !rawId) return;
+        const restId = Office.context.mailbox.convertToRestId(rawId, Office.MailboxEnums.RestVersion.v2_0);
+        currentItemRestId = restId || "";
+        // The rest id alone can already match a milestone synced from this
+        // mailbox — render before the Graph roundtrip, refine after.
+        try { renderMilestoneEventCard(); } catch { /* non-fatal */ }
         const ev = await graphFetch("GET", `/me/events/${restId}?$select=iCalUId`);
         // Stale-result guard — discard if user has moved to another item
         if (myGen !== itemContextGeneration) return;
@@ -503,10 +525,18 @@ function loadItemContext() {
         // The first pass (in loadItemContext) might have run before iCalUId
         // was available — without this re-fire, an appointment opened on a
         // device that's never tagged it would never auto-restore the tag.
-        if (!selectedProject && currentItemICalUId) {
+        if (!selectedProject && (currentItemICalUId || currentItemRestId)) {
           await restoreProjectSelectionForCurrentEmail();
         }
-      } catch { /* non-fatal */ }
+      } catch {
+        // Graph fetch failed — the rest id may still be usable for matching.
+        if (myGen === itemContextGeneration) {
+          try { renderMilestoneEventCard(); } catch { /* non-fatal */ }
+          if (!selectedProject && currentItemRestId) {
+            try { await restoreProjectSelectionForCurrentEmail(); } catch { /* non-fatal */ }
+          }
+        }
+      }
     })();
   }
   currentItemKind = emailItem.itemType === Office.MailboxEnums.ItemType.Appointment ? "appointment" : "message";
@@ -528,8 +558,12 @@ function loadItemContext() {
       document.getElementById("emailSubject").textContent = "(Loading…)";
       emailItem.subject.getAsync(r => {
         if (myGen !== itemContextGeneration) return; // user moved on
-        if (r.status === Office.AsyncResultStatus.Succeeded)
+        if (r.status === Office.AsyncResultStatus.Succeeded) {
           document.getElementById("emailSubject").textContent = r.value || "(No subject)";
+          // The milestone-event card's subject fallback can only match once
+          // the resolved subject exists — re-render now that it does.
+          try { renderMilestoneEventCard(); } catch { /* non-fatal */ }
+        }
       });
     } else {
       document.getElementById("emailSubject").textContent = emailItem.subject || "(No subject)";
@@ -3393,10 +3427,14 @@ function findMilestoneForCurrentEvent() {
   // Same-mailbox Graph event id — matches milestones synced from THIS mailbox
   // (most were synced by the calendar owner). Most legacy synced milestones
   // carry only calendarEventId, not the mailbox-independent calendarEventUid.
-  let restId = "";
-  try {
-    if (emailItem?.itemId) restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0) || "";
-  } catch { /* non-fatal */ }
+  // currentItemRestId is resolved async (compose mode needs getItemIdAsync);
+  // the sync compute below covers read mode before that resolution lands.
+  let restId = currentItemRestId || "";
+  if (!restId) {
+    try {
+      if (emailItem?.itemId) restId = Office.context.mailbox.convertToRestId(emailItem.itemId, Office.MailboxEnums.RestVersion.v2_0) || "";
+    } catch { /* non-fatal */ }
+  }
   if (uid || restId) {
     for (const p of allProjects) {
       const m = (p.milestones || []).find(x => !x.cancelled && (
@@ -3406,13 +3444,21 @@ function findMilestoneForCurrentEvent() {
       if (m) return { project: p, milestone: m };
     }
   }
-  const subj = typeof emailItem?.subject === "string" ? emailItem.subject.trim() : "";
+  // Subject fallback — getResolvedItemSubject also works in compose mode once
+  // the async subject fetch has populated the header. TWO event-subject
+  // formats exist and must both match:
+  //   PMS sync (nycEventSubject):        "[number] name - milestone"
+  //   add-in createMilestoneCalendarEvent: "number name — milestone" (em dash)
+  const subj = (getResolvedItemSubject() || "").trim();
   if (subj) {
     for (const p of allProjects) {
-      // Mirrors the PMS's nycEventSubject(): "[number] name - milestone"
-      const prefix = (p.projectNumber ? "[" + p.projectNumber + "] " : "") + (p.name || "Project") + " - ";
-      if (!subj.startsWith(prefix)) continue;
-      const rest = subj.slice(prefix.length).trim();
+      const num = p.projectNumber || "";
+      const pmsPrefix   = (num ? "[" + num + "] " : "") + (p.name || "Project") + " - ";
+      const addinPrefix = (num ? num + " " : "") + (p.name || "") + " — ";
+      let rest = "";
+      if (subj.startsWith(pmsPrefix)) rest = subj.slice(pmsPrefix.length).trim();
+      else if (subj.startsWith(addinPrefix)) rest = subj.slice(addinPrefix.length).trim();
+      if (!rest) continue;
       const m = (p.milestones || []).find(x =>
         !x.cancelled && x.calendarEventId && String(x.name || "").trim() === rest);
       if (m) return { project: p, milestone: m };
