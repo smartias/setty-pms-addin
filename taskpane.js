@@ -2299,6 +2299,9 @@ async function legacyApplyLocalChangeAndSave(projectId, mutateProject) {
     freshProjects = allProjects;
   }
   const idx = freshProjects.findIndex(p => p.id === projectId);
+  // Session can expire between the entry guard and this re-fetch — recheck
+  // before blaming the project (signed-out reads come back empty, not 401).
+  if (idx < 0 && _signedOutForSaves()) throw new Error(SIGNED_OUT_SAVE_MSG);
   if (idx < 0) throw new Error("Project no longer exists in PMS.");
   const mutated = mutateProject(freshProjects[idx]);
   if (!mutated || !mutated.id) throw new Error("mutator returned invalid project");
@@ -2330,9 +2333,26 @@ async function _checkAddinMigrationStatus() {
   }
 }
 
+// Post-RLS-flip, a signed-out (anon) token doesn't error — Supabase just
+// returns ZERO rows. Every read looks like a deletion and every conditional
+// write silently matches nothing, so a signed-out save used to surface as
+// "✗ Project no longer exists in PMS" (it existed; the session had expired).
+// Guarded on window.settyAuth so the shim (setty-auth.js failed to load)
+// keeps the old behavior rather than blocking every save.
+function _signedOutForSaves() {
+  return !!window.settyAuth && !_settyAuth.isSignedIn();
+}
+const SIGNED_OUT_SAVE_MSG =
+  "You're signed out of the Setty suite, so PMS data can't be read or saved " +
+  "(a signed-out session can look like a missing project). Click the 🔐 Sign in " +
+  "pill at the bottom-right of the pane, then try again.";
+
 // Main entry point — used by all save callsites in the add-in.
 async function applyLocalChangeAndSave(projectId, mutateProject) {
   if (!projectId) throw new Error("applyLocalChangeAndSave: missing projectId");
+  // init() may still be refreshing a stale session — settle it before judging.
+  await settyAuthReady;
+  if (_signedOutForSaves()) throw new Error(SIGNED_OUT_SAVE_MSG);
 
   // Try V2 path first
   let fresh;
@@ -2390,6 +2410,7 @@ async function applyLocalChangeAndSave(projectId, mutateProject) {
     // case — this used to POST a skeleton row built from a bare {id}, which
     // resurrected projects deleted in PMS as ghost rows containing only the
     // new note/email (name, number, folder URL, milestones all missing).
+    if (_signedOutForSaves()) throw new Error(SIGNED_OUT_SAVE_MSG);
     throw new Error("This project no longer exists in PMS (it may have been deleted). Refresh the pane and pick another project.");
   }
 
@@ -11671,6 +11692,10 @@ function humanizeError(err) {
     return "Outlook hasn't synced this message to the cloud yet — wait a few seconds and retry.";
   if (m.includes("graph 429") || m.includes("graph 503") || m.includes("graph 504"))
     return "Microsoft is throttling requests right now — wait a moment and retry.";
+  // Setty-suite (Supabase) sign-out — distinct from the MSAL/Graph branch
+  // above: the fix is the 🔐 pill, not Outlook's Sign out/Sign in cycle.
+  if (m.includes("signed out of the setty suite"))
+    return "You're signed out — click the 🔐 Sign in pill at the bottom-right of the pane, then retry.";
   if (m.includes("save conflict") || m.includes("modified by someone else"))
     return "Someone else updated this project at the same moment. Retry — the add-in re-reads the latest version before saving.";
   if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))
