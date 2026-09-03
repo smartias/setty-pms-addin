@@ -1237,7 +1237,7 @@ async function createOrUpdateCalendarEvent(milestone, projectName, projectNumber
   endDateObj.setDate(endDateObj.getDate() + 1);
   const endDate = endDateObj.toISOString().slice(0, 10);
 
-  const prefix = projectNumber ? "[" + projectNumber + "] " : "";
+  const prefix = projectNumber ? projectNumber + " " : "";
   const subject = prefix + projectName + " - " + milestone.name;
 
   const eventBody = {
