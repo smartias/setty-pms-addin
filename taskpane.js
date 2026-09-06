@@ -3389,7 +3389,13 @@ async function autoSaveEmailToRecord() {
     await ensureProjectEmailMeta(selectedProject.id);
     if (myGen !== itemContextGeneration) return; // user moved on during fetch
     if (!selectedProject) return;
-    if (findSavedEmailRecord(selectedProject, msgId)) return;  // already filed
+    if (findSavedEmailRecord(selectedProject, msgId)) {
+      // Already filed — but our own sent replies on this thread may not be:
+      // the filer logs only the item you OPEN, and nobody opens their own
+      // Sent Items (the 7/31 outbound blind spot). Sweep the conversation.
+      void backfillCurrentConversationOutbound(selectedProject);
+      return;
+    }
     // Respect the process-wide save lock. Auto-save used to bypass it and
     // race user-initiated saves on the version counter — both fetch v10, one
     // PATCHes to v11, the other's version=eq.10 matches 0 rows → a phantom
@@ -3406,8 +3412,104 @@ async function autoSaveEmailToRecord() {
     saveInFlight = true; // hold the lock so a user click can't race US either
     try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
     finally { saveInFlight = false; _autoSavingMsgId = null; }
+    void backfillCurrentConversationOutbound(selectedProject); // catch our sent replies too
   } catch (e) {
     console.warn("auto-save failed:", e);
+  }
+}
+
+// ── OUTBOUND CONVERSATION BACKFILL ───────────────────────────────────────────
+// The filer logs only the item you OPEN, and nobody opens their own Sent
+// Items — so on a tagged thread outbound replies were never logged and the
+// record advanced only on inbound mail (diagnosed 2026-07-31; Sara chose
+// outbound-only reach 2026-09-06). When a tagged email opens, quietly sweep
+// the SAME conversation's Sent Items for unfiled messages and file them.
+// The filtered /me/messages query does not reliably include the user's own
+// Sent Items (the same mailbox fact isThreadAwaitingReply works around), so
+// Sent Items is queried directly — which for outbound-only reach is also the
+// cheaper query.
+const _backfilledConvos = new Set(); // one sweep per project+conversation per pane session
+const BACKFILL_MAX_PER_OPEN = 8;     // bound the quiet Graph + save work per open
+async function backfillCurrentConversationOutbound(project) {
+  try {
+    if (currentItemKind !== "message") return;
+    const convId = currentConversationId || await getCurrentConversationId();
+    if (convId) await backfillConversationOutbound(project, convId);
+  } catch (e) { console.warn("[backfill] convo resolve failed:", e?.message || e); }
+}
+async function backfillConversationOutbound(project, conversationId) {
+  const guardKey = (project?.id || "") + "|" + conversationId;
+  try {
+    if (!project || !conversationId) return;
+    if (_backfilledConvos.has(guardKey)) return;
+    _backfilledConvos.add(guardKey);
+    const token = await getToken();
+    const filter = "conversationId eq '" + conversationId.replace(/'/g, "''") + "'";
+    const qs = "?$filter=" + encodeURIComponent(filter) +
+      "&$top=50&$select=id,internetMessageId,subject,from,toRecipients,ccRecipients,sentDateTime,receivedDateTime,hasAttachments";
+    const sent = await graphFetch("GET", "/me/mailFolders/sentitems/messages" + qs, null, token);
+    const withId = (sent?.value || []).filter(m => m.internetMessageId); // no id = draft, unfileable
+    if (!withId.length) return;
+    await ensureProjectEmailMeta(project.id);
+    const unfiled = withId.filter(m => !findSavedEmailRecord(project, m.internetMessageId))
+      .slice(0, BACKFILL_MAX_PER_OPEN);
+    if (!unfiled.length) return;
+    const records = [];
+    for (const m of unfiled) {
+      // Body per message, best-effort — a record with headers but no body
+      // still completes the thread; inline-image embedding is deliberately
+      // skipped (these are our own sent messages, SharePoint has originals).
+      let bodyHtml = "";
+      try {
+        const d = await graphFetch("GET", "/me/messages/" + m.id + "?$select=body", null, token);
+        bodyHtml = d?.body?.content || "";
+      } catch (e) { console.warn("[backfill] body fetch failed:", e?.message || e); }
+      const from = m.from?.emailAddress || {};
+      records.push({
+        id: uid(), msgId: m.internetMessageId,
+        subject: m.subject || "",
+        from: from.name || "", fromAddress: from.address || "",
+        to: (m.toRecipients || []).map(r => r.emailAddress?.address).filter(Boolean).join(", "),
+        cc: (m.ccRecipients || []).map(r => r.emailAddress?.address).filter(Boolean).join(", "),
+        date: m.sentDateTime || m.receivedDateTime || null,
+        bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
+        bodyHtmlCompressed: bodyHtml ? compressHtmlAddin(bodyHtml) : "",
+        bodyHtmlSize: bodyHtml.length,
+        hasAttachments: !!m.hasAttachments, attachmentNames: [],
+        spFolderUrl: "", links: [],
+        savedAt: new Date().toISOString(),
+        savedBy: _getCurrentUserEmail() || "",
+        savedToSharePoint: false,
+      });
+    }
+    // Same save-lock etiquette as auto-save: wait bounded, never race a user
+    // save on the version counter. On timeout, drop the guard so a later open
+    // of this thread retries.
+    for (let waited = 0; saveInFlight && waited < 20000; waited += 500) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (saveInFlight) { _backfilledConvos.delete(guardKey); return; }
+    saveInFlight = true;
+    try {
+      await applyLocalChangeAndSave(project.id, fresh => {
+        const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
+        const add = records.filter(r => !have.has(r.msgId));
+        return add.length ? { ...fresh, emails: [...(fresh.emails || []), ...add] } : fresh;
+      });
+      for (const r of records) {
+        // Index writes are per-row best-effort: one failure shouldn't strand
+        // the rest, and saveProjectEmailRow already patches the meta cache.
+        try { await saveProjectEmailRow(project.id, r, false, conversationId); }
+        catch (e) { console.warn("[backfill] index write failed:", e?.message || e); }
+      }
+    } finally { saveInFlight = false; }
+    console.log("[backfill] filed " + records.length + " sent message(s) from this thread to " + (project.name || project.id));
+    setStatus("actionStatus", "success",
+      "✓ Also logged " + records.length + " sent repl" + (records.length === 1 ? "y" : "ies") + " from this thread.");
+  } catch (e) {
+    // Retry on a later open rather than permanently skipping the thread.
+    _backfilledConvos.delete(guardKey);
+    console.warn("[backfill] failed:", e?.message || e);
   }
 }
 // Refreshes the "Calendar event detected" / "Already logged" status message.
@@ -3820,6 +3922,21 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
   const numMatches = [...subj.matchAll(/\b(\d{4,6})\b/g)].map(m => m[1]);
   const senderDomain = (senderEmail || "").toLowerCase().split("@")[1] || "";
   const senderClient = senderDomain ? getClientByEmail(senderEmail) : null;
+  // Outbound mail loses the sender-company signal — WE are the sender, so
+  // getClientByEmail(sender) is null and the +4 never fired (7/31 diagnosis).
+  // Recover it from the RECIPIENTS: on mail from a Setty address, each
+  // external To/CC recipient's company scores the same way the sender's
+  // company scores inbound. Measured over filed outbound mail: this covers
+  // ~2,600 of 8,884; the learned-map-on-recipients variant added only 19 more,
+  // so it deliberately stays company-match only.
+  const recipientClientNames = new Set();
+  if (isSettyInternalEmail(senderEmail)) {
+    for (const pt of (participants || [])) {
+      if (pt.label !== "To" && pt.label !== "CC") continue;
+      const c = getClientByEmail(pt.emailAddress || "");
+      if (c && c.name) recipientClientNames.add(c.name.toLowerCase().trim());
+    }
+  }
 
   const scored = [];
   for (const p of (allProjects || [])) {
@@ -3852,6 +3969,12 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
       if (projClient && projClient === (senderClient.name || "").toLowerCase().trim()) {
         score += SUGGESTION_WEIGHTS.senderDomainMatchClient;
         reasons.push("sender's company");
+      }
+    } else if (recipientClientNames.size) {
+      const projClient = (p.prime || p.clientName || "").toLowerCase().trim();
+      if (projClient && recipientClientNames.has(projClient)) {
+        score += SUGGESTION_WEIGHTS.senderDomainMatchClient;
+        reasons.push("recipient's company");
       }
     }
 
@@ -3978,6 +4101,42 @@ function sweepParticipants(msg) {
     const a = r.emailAddress?.address; if (a) out.push({ label: "CC", emailAddress: a });
   }
   return out;
+}
+
+// Outbound mail could barely be scored in the sweep: the learned sender map
+// rightly excludes internal senders (they span too many jobs to discriminate)
+// and the sweep is subject-only — so a sent email with no project # in the
+// subject had NO signal at all and was always skipped (the 7/31 outbound
+// blind spot). Recover the company signal from the RECIPIENTS, outbound mail
+// only: a To/CC recipient whose company is a known client scores that
+// client's projects the same +4 the sender's company would score inbound.
+// Boost-or-add like mergeSenderSignal. classifySweep still auto-files ONLY on
+// a project # in the subject, so a bare recipient-company match can at most
+// enter the human review queue, never file by itself.
+function applyRecipientClientSignal(candidates, msg) {
+  const from = msg?.from?.emailAddress?.address || "";
+  if (!isSettyInternalEmail(from)) return candidates;
+  const clientNames = new Set();
+  for (const pt of sweepParticipants(msg)) {
+    const c = getClientByEmail(pt.emailAddress);
+    if (c && c.name) clientNames.add(c.name.toLowerCase().trim());
+  }
+  if (!clientNames.size) return candidates;
+  const have = new Map(candidates.map(c => [c.project.id, c]));
+  for (const p of (allProjects || [])) {
+    if (!p || p.archived || (!p.name && !p.projectNumber)) continue;
+    const projClient = (p.prime || p.clientName || "").toLowerCase().trim();
+    if (!projClient || !clientNames.has(projClient)) continue;
+    const existing = have.get(p.id);
+    if (existing) {
+      existing.score += SUGGESTION_WEIGHTS.senderDomainMatchClient;
+      existing.reasons.push("recipient's company");
+    } else {
+      candidates.push({ project: p, score: SUGGESTION_WEIGHTS.senderDomainMatchClient, reasons: ["recipient's company"] });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score || (a.project.name || "").localeCompare(b.project.name || ""));
+  return candidates;
 }
 
 // Confidence policy (tightened after live testing — auto-file must be near-certain):
@@ -4486,7 +4645,9 @@ async function sweepScanBatch({ base, token, cursor }) {
         }
         if (seen === "review") { out.alreadyFiled++; continue; } // thread already queued once this run
       }
-      const verdict = classifySweep(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())), filterId);
+      const verdict = classifySweep(
+        applyRecipientClientSignal(mergeSenderSignal(sweepSuggest(m.subject || ""), senderMap.get(sender.toLowerCase())), m),
+        filterId);
       if (verdict.action === "skip") { out.skip++; continue; }
       if (verdict.action === "file") {
         if (item.convId) _sweepConvoSeen.set(item.convId, verdict.project.id);
