@@ -11428,12 +11428,25 @@ function buildAskClaudeMenuEntries() {
     "Produce the standard Setty two-tab Open Items & Design Assumptions Log workbook.",
   ]);
 
-  return [
+  const entries = [
     { icon: "💬", title: "Ask about this job", desc: "Briefing: what needs attention, risks, next steps", url: () => jobcardAskUrl },
     { icon: "✉️", title: "Help me respond to this email", desc: "Thread history, recommended reply, next steps", url: emailResponseUrl },
     { icon: "📅", title: "Prep my next meeting", desc: "Per-item status, decisions, open questions, sources", url: meetingPrepUrl },
     { icon: "✅", title: "Build the open items log", desc: "Assumptions and awaited items for the next deliverable", url: openItemsUrl },
   ];
+  // Work-in-the-folder — the one entry that is NOT a chat. Mirrors the PMS
+  // jobcard: routes through the bridge page (task panes can only open https)
+  // with verb=cowork, which fires settypms:cowork → a Claude Code session IN
+  // the synced project folder. Same folder-name extraction as
+  // openSelectedProjectExplorer; machines without the handler get the bridge
+  // page's setup pointers instead of a dead end.
+  const coworkName = safeDecodeFolderUrl(String(project.projectFolderUrl || "").replace(/\/+$/, "").split("/").pop() || "").trim();
+  if (coworkName) entries.push({
+    icon: "📁", title: "Work in the project folder",
+    desc: "Opens Claude Code inside the synced folder to work on the actual files",
+    url: () => "https://smartias.github.io/setty-pms/explorer-bridge/open.html?verb=cowork&folder=" + encodeURIComponent(coworkName),
+  });
+  return entries;
 }
 
 function closeAskClaudeMenu() {
