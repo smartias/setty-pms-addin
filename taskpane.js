@@ -2634,10 +2634,17 @@ async function logFilingOp(record) {
     retried:        record.retried || 0,
   };
   try {
+    const body = JSON.stringify(row);
     const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + FILING_LOG_TABLE, {
       method: "POST",
       headers: { ...SB_HEADERS, Prefer: "return=minimal" },
-      body: JSON.stringify(row),
+      body,
+      // keepalive lets the insert outlive the pane: if the user closes the
+      // taskpane (or Outlook navigates) right after a save completes, the
+      // browser still delivers the request instead of aborting it. Browsers
+      // cap keepalive bodies at 64 KB, so only ask for it when the row fits —
+      // a save with hundreds of attachments still logs, just without it.
+      keepalive: body.length < 60000,
     }, { label: "sb filing-log insert", maxAttempts: 2 });
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
@@ -2678,8 +2685,19 @@ async function fetchRecentFilingLog(projectId, sinceIso) {
 // open, any leftover entries indicate "a save was interrupted — retry it."
 //
 // Entry shape: { queueId, project_id, project_name, msg_id, operation,
-//                email_subject, started_at, attempts }
+//                email_subject, started_at, attempts,
+//                completed_at?, pendingLog? }
+//   completed_at + pendingLog mark a save whose UPLOAD finished but whose
+//   audit-log row never landed (network blip, pane closed mid-insert). Such
+//   an entry is not an interrupted save — nothing needs re-uploading — so it
+//   never shows in the "did not complete" banner; flushPendingFilingLogs()
+//   re-sends the stored row on the next taskpane open and dequeues it then.
 // Map shape: { [queueId]: entry }
+//
+// One entry per (msg_id, operation): a retry of the same save reuses the
+// existing entry's queueId and bumps `attempts`, so a save that failed once
+// and then succeeded is dequeued by the success — not left behind as a ghost
+// that nags for seven days about an email that was in fact filed.
 const FILING_QUEUE_KEY = "settyPms:filingQueue";
 
 function _readFilingQueue() {
@@ -2691,10 +2709,26 @@ function _writeFilingQueue(q) {
   }
 }
 
+// Finds the queueId of an existing entry for the same (msg_id, operation) so a
+// retry continues that entry instead of minting a sibling. Entries without a
+// msg_id (rare — item id unavailable) can't be matched and always get a fresh id.
+function _findFilingIntentId(q, msgId, operation) {
+  if (!msgId) return null;
+  for (const id in q) {
+    const e = q[id];
+    if (e && e.msg_id === msgId && e.operation === operation) return id;
+  }
+  return null;
+}
+
 function enqueueFilingIntent(entry) {
   if (!entry || !entry.project_id || !entry.operation) return null;
-  const queueId = entry.queueId || (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7));
   const q = _readFilingQueue();
+  const queueId = entry.queueId
+    || _findFilingIntentId(q, entry.msg_id || null, entry.operation)
+    || (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7));
+  // A re-save replaces any completed-but-unlogged marker: the user is filing
+  // this email again, so the new attempt's own outcome is what gets logged.
   q[queueId] = {
     queueId,
     project_id:    entry.project_id,
@@ -2718,6 +2752,44 @@ function dequeueFilingIntent(queueId) {
   }
 }
 
+// Success path for every filing flow: write the audit row, and only THEN
+// clear the crash-recovery intent. The old order (fire-and-forget insert,
+// then an immediate synchronous dequeue) had a hole the queue was built to
+// close: close the pane in that window and neither the log row nor the queue
+// entry survives, so a real save left no record anywhere. Now, if the insert
+// fails, the entry stays — flagged completed, carrying the row — and is
+// re-sent on next open by flushPendingFilingLogs(). Nothing is re-uploaded.
+// Returns true when the row landed and the entry was cleared.
+async function completeFilingIntent(queueId, record) {
+  const logged = await logFilingOp(record);
+  if (logged) {
+    dequeueFilingIntent(queueId);
+    return true;
+  }
+  if (queueId) {
+    const q = _readFilingQueue();
+    if (q[queueId]) {
+      q[queueId].completed_at = new Date().toISOString();
+      q[queueId].pendingLog = record;
+      _writeFilingQueue(q);
+    }
+  }
+  return false;
+}
+
+// Re-sends audit rows for saves that completed but never got logged (see
+// completeFilingIntent). Best-effort and sequential; an entry that still
+// won't log stays for the next open, until the 7-day prune.
+async function flushPendingFilingLogs() {
+  const q = _readFilingQueue();
+  const ids = Object.keys(q).filter(id => q[id] && q[id].pendingLog);
+  for (const id of ids) {
+    const record = { ...q[id].pendingLog, retried: (q[id].pendingLog.retried || 0) + 1 };
+    const logged = await logFilingOp(record);
+    if (logged) dequeueFilingIntent(id);
+  }
+}
+
 // Returns array of entries that have been pending too long ("orphaned"). The
 // definition of "too long" is a generous 60s — anything older than that on
 // taskpane open is almost certainly a crash from a previous session, not an
@@ -2728,6 +2800,7 @@ function getOrphanedFilingIntents() {
   const out = [];
   for (const id in q) {
     const entry = q[id];
+    if (!entry || entry.pendingLog) continue; // upload finished; only the log row is owed
     const age = now - new Date(entry.started_at).getTime();
     if (age > 60 * 1000) out.push(entry);
   }
@@ -2755,6 +2828,9 @@ function pruneAncientFilingIntents() {
 // the recovery path simple (no Graph-only fetch + reconstruction logic).
 function showPendingFilingBanner() {
   pruneAncientFilingIntents();
+  // Saves that finished but never logged: re-send their audit rows in the
+  // background. They're excluded from the banner either way.
+  flushPendingFilingLogs().catch(e => console.warn("[filing-queue] log flush failed:", e.message));
   const pending = getOrphanedFilingIntents();
   const banner = document.getElementById("filingPendingBanner");
   if (!banner) {
@@ -7492,7 +7568,8 @@ async function withFilingScaffold(opts, runUpload) {
     if (result?.successMessage != null) {
       setStatus(statusElement, "success", result.successMessage);
     }
-    void logFilingOp({
+    // Log first, dequeue only once the row landed — see completeFilingIntent.
+    await completeFilingIntent(queueId, {
       project_id:    selectedProject.id,
       msg_id:        snapItem?.itemId || null,
       operation,
@@ -7502,7 +7579,6 @@ async function withFilingScaffold(opts, runUpload) {
       status:        result?.status || "success",
       error:         result?.error || null,
     });
-    dequeueFilingIntent(queueId);
     return result;
   } catch (e) {
     setStatus(statusElement, "error", "✗ " + humanizeError(e));
@@ -7808,7 +7884,9 @@ if (existingRecord) {
     }
     // Append to the filing-integrity audit log so PMS can reconcile this save.
     // Status reflects whether the upload was clean or partial — verified flag
-    // gets set by Phase 2 read-back once that lands. Fire-and-forget.
+    // gets set by Phase 2 read-back once that lands. Written (and awaited) by
+    // completeFilingIntent below, after the UI refresh, so the queue entry is
+    // only cleared once the row has actually landed.
     // A detached SP link counts as partial: the bytes are filed but the project
     // record can't point at them, which is exactly what a reconcile sweep needs
     // to see. Without this the row would log clean and the miss would be
@@ -7818,7 +7896,7 @@ if (existingRecord) {
       (attempted > 0 && attCount < attempted)      ? "partial" :
       spLinkAttachFailed                           ? "partial" :
       "success";
-    void logFilingOp({
+    const filingRecord = {
       project_id:    selectedProject.id,
       msg_id:        msgId,
       operation:     "email-sp",
@@ -7827,7 +7905,7 @@ if (existingRecord) {
       email_subject: snapSubject,
       status,
       error:         status === "success" ? null : (warnings.join(" ") || `${attCount}/${attempted} uploaded`),
-    });
+    };
     // One-shot custom name consumed — clear so the next email's save uses
     // subject-default unless explicitly renamed again.
     _customSpFolderName = "";
@@ -7840,10 +7918,11 @@ if (existingRecord) {
     try { refreshLinkToTargetDropdown(); } catch {}
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
-    // Save completed without throwing — clear crash-recovery queue entry.
-    // (Partial successes still dequeue: the user has the status message and
-    // a "partial" audit log row; the queue is only for crash recovery.)
-    dequeueFilingIntent(queueId);
+    // Save completed without throwing — log it, then clear the crash-recovery
+    // queue entry once the row has landed. (Partial successes still dequeue:
+    // the user has the status message and a "partial" audit log row; the
+    // queue is only for crash recovery.)
+    await completeFilingIntent(queueId, filingRecord);
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     void logFilingOp({
