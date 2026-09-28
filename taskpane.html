@@ -594,6 +594,16 @@
     .suggestion-chip .sc-num { font-size: 11px; color: var(--text-faint); font-family: "Consolas", monospace; }
     .suggestion-chip .sc-name { font-size: 13px; color: var(--text); font-weight: 600; }
     .suggestion-chip .sc-reason { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+    /* Region tag beside the number: muted for the caller's own region, amber
+       when the suggestion comes from another office so it can be dismissed
+       at a glance. */
+    .suggestion-chip .sc-team {
+      display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px;
+      font-size: 10px; font-weight: 600; letter-spacing: 0.03em; font-family: inherit;
+      color: var(--text-soft); background: var(--border);
+    }
+    .suggestion-chip .sc-team-other { color: #7a5a00; background: var(--warn-bg); border: 1px solid #f1d875; }
+    .suggestion-region { font-size: 11px; padding: 1px 4px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--bg); color: var(--text-soft); font-family: inherit; }
     /* Response watchlist — amber to read as a "you owe a reply" nudge, distinct
        from the blue suggestion blocks. */
     .watchlist-block {
@@ -888,7 +898,10 @@
 
   <!-- Project suggestion chips — shown when no project tag exists for this thread -->
   <div id="suggestionBlock" class="suggestion-block" style="display:none;">
-    <div class="suggestion-label">💡 <span id="suggestionLabelText">Possible projects</span></div>
+    <div class="suggestion-label" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <span>💡 <span id="suggestionLabelText">Possible projects</span></span>
+      <select id="suggestionRegion" class="suggestion-region" title="Favour this region's projects in the suggestions (ranking only; search stays firm-wide)" style="display:none;"></select>
+    </div>
     <div id="suggestionChips"></div>
   </div>
 

@@ -43,6 +43,15 @@ const SP_LIBRARY   = "Project Document Library";
 let msalApp = null;
 let msalAccount = null;
 let allProjects = [];
+// pms_projects.team (NY / DC / BT) per project id — a real column on the row,
+// never a key inside the project blob (the PMS keeps it that way, and save
+// flows re-fetch and merge the blob). Kept beside allProjects for the same
+// reason. Empty on the legacy pms_data path, so callers treat null as unknown.
+let _projectTeamById = new Map();
+function projectTeamOf(p) {
+  const t = p && p.id ? _projectTeamById.get(p.id) : null;
+  return t ? String(t).toUpperCase() : null;
+}
 let allClients = [];
 let selectedProject = null;
 // Ask-Claude URL for the CURRENT jobcard — built by renderJobcard (it already
@@ -1995,7 +2004,7 @@ function loadProjectsCache() {
   }
 }
 
-function saveProjectsCache(projects, clients, versionMap) {
+function saveProjectsCache(projects, clients, versionMap, teamMap) {
   try {
     // Surgical strip: keep all top-level fields and nested arrays, drop only
     // large content fields within each nested record. See _stripProjectForCache
@@ -2004,6 +2013,7 @@ function saveProjectsCache(projects, clients, versionMap) {
       projects: (projects || []).map(_stripProjectForCache),
       clients:  clients || [],
       versionMap: versionMap || {},
+      teamMap: teamMap || {},
       savedAt: Date.now(),
     };
     if (typeof pako === "undefined") {
@@ -2065,6 +2075,7 @@ async function loadProjects() {
     for (const [id, ver] of Object.entries(cached.versionMap || {})) {
       _projectVersionCache.set(id, ver);
     }
+    _projectTeamById = new Map(Object.entries(cached.teamMap || {}));
     renderCompanySuggestions();
     renderedFromCache = true;
   }
@@ -2083,7 +2094,7 @@ async function loadProjects() {
     // flows still re-fetch the FULL row (fetchFreshProjectV2) so email-append
     // mutators always merge against the complete inline array.
     const [pRows, cRows] = await Promise.all([
-      sbFetchAllRows("pms_projects_slim?select=id,project,version&order=id.asc", "sb loadProjects v2 projects"),
+      sbFetchAllRows("pms_projects_slim?select=id,project,version,team&order=id.asc", "sb loadProjects v2 projects"),
       sbFetchAllRows("pms_clients?select=client&order=id.asc", "sb loadProjects v2 clients"),
     ]);
     if (pRows && cRows) {
@@ -2091,14 +2102,17 @@ async function loadProjects() {
         // V2 path
         allProjects = pRows.map(r => r.project).filter(p => p && !p.archived);
         const versionMap = {};
+        const teamMap = {};
         for (const r of pRows) {
           _projectVersionCache.set(r.id, r.version);
           versionMap[r.id] = r.version;
+          if (r.team) teamMap[r.id] = r.team;
         }
+        _projectTeamById = new Map(Object.entries(teamMap));
         allClients = (cRows || []).map(r => r.client).filter(Boolean);
         renderCompanySuggestions();
         // Refresh the cache with the latest data
-        saveProjectsCache(allProjects, allClients, versionMap);
+        saveProjectsCache(allProjects, allClients, versionMap, teamMap);
         // Milestone-event card may have rendered from the slim cache (or not at
         // all, on a first-ever pane open) — re-render from the fresh rows.
         try { renderMilestoneEventCard(); } catch {}
@@ -3920,7 +3934,11 @@ function suggestionAcronyms(name) {
   for (let i = 0; i < words.length; i++) {
     for (let j = i + 2; j <= words.length; j++) {
       const acro = words.slice(i, j).map(w => w.charAt(0).toLowerCase()).join("");
-      if (acro.length >= 2 && acro.length <= 6 && /^[a-z]+$/.test(acro)) out.add(acro);
+      // Three letters minimum (was two): with every region's projects in the
+      // pool, two-letter initials collide with ordinary subject words — "CA"
+      // (construction administration), "SD", "PM" — and a lone acronym hit
+      // clears SUGGESTION_MIN_SCORE by itself. Applies to the sweep too.
+      if (acro.length >= 3 && acro.length <= 6 && /^[a-z]+$/.test(acro)) out.add(acro);
     }
   }
   return out;
@@ -3989,13 +4007,67 @@ function directorySignalScore(project, participants, senderEmail) {
   }
   return { points, reasons };
 }
+// ─── CALLER'S REGION (ranking preference) ────────────────────────────────────
+// Which office's projects to favour in the chips. Explicit choice first (the
+// small selector on the suggestion block, kept in localStorage), else the team
+// on the caller's PMS role row, read once per session through pms_caps_for —
+// the same RPC the connector resolves callers with. Any failure (RPC not
+// granted to this role, no role row, offline) leaves the region unknown and
+// the ranking exactly as before. Never restricts what can be searched or filed.
+const MY_REGION_KEY = "settyPms:myRegion";
+let _myRegionAuto = null;
+let _myRegionPromise = null;
+function myRegion() {
+  try {
+    const v = (localStorage.getItem(MY_REGION_KEY) || "").trim().toUpperCase();
+    if (v === "ANY") return null;
+    if (v) return v;
+  } catch {}
+  return _myRegionAuto;
+}
+function setMyRegion(v) {
+  try {
+    const val = (v || "").trim().toUpperCase();
+    if (val) localStorage.setItem(MY_REGION_KEY, val); else localStorage.removeItem(MY_REGION_KEY);
+  } catch {}
+}
+function ensureMyRegion(onReady) {
+  if (_myRegionPromise) return _myRegionPromise;
+  _myRegionPromise = (async () => {
+    const email = (_getCurrentUserEmail() || "").trim().toLowerCase();
+    if (!email) return;
+    try {
+      const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/pms_caps_for", {
+        method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation" },
+        body: JSON.stringify({ p_email: email }),
+      });
+      if (!res.ok) return;
+      let j = await res.json();
+      if (Array.isArray(j)) j = j[0];   // a set-returning variant comes back as rows
+      const team = j && typeof j === "object" && j.team ? String(j.team).trim().toUpperCase() : "";
+      if (team) _myRegionAuto = team;
+    } catch { /* unknown region: no preference applied */ }
+  })();
+  if (typeof onReady === "function") _myRegionPromise.then(onReady);
+  return _myRegionPromise;
+}
+// Regions present in the loaded project list, for the selector.
+function knownRegions() {
+  return [...new Set([..._projectTeamById.values()].map(t => String(t || "").toUpperCase()).filter(Boolean))].sort();
+}
+
 function suggestProjects(subject, senderEmail, participants = emailParticipants) {
   const subj = (subject || "").toLowerCase();
   if (!subj && !senderEmail) return [];
-  const subjTokens = new Set(suggestionTokenize(subj));
-  // Project number heuristic — most Setty project numbers are 5 digits but we
-  // accept 4-6 to be tolerant of legacy/special projects.
-  const numMatches = [...subj.matchAll(/\b(\d{4,6})\b/g)].map(m => m[1]);
+  // Same tokenizer as the sweep: drops the generic AEC / agency words
+  // ("hvac", "campus", "dasny") and bare short numbers that matched dates.
+  const subjTokens = new Set(sweepTokenize(subj));
+  // The caller's region (see myRegion). Text signals from OTHER regions'
+  // projects are halved, so a lone name word or acronym from a job in another
+  // office cannot clear SUGGESTION_MIN_SCORE on its own; the strong signals
+  // (number, client, directory, PM, known sender) are untouched. A ranking
+  // preference only — the project search box stays firm-wide.
+  const region = myRegion();
   const senderDomain = (senderEmail || "").toLowerCase().split("@")[1] || "";
   const senderClient = senderDomain ? getClientByEmail(senderEmail) : null;
   // Outbound mail loses the sender-company signal — WE are the sender, so
@@ -4021,24 +4093,35 @@ function suggestProjects(subject, senderEmail, participants = emailParticipants)
     let score = 0;
     const reasons = [];
 
-    if (p.projectNumber && numMatches.includes(String(p.projectNumber))) {
+    // The sweep's matcher: the SAPX number with or without its .00 suffix, or
+    // the prime's number. The old bare-digit-run compare never matched a
+    // "SAPX256010.00"-form number, so this strongest signal was not firing
+    // in the chips at all.
+    if (subjectHasProjectId(subj, p)) {
       score += SUGGESTION_WEIGHTS.projectNumberInSubject;
       reasons.push("project # in subject");
     }
 
-    const projTokens = suggestionTokenize(p.name || "");
+    let textPoints = 0;
+    const projTokens = sweepTokenize(p.name || "");
     const tokenHits = projTokens.filter(t => subjTokens.has(t));
     if (tokenHits.length) {
-      score += tokenHits.length * SUGGESTION_WEIGHTS.perNameTokenInSubject;
+      textPoints += tokenHits.length * SUGGESTION_WEIGHTS.perNameTokenInSubject;
       reasons.push(tokenHits.length + " name word" + (tokenHits.length > 1 ? "s" : "") + " match");
     }
 
     const acros = suggestionAcronyms(p.name || "");
     const acroHit = [...acros].some(a => subjTokens.has(a));
     if (acroHit) {
-      score += SUGGESTION_WEIGHTS.acronymInSubject;
+      textPoints += SUGGESTION_WEIGHTS.acronymInSubject;
       reasons.push("acronym match");
     }
+    const team = projectTeamOf(p);
+    if (textPoints && region && team && team !== region) {
+      textPoints = textPoints / 2;
+      reasons.push("other region (" + team + ")");
+    }
+    score += textPoints;
 
     if (senderClient && p) {
       const projClient = (p.prime || p.clientName || "").toLowerCase().trim();
@@ -5139,6 +5222,23 @@ async function sweepConfirmReview(i, ci) {
   renderSweepReviewQueue();
 }
 
+// The "Region" selector on the suggestion block: explicit choice beats the
+// role-row team; "Any" switches the preference off. Options are the regions
+// actually present in the project list, so nothing shows until teams load.
+function renderRegionSelector() {
+  const sel = document.getElementById("suggestionRegion");
+  if (!sel) return;
+  const regions = knownRegions();
+  if (!regions.length) { sel.style.display = "none"; return; }
+  let stored = "";
+  try { stored = (localStorage.getItem(MY_REGION_KEY) || "").toUpperCase(); } catch {}
+  const current = stored || (_myRegionAuto || "");
+  const opts = [`<option value="ANY"${current === "ANY" || !current ? " selected" : ""}>Any region</option>`]
+    .concat(regions.map(r => `<option value="${escHtml(r)}"${current === r ? " selected" : ""}>${escHtml(r)}</option>`));
+  sel.innerHTML = opts.join("");
+  sel.style.display = "";
+  sel.onchange = () => { setMyRegion(sel.value); renderProjectSuggestions(); };
+}
 function renderProjectSuggestions() {
   const block = document.getElementById("suggestionBlock");
   const chips = document.getElementById("suggestionChips");
@@ -5150,19 +5250,28 @@ function renderProjectSuggestions() {
   // chips once it lands (a known sender can surface a job with no subject match).
   // No-op on later calls — the cache is warm and read synchronously by suggestProjects.
   ensureSenderSignalCache(renderProjectSuggestions);
+  // Same idea for the caller's region: re-rank once it is known.
+  ensureMyRegion(renderProjectSuggestions);
 
   const subject = (typeof emailItem?.subject === "string") ? emailItem.subject : "";
   const results = suggestProjects(subject, emailFromAddress);
   if (!results.length) { block.style.display = "none"; chips.innerHTML = ""; return; }
 
   if (labelText) labelText.textContent = results.length === 1 ? "Suggested project" : "Possible projects";
-  chips.innerHTML = results.map((r, i) => `
+  renderRegionSelector();
+  const region = myRegion();
+  chips.innerHTML = results.map((r, i) => {
+    const team = projectTeamOf(r.project);
+    const teamTag = team
+      ? `<span class="sc-team${region && team !== region ? " sc-team-other" : ""}" title="Region">${escHtml(team)}</span>`
+      : "";
+    return `
     <button type="button" class="suggestion-chip" data-id="${escHtml(r.project.id)}">
-      <div class="sc-num">${escHtml(r.project.projectNumber || "")}</div>
+      <div class="sc-num">${escHtml(r.project.projectNumber || "")}${teamTag}</div>
       <div class="sc-name">${escHtml(r.project.name || "")}</div>
       <div class="sc-reason">${escHtml(r.reasons.join(" · "))}</div>
     </button>
-  `).join("");
+  `; }).join("");
   chips.querySelectorAll(".suggestion-chip").forEach(el => {
     el.onclick = () => {
       const proj = getProjectById(el.dataset.id);
