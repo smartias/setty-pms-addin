@@ -2860,19 +2860,47 @@ function pruneAncientFilingIntents() {
   if (changed) _writeFilingQueue(q);
 }
 
-// Banner UI: show pending entries on the main view with a Dismiss button.
-// We deliberately don't auto-resume — the user has to consciously open the
-// email and click Save again. That avoids surprising re-uploads and keeps
-// the recovery path simple (no Graph-only fetch + reconstruction logic).
+// Dismisses exactly the entries the user was shown, and nothing else.
+//   * Entries that only owe an audit-log row (pendingLog) are never dismissed:
+//     their upload finished, and the row is re-sent by flushPendingFilingLogs().
+//     Wiping them (as the old "Dismiss all" did with an empty queue) silently
+//     lost the audit record of a real save.
+//   * `started_at` must still match what was rendered. enqueueFilingIntent reuses
+//     a queueId for a retry of the same email+operation, so a save the user (or
+//     another pane) restarted after the banner drew is a live save now, not the
+//     orphan that was on screen, and is left alone.
+// Re-reads the queue right before writing so a change made by another pane
+// between render and click isn't overwritten with a stale copy.
+function dismissFilingIntents(targets) {
+  const q = _readFilingQueue();
+  let changed = false;
+  for (const t of targets) {
+    const e = q[t.queueId];
+    if (!e || e.pendingLog || e.started_at !== t.started_at) continue;
+    delete q[t.queueId];
+    changed = true;
+  }
+  if (changed) _writeFilingQueue(q);
+}
+
+// Banner UI: show pending entries on the main view, each with its own dismiss
+// (x) plus a Dismiss all. We deliberately don't auto-resume: the user has to
+// consciously open the email and click Save again. That avoids surprising
+// re-uploads and keeps the recovery path simple (no Graph-only fetch +
+// reconstruction logic).
 function showPendingFilingBanner() {
   pruneAncientFilingIntents();
   // Saves that finished but never logged: re-send their audit rows in the
   // background. They're excluded from the banner either way.
   flushPendingFilingLogs().catch(e => console.warn("[filing-queue] log flush failed:", e.message));
+  renderPendingFilingBanner();
+}
+
+function renderPendingFilingBanner() {
   const pending = getOrphanedFilingIntents();
   const banner = document.getElementById("filingPendingBanner");
   if (!banner) {
-    // First-time render — inject the banner into the DOM
+    // First-time render: inject the banner into the DOM
     const mainView = document.getElementById("mainView");
     if (!mainView) return;
     const el = document.createElement("div");
@@ -2882,8 +2910,12 @@ function showPendingFilingBanner() {
   }
   const b = document.getElementById("filingPendingBanner");
   if (pending.length === 0) { b.style.display = "none"; return; }
+  const target = e => ({ queueId: e.queueId, started_at: e.started_at });
   const lines = pending.slice(0, 5).map(e =>
-    `<div style="margin:4px 0">⚠ <strong>${e.operation}</strong> · ${(e.email_subject || "(no subject)").replace(/</g, "&lt;").slice(0, 60)} — interrupted ${_relativeTime(e.started_at)}</div>`
+    `<div style="margin:4px 0;display:flex;gap:6px;align-items:baseline">` +
+      `<span style="flex:1">⚠ <strong>${escHtml(e.operation)}</strong> · ${escHtml((e.email_subject || "(no subject)").slice(0, 60))} — interrupted ${_relativeTime(e.started_at)}</span>` +
+      `<button type="button" class="filing-banner-dismiss-one" data-qid="${escHtml(e.queueId)}" data-started="${escHtml(e.started_at)}" title="Dismiss this one" aria-label="Dismiss this save" style="font-size:13px;line-height:1;padding:0 5px;border:none;background:transparent;color:#78350f;cursor:pointer">×</button>` +
+    `</div>`
   );
   const moreNote = pending.length > 5 ? `<div style="margin-top:4px;opacity:0.7">…and ${pending.length - 5} more</div>` : "";
   b.innerHTML = `
@@ -2896,11 +2928,19 @@ function showPendingFilingBanner() {
     </div>
   `;
   b.style.display = "";
+  b.querySelectorAll(".filing-banner-dismiss-one").forEach(btn => {
+    btn.onclick = () => {
+      dismissFilingIntents([{ queueId: btn.dataset.qid, started_at: btn.dataset.started }]);
+      renderPendingFilingBanner();
+    };
+  });
   const dismissBtn = document.getElementById("filingBannerDismiss");
   if (dismissBtn) {
+    // Everything that was listed (including the ones past the first 5), not
+    // the whole queue.
     dismissBtn.onclick = () => {
-      _writeFilingQueue({});
-      b.style.display = "none";
+      dismissFilingIntents(pending.map(target));
+      renderPendingFilingBanner();
     };
   }
 }
