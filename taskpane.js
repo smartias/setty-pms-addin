@@ -2628,7 +2628,24 @@ function _getCurrentUserEmail() {
 //     status:         "success" | "verified" | "failed" | "partial" | "queued" | "retrying",  // required
 //     error:          "<message>" | null,
 //     retried:        <int>,
+//     client_op_id:   "<id>" | undefined,   // idempotency key, see below
 //   }
+//
+// Idempotency: every row carries a client_op_id (unique index on the table). The
+// insert is sent with on_conflict + ignore-duplicates, so re-sending the same id
+// is a no-op that still answers 2xx. That makes both the transport retry below
+// and flushPendingFilingLogs() safe: a first attempt that landed but whose
+// response was lost can no longer produce a second row. Callers that must survive
+// a crash (completeFilingIntent) mint the id once and store it with the pending
+// row so the re-send reuses it; everyone else gets a fresh id per call, which
+// still covers the in-call retry. A deliberate re-file is a new call, so it logs.
+function _newFilingOpId() {
+  try {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  } catch {}
+  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+}
+
 async function logFilingOp(record) {
   if (!record || !record.project_id || !record.operation || !record.status) {
     console.warn("[filing-log] dropped malformed record:", record);
@@ -2646,12 +2663,15 @@ async function logFilingOp(record) {
     user_email:     _getCurrentUserEmail(),
     client_version: CLIENT_VERSION_STRING,
     retried:        record.retried || 0,
+    client_op_id:   record.client_op_id || _newFilingOpId(),
   };
   try {
     const body = JSON.stringify(row);
-    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + FILING_LOG_TABLE, {
+    const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + FILING_LOG_TABLE + "?on_conflict=client_op_id", {
       method: "POST",
-      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+      // ignore-duplicates: a row with this client_op_id already exists, so the
+      // insert is skipped and PostgREST still answers 201 (treated as success).
+      headers: { ...SB_HEADERS, Prefer: "return=minimal,resolution=ignore-duplicates" },
       body,
       // keepalive lets the insert outlive the pane: if the user closes the
       // taskpane (or Outlook navigates) right after a save completes, the
@@ -2775,6 +2795,10 @@ function dequeueFilingIntent(queueId) {
 // re-sent on next open by flushPendingFilingLogs(). Nothing is re-uploaded.
 // Returns true when the row landed and the entry was cleared.
 async function completeFilingIntent(queueId, record) {
+  // Mint the idempotency key here, before the first attempt, so the copy stored
+  // in pendingLog on failure carries the same id the failed attempt used. If
+  // that attempt actually landed, the re-send is ignored instead of doubling up.
+  record = { ...record, client_op_id: record.client_op_id || _newFilingOpId() };
   const logged = await logFilingOp(record);
   if (logged) {
     dequeueFilingIntent(queueId);
