@@ -7741,44 +7741,65 @@ async function withSaveGuard(name, fn, buttonIds = []) {
 //     status?: "success" | "partial",  // audit log status; defaults to "success"
 //     error?: string,           // explanation if partial; for the audit log
 //     successMessage?: string,  // text shown in the status banner on success
+//     skip?: boolean,           // deliberate clean abort: nothing was filed, so dequeue
+//                               // the intent and write no audit row
 //   }
+//
+// opts (besides operation / statusElement / startMessage):
+//   msgId, emailSubject   Override the audit row's msg_id / email_subject for flows
+//                         that aren't keyed to the open email (RFI response and
+//                         submittal review use "milestone:<kind>:<id>"; Save SP
+//                         uses the stable internet message id). Default: the open
+//                         item's id / subject.
+//   holdsLock             The caller already holds the saveInFlight lock (Save SP
+//                         runs inside withSaveGuard). Skip the lock check and
+//                         leave release to the caller.
 //
 // Throwing from runUpload triggers the error path: status banner shows "✗ ..."
 // and a "failed" audit log row is written. The queue entry stays in place so
 // it surfaces on next taskpane open as a crash-recovery candidate.
 async function withFilingScaffold(opts, runUpload) {
-  const { operation, statusElement, startMessage = "⏳ Saving…" } = opts;
+  const { operation, statusElement, startMessage = "⏳ Saving…", holdsLock = false } = opts;
   if (!selectedProject) {
     setStatus(statusElement, "error", "No project selected.");
     return;
   }
-  if (saveInFlight) {
+  if (!holdsLock && saveInFlight) {
     setStatus(statusElement, "info", "⏳ Another save is in progress; please wait.");
     return;
   }
-  // Snapshot BEFORE any await — protects against item-switch races.
+  // Snapshot BEFORE any await — protects against item-switch races. The project
+  // is snapshotted too: the audit row must name the project the save ran
+  // against even if the user switches projects while it is in flight.
   const snapItem = emailItem;
+  const project = selectedProject;
+  const msgId = opts.msgId !== undefined ? opts.msgId : (snapItem?.itemId || null);
+  const emailSubject = opts.emailSubject !== undefined ? opts.emailSubject : (snapItem?.subject || "");
   const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        snapItem?.itemId || null,
+    project_id:    project.id,
+    project_name:  project.name || "",
+    msg_id:        msgId,
     operation,
-    email_subject: snapItem?.subject || "",
+    email_subject: emailSubject,
   });
-  saveInFlight = true;
+  if (!holdsLock) saveInFlight = true;
   const stopBeat = startFilingHeartbeat(queueId);
   setStatus(statusElement, "info", startMessage);
   try {
-    const result = await runUpload({ snapItem, statusElement, project: selectedProject });
+    const result = await runUpload({ snapItem, statusElement, project });
+    if (result?.skip) {
+      dequeueFilingIntent(queueId);
+      return result;
+    }
     if (result?.successMessage != null) {
       setStatus(statusElement, "success", result.successMessage);
     }
     // Log first, dequeue only once the row landed — see completeFilingIntent.
     await completeFilingIntent(queueId, {
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
+      project_id:    project.id,
+      msg_id:        msgId,
       operation,
-      email_subject: snapItem?.subject || null,
+      email_subject: emailSubject || null,
       sp_folder_url: result?.sp_folder_url || null,
       files:         result?.files !== undefined ? result.files : (lastAttachmentUploadStats?.uploadedFiles || []),
       status:        result?.status || "success",
@@ -7787,11 +7808,12 @@ async function withFilingScaffold(opts, runUpload) {
     return result;
   } catch (e) {
     setStatus(statusElement, "error", "✗ " + humanizeError(e));
+    console.error("[filing:" + operation + "]", e);
     void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        snapItem?.itemId || null,
+      project_id:    project.id,
+      msg_id:        msgId,
       operation,
-      email_subject: snapItem?.subject || null,
+      email_subject: emailSubject || null,
       status:        "failed",
       error:         e.message,
     });
@@ -7799,7 +7821,7 @@ async function withFilingScaffold(opts, runUpload) {
     // a previous-save-did-not-complete banner.
   } finally {
     stopBeat();
-    saveInFlight = false;
+    if (!holdsLock) saveInFlight = false;
   }
 }
 
@@ -7914,19 +7936,18 @@ if (existingRecord) {
   // Read the "Link to RFI/Sub" dropdown synchronously so it can't drift if
   // the user switches projects mid-save.
   const linkToValue = (document.getElementById("linkToTarget")?.value || "");
-  // Crash-recovery queue: record the intent BEFORE any awaits. If the browser
-  // crashes during upload, the entry remains and is surfaced as a pending save
-  // on next taskpane open. Dequeued at the end of a clean save.
-  const queueId = enqueueFilingIntent({
-    project_id:    selectedProject.id,
-    project_name:  selectedProject.name || "",
-    msg_id:        currentMsgId,
-    operation:     "email-sp",
-    email_subject: snapSubject,
-  });
-  const stopBeat = startFilingHeartbeat(queueId);
-  setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
-  try {
+  // Crash-recovery queue, heartbeat, audit row and failure handling all come
+  // from withFilingScaffold (the same path as the RFI / submittal flows). The
+  // body below is the save itself and reports its outcome through the return
+  // value. withSaveGuard already holds the saveInFlight lock, hence holdsLock.
+  await withFilingScaffold({
+    operation:    "email-sp",
+    statusElement: "actionStatus",
+    startMessage: "⏳ " + pickSavingMessage(),
+    msgId:        currentMsgId,
+    emailSubject: snapSubject,
+    holdsLock:    true,
+  }, async () => {
     const token = await getToken();
     const { driveId } = await resolveSpIds();
     // Phase 3: fetch body HTML once up front so we can both upload to SharePoint
@@ -7961,10 +7982,10 @@ if (existingRecord) {
     // rather than continuing with a mix of old-item folder + new-item body.
     if (saveGen !== itemContextGeneration) {
       setStatus("actionStatus", "info", "Save aborted — you switched emails. Click Save again on the email you want to file.");
-      // Deliberate abort before any file or record was written: clear the intent, or it
-      // would resurface as a "did not complete" save once its heartbeat lapses.
-      dequeueFilingIntent(queueId);
-      return;
+      // Deliberate abort before any file or record was written: the scaffold
+      // clears the intent and writes no audit row, so it can't resurface as a
+      // "did not complete" save once its heartbeat lapses.
+      return { skip: true };
     }
     await writeSpMetadataSidecar(driveId, token, targetPath, buildAddinMetadata(selectedProject, "correspondence"));
     // Pass snapItem so the attachment loop reads from the captured item, not
@@ -8106,13 +8127,9 @@ if (existingRecord) {
       (attempted > 0 && attCount < attempted)      ? "partial" :
       spLinkAttachFailed                           ? "partial" :
       "success";
-    const filingRecord = {
-      project_id:    selectedProject.id,
-      msg_id:        msgId,
-      operation:     "email-sp",
+    const filingOutcome = {
       sp_folder_url: spFolderUrl,
       files:         (lastAttachmentUploadStats?.uploadedFiles || []),
-      email_subject: snapSubject,
       status,
       error:         status === "success" ? null : (warnings.join(" ") || `${attCount}/${attempted} uploaded`),
     };
@@ -8128,25 +8145,12 @@ if (existingRecord) {
     try { refreshLinkToTargetDropdown(); } catch {}
     recordSaveAndCelebrate();
     refreshEmailSavedIndicator(true);
-    // Save completed without throwing — log it, then clear the crash-recovery
-    // queue entry once the row has landed. (Partial successes still dequeue:
-    // the user has the status message and a "partial" audit log row; the
-    // queue is only for crash recovery.)
-    await completeFilingIntent(queueId, filingRecord);
-  } catch (e) {
-    setStatus("actionStatus", "error", "✗ " + humanizeError(e));
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        currentMsgId,
-      operation:     "email-sp",
-      email_subject: snapSubject,
-      status:        "failed",
-      error:         e.message,
-    });
-    // Leave the queue entry in place for crash-recovery surfacing on next open.
-  } finally {
-    stopBeat();
-  }
+    // Save completed without throwing: the scaffold writes the audit row, then
+    // clears the crash-recovery queue entry once the row has landed. (Partial
+    // successes still dequeue: the user has the status message and a "partial"
+    // audit log row; the queue is only for crash recovery.)
+    return filingOutcome;
+  });
 }
 async function doSaveToProjectRecordOnly() {
   return withSaveGuard("save-record", _doSaveToProjectRecordOnly, ["saveSpBtn", "saveRecordBtn"]);
@@ -10065,9 +10069,16 @@ async function submitRfiResponse() {
 
   const submitBtn = document.getElementById("submitRfiResponseBtn");
   if (submitBtn) submitBtn.disabled = true;
-  setStatus("rfiResponseStatusMsg", "info", "⏳ Generating response…");
-
-  try {
+  // Queue intent, heartbeat, audit row and error handling come from
+  // withFilingScaffold. This isn't tied to the open email, so the audit row is
+  // keyed to the RFI. The button is re-enabled however the scaffold exits.
+  await withFilingScaffold({
+    operation:     "rfi-response",
+    statusElement: "rfiResponseStatusMsg",
+    startMessage:  "⏳ Generating response…",
+    msgId:         "milestone:rfi-response:" + rfi.id,
+    emailSubject:  `${rfi.number} Response`,
+  }, async () => {
     // 1. Build the DOCX cover sheet
     const docxBlob = await buildRfiResponseDocx({
       rfi, project: selectedProject, response: responseText, dateResponded, status: newStatus,
@@ -10124,18 +10135,15 @@ async function submitRfiResponse() {
       } : r),
     }));
 
-    // 5. Audit-log the response generation. Re-using the filing log so PMS
-    // reconcile sees the OUT folder activity and can verify the docx is there.
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        "milestone:rfi-response:" + rfi.id, // unique-ish key
-      operation:     "rfi-response",
+    // 5. Audit-log the response generation (written by the scaffold on return).
+    // Re-using the filing log so PMS reconcile sees the OUT folder activity and
+    // can verify the docx is there.
+    const filingOutcome = {
       sp_folder_url: outFolderWebUrl || null,
       files:         [{ name: `${rfi.number}_Response.docx`, verified: true, distributionKind: "save-sp" }],
-      email_subject: `${rfi.number} Response`,
       status:        outFolderWebUrl ? "success" : "partial",
       error:         outFolderWebUrl ? null : "RFI response logged without SharePoint upload",
-    });
+    };
 
     // 6. Open a prefilled draft to the RFI's original sender (rfi.from) — or
     // fall back to the assignee if there's no usable sender email.
@@ -10161,12 +10169,10 @@ async function submitRfiResponse() {
     try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
     }, 1500);
-  } catch (e) {
-    setStatus("rfiResponseStatusMsg", "error", "✗ " + humanizeError(e));
-    console.error("[rfi-response]", e);
-  } finally {
+    return filingOutcome;
+  }).finally(() => {
     if (submitBtn) submitBtn.disabled = false;
-  }
+  });
 }
 
 // Best-effort recipient resolver for an RFI response. Prefers an explicit
@@ -10572,9 +10578,14 @@ async function submitSubReview() {
 
   const submitBtn = document.getElementById("submitSubReviewBtn");
   if (submitBtn) submitBtn.disabled = true;
-  setStatus("subReviewStatusMsg", "info", "⏳ Generating review…");
-
-  try {
+  // See submitRfiResponse: scaffolded, keyed to the submittal, not the open email.
+  await withFilingScaffold({
+    operation:     "sub-review",
+    statusElement: "subReviewStatusMsg",
+    startMessage:  "⏳ Generating review…",
+    msgId:         "milestone:sub-review:" + sub.id,
+    emailSubject:  `${sub.number} Review`,
+  }, async () => {
     const docxBlob = await buildSubReviewDocx({
       sub, project: selectedProject, comments, stamp, dateReturned, status: newStatus,
     });
@@ -10619,16 +10630,12 @@ async function submitSubReview() {
       } : s),
     }));
 
-    void logFilingOp({
-      project_id:    selectedProject.id,
-      msg_id:        "milestone:sub-review:" + sub.id,
-      operation:     "sub-review",
+    const filingOutcome = {
       sp_folder_url: outFolderWebUrl || null,
       files:         [{ name: `${sub.number}_Review.docx`, verified: true, distributionKind: "save-sp" }],
-      email_subject: `${sub.number} Review`,
       status:        outFolderWebUrl ? "success" : "partial",
       error:         outFolderWebUrl ? null : "Submittal review logged without SharePoint upload",
-    });
+    };
 
     // For submittals, the return recipient is most commonly the original sender
     // (GC/Prime) who submitted it. Same email-record lookup as RFIs.
@@ -10656,12 +10663,10 @@ async function submitSubReview() {
     try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
     }, 1500);
-  } catch (e) {
-    setStatus("subReviewStatusMsg", "error", "✗ " + humanizeError(e));
-    console.error("[sub-review]", e);
-  } finally {
+    return filingOutcome;
+  }).finally(() => {
     if (submitBtn) submitBtn.disabled = false;
-  }
+  });
 }
 
 function _guessEmailForSub(sub, project) {
