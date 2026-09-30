@@ -2828,10 +2828,38 @@ async function flushPendingFilingLogs() {
   }
 }
 
-// Returns array of entries that have been pending too long ("orphaned"). The
-// definition of "too long" is a generous 60s — anything older than that on
-// taskpane open is almost certainly a crash from a previous session, not an
-// in-flight save from the current one.
+// Multi-pane safety. The queue lives in localStorage, which every open pane
+// shares, but a save only runs in one of them. "Older than N seconds" alone
+// can't tell a crashed save from a slow live one (big attachments, VPN), so a
+// second pane used to report the first pane's healthy upload as "did not
+// complete". A save now stamps heartbeat_at on its entry while it runs, and an
+// entry counts as orphaned only when its last sign of life (heartbeat, else
+// start) is older than FILING_ORPHAN_AGE_MS. The age is several beats wide so
+// a throttled background-pane timer doesn't trip it.
+const FILING_HEARTBEAT_MS  = 15 * 1000;
+const FILING_ORPHAN_AGE_MS = 2 * 60 * 1000;
+
+// Starts beating for `queueId`; returns a stop function. Only refreshes an entry
+// that still exists (a finished save has dequeued it, and a beat must never
+// resurrect it) and leaves started_at alone, since dismissFilingIntents and
+// retry detection key off it.
+function startFilingHeartbeat(queueId) {
+  if (!queueId) return () => {};
+  const beat = () => {
+    const q = _readFilingQueue();
+    const e = q[queueId];
+    if (!e || e.pendingLog) return;
+    e.heartbeat_at = new Date().toISOString();
+    _writeFilingQueue(q);
+  };
+  beat();
+  const timer = setInterval(beat, FILING_HEARTBEAT_MS);
+  return () => clearInterval(timer);
+}
+
+// Returns array of entries with no sign of life for FILING_ORPHAN_AGE_MS
+// ("orphaned"): almost certainly a crash from a previous session, not a save
+// still running in this pane or another one.
 function getOrphanedFilingIntents() {
   const q = _readFilingQueue();
   const now = Date.now();
@@ -2839,8 +2867,11 @@ function getOrphanedFilingIntents() {
   for (const id in q) {
     const entry = q[id];
     if (!entry || entry.pendingLog) continue; // upload finished; only the log row is owed
-    const age = now - new Date(entry.started_at).getTime();
-    if (age > 60 * 1000) out.push(entry);
+    const lastAlive = Math.max(
+      new Date(entry.started_at).getTime() || 0,
+      new Date(entry.heartbeat_at || 0).getTime() || 0
+    );
+    if (now - lastAlive > FILING_ORPHAN_AGE_MS) out.push(entry);
   }
   return out;
 }
@@ -7735,6 +7766,7 @@ async function withFilingScaffold(opts, runUpload) {
     email_subject: snapItem?.subject || "",
   });
   saveInFlight = true;
+  const stopBeat = startFilingHeartbeat(queueId);
   setStatus(statusElement, "info", startMessage);
   try {
     const result = await runUpload({ snapItem, statusElement, project: selectedProject });
@@ -7766,6 +7798,7 @@ async function withFilingScaffold(opts, runUpload) {
     // Queue entry intentionally NOT dequeued — surfaces on next open as
     // a previous-save-did-not-complete banner.
   } finally {
+    stopBeat();
     saveInFlight = false;
   }
 }
@@ -7891,6 +7924,7 @@ if (existingRecord) {
     operation:     "email-sp",
     email_subject: snapSubject,
   });
+  const stopBeat = startFilingHeartbeat(queueId);
   setStatus("actionStatus", "info", "⏳ " + pickSavingMessage());
   try {
     const token = await getToken();
@@ -7927,6 +7961,9 @@ if (existingRecord) {
     // rather than continuing with a mix of old-item folder + new-item body.
     if (saveGen !== itemContextGeneration) {
       setStatus("actionStatus", "info", "Save aborted — you switched emails. Click Save again on the email you want to file.");
+      // Deliberate abort before any file or record was written: clear the intent, or it
+      // would resurface as a "did not complete" save once its heartbeat lapses.
+      dequeueFilingIntent(queueId);
       return;
     }
     await writeSpMetadataSidecar(driveId, token, targetPath, buildAddinMetadata(selectedProject, "correspondence"));
@@ -8107,6 +8144,8 @@ if (existingRecord) {
       error:         e.message,
     });
     // Leave the queue entry in place for crash-recovery surfacing on next open.
+  } finally {
+    stopBeat();
   }
 }
 async function doSaveToProjectRecordOnly() {
