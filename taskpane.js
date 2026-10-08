@@ -4123,9 +4123,12 @@ function directorySignalScore(project, participants, senderEmail) {
 // ─── CALLER'S REGION (ranking preference) ────────────────────────────────────
 // Which office's projects to favour in the chips. Explicit choice first (the
 // small selector on the suggestion block, kept in localStorage), else the team
-// on the caller's PMS role row, read once per session through pms_caps_for —
-// the same RPC the connector resolves callers with. Any failure (RPC not
-// granted to this role, no role row, offline) leaves the region unknown and
+// on the caller's PMS role row, read once per session through
+// my_pms_permissions (granted to authenticated; identity comes from the JWT).
+// pms_caps_for takes an arbitrary email and is service_role only, so the add-in
+// must never call it. my_pms_permissions does not return `team` today, so the
+// auto region stays unknown until it does; the manual selector still works.
+// Any failure (signed out, no role row, offline) leaves the region unknown and
 // the ranking exactly as before. Never restricts what can be searched or filed.
 const MY_REGION_KEY = "settyPms:myRegion";
 let _myRegionAuto = null;
@@ -4147,12 +4150,14 @@ function setMyRegion(v) {
 function ensureMyRegion(onReady) {
   if (_myRegionPromise) return _myRegionPromise;
   _myRegionPromise = (async () => {
-    const email = (_getCurrentUserEmail() || "").trim().toLowerCase();
-    if (!email) return;
     try {
-      const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/pms_caps_for", {
+      // The RPC reads the caller from the session token, so wait for the
+      // session to settle and don't send the anon key (it has no identity).
+      await settyAuthReady;
+      if (!window.settyAuth || _signedOutForSaves()) return;
+      const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/my_pms_permissions", {
         method: "POST", headers: { ...SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation" },
-        body: JSON.stringify({ p_email: email }),
+        body: "{}",
       });
       if (!res.ok) return;
       let j = await res.json();
