@@ -1828,7 +1828,25 @@ const _settyAuth = window.settyAuth || {
 };
 const settyAuthReady = _settyAuth.init().catch(() => null).then(() => _syncSettyAuth());
 function _syncSettyAuth() { SB_HEADERS.Authorization = "Bearer " + _settyAuth.token(); }
-_settyAuth.onChange(_syncSettyAuth);
+// Top-of-pane banner mirrors the sign-in state. Shown only when setty-auth.js
+// loaded (the shim can never sign in, so a banner would be a dead end) and the
+// session is gone. Safe to call before the DOM element exists.
+function _renderSettyAuthBanner() {
+  const el = document.getElementById("settyAuthBanner");
+  if (!el) return;
+  el.classList.toggle("show", !!window.settyAuth && !_settyAuth.isSignedIn());
+}
+function _onSettyAuthChange() { _syncSettyAuth(); _renderSettyAuthBanner(); }
+_settyAuth.onChange(_onSettyAuthChange);
+settyAuthReady.then(_renderSettyAuthBanner);
+document.addEventListener("DOMContentLoaded", () => {
+  _renderSettyAuthBanner();
+  const btn = document.getElementById("settyAuthBannerBtn");
+  if (btn) btn.onclick = async () => {
+    try { await _settyAuth.signInPopup(); } catch (e) { console.warn("[settyAuth] sign-in failed", e); }
+    _renderSettyAuthBanner();
+  };
+});
 _settyAuth.mountPill({ label: "🔐 Sign in", onClick: () => _settyAuth.signInPopup() });
 // localStorage cache for the projects/clients picker. Two changes vs prior
 // "v2" format:
@@ -2358,8 +2376,8 @@ function _signedOutForSaves() {
 }
 const SIGNED_OUT_SAVE_MSG =
   "You're signed out of the Setty suite, so PMS data can't be read or saved " +
-  "(a signed-out session can look like a missing project). Click the 🔐 Sign in " +
-  "pill at the bottom-right of the pane, then try again.";
+  "(a signed-out session can look like a missing project). Click Sign in in the " +
+  "yellow banner at the top of the pane, then try again.";
 
 // Main entry point — used by all save callsites in the add-in.
 async function applyLocalChangeAndSave(projectId, mutateProject) {
@@ -12163,9 +12181,9 @@ function humanizeError(err) {
   if (m.includes("graph 429") || m.includes("graph 503") || m.includes("graph 504"))
     return "Microsoft is throttling requests right now — wait a moment and retry.";
   // Setty-suite (Supabase) sign-out — distinct from the MSAL/Graph branch
-  // above: the fix is the 🔐 pill, not Outlook's Sign out/Sign in cycle.
+  // above: the fix is the Sign in banner, not Outlook's Sign out/Sign in cycle.
   if (m.includes("signed out of the setty suite"))
-    return "You're signed out — click the 🔐 Sign in pill at the bottom-right of the pane, then retry.";
+    return "You're signed out — click Sign in in the yellow banner at the top of the pane, then retry.";
   if (m.includes("save conflict") || m.includes("modified by someone else"))
     return "Someone else updated this project at the same moment. Retry — the add-in re-reads the latest version before saving.";
   if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))

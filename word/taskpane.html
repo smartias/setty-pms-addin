@@ -613,6 +613,13 @@
     <div class="header-sub">Word → OneNote</div>
   </div>
 
+  <!-- Suite sign-in banner: the shared 🔐 pill is small and easy to miss, so
+       this shows at the top of the pane while the Setty session is signed out. -->
+  <div id="settyAuthBanner" role="alert" style="display:none;align-items:center;gap:10px;background:#fff4ce;border:1px solid #e8c766;border-radius:4px;padding:10px;margin:8px 12px 0;font-size:12px;color:#5c4a00;line-height:1.4;">
+    <span style="flex:1;font-weight:600;">🔐 You're signed out of Setty PMS. Sending to a project won't work until you sign in.</span>
+    <button type="button" id="settyAuthBannerBtn" style="width:auto;padding:6px 12px;white-space:nowrap;">Sign in</button>
+  </div>
+
   <div class="container">
 
     <div id="signInView" class="view">
@@ -811,6 +818,6 @@
 
   </div>
 
-  <script src="taskpane.js?v=20260717-new-from-template"></script>
+  <script src="taskpane.js?v=20261008-auth-banner"></script>
 </body>
 </html>

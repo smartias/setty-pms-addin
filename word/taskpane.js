@@ -35,7 +35,24 @@ const _settyAuth = window.settyAuth || {
 };
 const settyAuthReady = _settyAuth.init().catch(() => null).then(() => _syncSettyAuth());
 function _syncSettyAuth() { SB_HEADERS.Authorization = "Bearer " + _settyAuth.token(); }
-_settyAuth.onChange(_syncSettyAuth);
+// Top-of-pane banner mirrors the sign-in state. Only shown when setty-auth.js
+// loaded (the shim can never sign in) and the session is gone.
+function _renderSettyAuthBanner() {
+  const el = document.getElementById("settyAuthBanner");
+  if (!el) return;
+  el.style.display = (!!window.settyAuth && !_settyAuth.isSignedIn()) ? "flex" : "none";
+}
+function _onSettyAuthChange() { _syncSettyAuth(); _renderSettyAuthBanner(); }
+_settyAuth.onChange(_onSettyAuthChange);
+settyAuthReady.then(_renderSettyAuthBanner);
+document.addEventListener("DOMContentLoaded", () => {
+  _renderSettyAuthBanner();
+  const btn = document.getElementById("settyAuthBannerBtn");
+  if (btn) btn.onclick = async () => {
+    try { await _settyAuth.signInPopup(); } catch (e) { console.warn("[settyAuth] sign-in failed", e); }
+    _renderSettyAuthBanner();
+  };
+});
 _settyAuth.mountPill({ label: "🔐 Sign in", onClick: () => _settyAuth.signInPopup() });
 const PROJECTS_CACHE_KEY = "settyPmsWord:projectsCache";
 const PROJECTS_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6h
