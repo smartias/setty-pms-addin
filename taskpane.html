@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-09-30-filing-scaffold-all";</script>
+  <script>window.__appVersion = "2026-10-08-auth-banner";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -112,6 +112,35 @@
       font-size: 13px;
       padding: 0 2px;
       line-height: 1;
+    }
+    /* Suite sign-in banner — the shared 🔐 pill is small and sits at the
+       bottom-right, so people missed it and wondered why saves did nothing.
+       This sits at the top of the main view and only shows while signed out. */
+    #settyAuthBanner {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      background: #fff4ce;
+      border: 1px solid #e8c766;
+      border-radius: 4px;
+      padding: 10px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      color: #5c4a00;
+      line-height: 1.4;
+    }
+    #settyAuthBanner.show { display: flex; }
+    #settyAuthBanner .msg { flex: 1; font-weight: 600; }
+    #settyAuthBanner button {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
     }
     /* Version footer — faint, out of the way; hover for version, 5x click for credits */
     #versionFooter {
@@ -867,6 +896,10 @@
 
 <!-- Main View -->
 <div id="mainView">
+  <div id="settyAuthBanner" role="alert">
+    <span class="msg">🔐 You're signed out of Setty PMS. Filing and saving won't work until you sign in.</span>
+    <button type="button" id="settyAuthBannerBtn">Sign in</button>
+  </div>
   <!-- Pin reminder — shown until dismissed, or until ItemChanged fires
        (ItemChanged only fires while the pane is pinned, so receiving one
        doubles as "user already pinned" detection — see markPanePinned()). -->
@@ -1372,6 +1405,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-09-06-cowork-folder"></script>
+<script src="taskpane.js?v=2026-10-08-auth-banner"></script>
 </body>
 </html>
