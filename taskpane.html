@@ -266,6 +266,19 @@
        OneNote notebook or Teams channel. A class (not style.display or .disabled) so the
        attachment and pipeline rules that toggle those cannot undo it. */
     .integration-off { display: none !important; }
+    /* Follow-ups view */
+    .fu-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--surface, #fff); }
+    .fu-card.fu-due { border-left: 3px solid #d97706; }
+    .fu-card.fu-overdue { border-left: 3px solid #c5221f; }
+    .fu-subject { font-size: 13px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+    .fu-meta { font-size: 11px; color: #64748b; margin: 3px 0 6px; line-height: 1.5; }
+    .fu-chip { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 9px; background: #e8eefc; color: #1d4ed8; margin-right: 4px; }
+    .fu-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+    .fu-actions button { font-size: 11px; padding: 4px 9px; border: 1px solid var(--border); background: #fff; color: var(--text, #222); border-radius: 5px; cursor: pointer; }
+    .fu-actions button.fu-done { border-color: #137333; color: #137333; }
+    .fu-track { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+    .fu-track .fu-row { display: flex; gap: 6px; }
+    .fu-track .fu-row > * { flex: 1; min-width: 0; }
     .btn-teams:hover:not(:disabled)   { background: #4f519e; }
     .btn-teams-sent { background: #107c41; color: #fff; border-color: #107c41; }
     .btn-teams-sent:hover:not(:disabled) { background: #0d6435; }
@@ -539,9 +552,9 @@
       letter-spacing: 0.6px;
       margin: 4px 0 8px;
     }
-    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView, #rfiResponseView, #subReviewView { display: none; }
+    #signInView, #mainView, #rfiView, #subView, #noteView, #actionItemView, #contactView, #peopleView, #datesView, #rfiResponseView, #subReviewView, #followupsView { display: none; }
     #signInView.active, #mainView.active, #rfiView.active,
-    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active, #rfiResponseView.active, #subReviewView.active { display: block; }
+    #subView.active, #noteView.active, #actionItemView.active, #contactView.active, #peopleView.active, #datesView.active, #rfiResponseView.active, #subReviewView.active, #followupsView.active { display: block; }
     .back-btn {
       background: none;
       border: none;
@@ -1059,6 +1072,7 @@
       <button class="btn btn-onenote" id="logNoteBtn">📓 Log as Note</button>
       <button class="btn btn-teams" id="sendToTeamsBtn">💬 Send to Teams Channel</button>
       <button class="btn btn-secondary" id="newActionItemBtn">✅ New Action Item</button>
+      <button class="btn btn-secondary" id="openFollowupsBtn">⏰ Follow-ups</button>
       <hr class="divider"/>
       <button class="btn btn-secondary" id="logRfiBtn">🔵 Log as RFI</button>
       <button class="btn btn-secondary" id="logSubBtn">📋 Log as Submittal</button>
@@ -1365,6 +1379,32 @@
   </div>
 </div>
 
+<!-- Follow-ups View: outgoing requests we are waiting on (pms_followups) -->
+<div id="followupsView">
+  <button class="back-btn" id="followupsBack">← Back</button>
+  <div class="section-title">Follow-ups</div>
+  <p style="font-size:11px;color:#64748b;margin-bottom:10px;line-height:1.5;">
+    Things you have asked someone for and are waiting on. Flag a sent message in Outlook (Follow up) and tap
+    Sync, or track the open email below. Only you see your follow-ups.
+  </p>
+  <div id="followupsStatus" class="status-msg"></div>
+  <div class="fu-track" id="fuTrackBox" style="display:none;">
+    <div style="font-size:12px;font-weight:600;margin-bottom:6px;">Track this email</div>
+    <div class="fu-row">
+      <select id="fuKind"></select>
+      <input type="number" id="fuDays" min="1" max="90" title="Remind me in this many days"/>
+    </div>
+    <input type="text" id="fuLabel" placeholder="Label, e.g. Add Service 7 or Invoice 3" style="margin-top:6px;"/>
+    <input type="number" id="fuAmount" placeholder="Amount (optional)" step="0.01" style="margin-top:6px;"/>
+    <button class="btn btn-blue" id="fuTrackBtn" style="margin-top:6px;">⏰ Track follow-up</button>
+  </div>
+  <div style="display:flex;gap:6px;margin-bottom:8px;">
+    <button class="btn btn-secondary" id="fuSyncBtn" style="flex:1;margin:0;">↻ Sync flagged sent mail</button>
+    <button class="btn btn-ghost" id="fuReloadBtn" style="margin:0;">Refresh</button>
+  </div>
+  <div id="followupsList"></div>
+</div>
+
 <!-- People View -->
 <div id="peopleView">
   <button class="back-btn" id="peopleBack">← Back</button>
@@ -1409,6 +1449,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-10-14-hide-unset-integrations"></script>
+<script src="taskpane.js?v=2026-10-14-followups-tab"></script>
 </body>
 </html>
