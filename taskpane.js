@@ -300,6 +300,12 @@ function setupEventListeners() {
   // don't appear mid-session otherwise (project data is loaded once at open).
   document.getElementById("refreshProjectsBtn").onclick = () => refreshProjectData();
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
+  document.getElementById("openFollowupsBtn").onclick = openFollowupsView;
+  document.getElementById("followupsBack").onclick = () => showView("mainView");
+  document.getElementById("fuTrackBtn").onclick = fuTrackCurrentEmail;
+  document.getElementById("fuSyncBtn").onclick = () => fuSyncFlagged(true);
+  document.getElementById("fuReloadBtn").onclick = () => fuLoadAndRender();
+  document.getElementById("fuKind").onchange = fuKindChanged;
   document.getElementById("newActionItemBtn").onclick = () => { prefillActionItem(); showView("actionItemView"); };
   document.getElementById("logRfiBtn").onclick       = () => { prefillRfi(); showView("rfiView"); };
   document.getElementById("logSubBtn").onclick       = () => { prefillSub(); showView("subView"); };
@@ -12154,7 +12160,7 @@ function showView(id) {
   // Hide loading spinner on first real view
   const loading = document.getElementById("loadingView");
   if (loading) loading.style.display = "none";
-  ["signInView","mainView","noteView","actionItemView","rfiView","subView","rfiResponseView","subReviewView","datesView","peopleView","contactView"].forEach(v => {
+  ["signInView","mainView","noteView","actionItemView","rfiView","subView","rfiResponseView","subReviewView","datesView","peopleView","contactView","followupsView"].forEach(v => {
     const el = document.getElementById(v);
     if (el) el.classList.toggle("active", v === id);
   });
@@ -12396,4 +12402,229 @@ function showQuickStatus(msg, type) {
   // Auto-hide after 2.5s — non-modal, just a confirmation toast.
   clearTimeout(showQuickStatus._t);
   showQuickStatus._t = setTimeout(() => { el.style.display = "none"; }, 2500);
+}
+
+// ─── OUTGOING FOLLOW-UPS ────────────────────────────────────────────────────
+// Things we asked someone for and are waiting on (a signed contract or add service,
+// a payment, an answer). Backed by pms_followups (setty-pms migration
+// 20261013120000), read and written straight through PostgREST with the signed-in
+// Setty session: RLS limits every row to its owner, so there is no owner filter
+// to forget here. Rows come from "Track this email" or from the sender flagging a
+// message in Sent Items (fuSyncFlagged). Nothing here sends mail.
+const FOLLOWUPS_TABLE = "pms_followups";
+const FU_KINDS = { signature: "Signature", payment: "Payment", info: "Info request", approval: "Approval", general: "General" };
+// Days between reminders per kind. Mirrors FOLLOWUP_CADENCE_DAYS in setty-pms
+// supabase/functions/pms-mcp/followups.ts: keep the two in step.
+const FU_CADENCE_DAYS = { signature: [5, 5, 5], payment: [3, 12, 15], info: [3, 4, 5], approval: [5, 7, 7], general: [5, 7, 7] };
+const FU_DAY_MS = 86400000;
+let _fuRows = [];
+
+function fuNextAfter(kind, fromIso, reminderCount) {
+  const steps = FU_CADENCE_DAYS[kind] || FU_CADENCE_DAYS.general;
+  const i = Math.min(Math.max(reminderCount || 0, 0), steps.length - 1);
+  return new Date(Date.parse(fromIso) + steps[i] * FU_DAY_MS).toISOString();
+}
+// Best guess only; the person confirms in the Track box. Mirrors guessKind in followups.ts.
+function fuGuessKind(subject, attachmentNames) {
+  const t = [subject || "", ...(attachmentNames || [])].join(" ").toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  if (/\binvoice\b|\bpayment\b|\bpast due\b|\bremittance\b|\bpay app\b/.test(t)) return "payment";
+  if (/\bagreement\b|\bcontract\b|\badd(itional)? service\b|\bauthorization\b|\bsign(ed|ature)?\b|\bcarf\b/.test(t)) return "signature";
+  if (/\bapproval\b|\bapprove\b|\bsubmittal\b/.test(t)) return "approval";
+  if (/\bplease (confirm|send|provide)\b|\bneed(ed)?\b|\brequest(ing)?\b/.test(t)) return "info";
+  return "general";
+}
+// Email claim of the Setty session. RLS keys on it, so without it nothing can be saved.
+function fuCallerEmail() {
+  try {
+    const tok = _settyAuth.token();
+    if (!_settyAuth.isSignedIn() || !tok || tok === SUPABASE_ANON) return "";
+    const b = tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const c = JSON.parse(decodeURIComponent(escape(atob(b + "===".slice((b.length + 3) % 4)))));
+    return String(c.email || c.preferred_username || "").toLowerCase();
+  } catch { return ""; }
+}
+function fuHeaders() { return Object.assign({}, SB_HEADERS, { "Prefer": "return=representation" }); }
+async function fuRest(method, pathQuery, body) {
+  const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/" + pathQuery, {
+    method, headers: fuHeaders(), body: body === undefined ? undefined : JSON.stringify(body),
+  }, { label: "followups " + method });
+  if (!res.ok) throw new Error("Follow-ups " + method + " " + res.status + ": " + (await res.text()).slice(0, 200));
+  return res.status === 204 ? [] : res.json();
+}
+function fuDays(iso) { return Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / FU_DAY_MS)); }
+
+function fuFillKindSelect() {
+  const sel = document.getElementById("fuKind");
+  if (!sel || sel.options.length) return;
+  Object.entries(FU_KINDS).forEach(([k, label]) => sel.add(new Option(label, k)));
+}
+function fuKindChanged() {
+  const kind = document.getElementById("fuKind").value;
+  document.getElementById("fuDays").value = (FU_CADENCE_DAYS[kind] || FU_CADENCE_DAYS.general)[0];
+}
+function fuIsMailItem() { return !!emailItem && !emailItem.start; } // appointments have .start
+
+async function openFollowupsView() {
+  fuFillKindSelect();
+  showView("followupsView");
+  const box = document.getElementById("fuTrackBox");
+  if (box) box.style.display = fuIsMailItem() ? "block" : "none";
+  if (fuIsMailItem()) {
+    const k = fuGuessKind(emailItem.subject, []);
+    document.getElementById("fuKind").value = k;
+    fuKindChanged();
+  }
+  if (!fuCallerEmail()) {
+    setStatus("followupsStatus", "error", "Sign in to Setty (the pill at the top of the pane) to use follow-ups.");
+    document.getElementById("followupsList").innerHTML = "";
+    return;
+  }
+  setStatus("followupsStatus", "", "");
+  await fuLoadAndRender();
+}
+
+async function fuLoadAndRender() {
+  const list = document.getElementById("followupsList");
+  try {
+    _fuRows = await fuRest("GET", FOLLOWUPS_TABLE + "?select=*&status=in.(open,snoozed)&order=next_followup_at.asc.nullsfirst&limit=200");
+  } catch (e) {
+    setStatus("followupsStatus", "error", "✗ " + humanizeError(e));
+    return;
+  }
+  if (!_fuRows.length) {
+    list.innerHTML = '<p style="font-size:12px;color:#64748b;">Nothing outstanding. Flag a sent message in Outlook and tap Sync, or track the open email above.</p>';
+    return;
+  }
+  list.innerHTML = _fuRows.map(fuCardHtml).join("");
+  list.querySelectorAll("[data-fu]").forEach(btn => {
+    btn.onclick = () => fuAction(Number(btn.dataset.id), btn.dataset.fu);
+  });
+}
+function fuCardHtml(r) {
+  const now = Date.now();
+  const next = r.next_followup_at ? Date.parse(r.next_followup_at) : null;
+  const due = next !== null && next <= now;
+  const overdue = due && now - next > 2 * FU_DAY_MS;
+  const age = r.sent_at ? "Sent " + fuDays(r.sent_at) + "d ago" : "";
+  const nextTxt = next === null ? "" : (due ? "Reminder due" : "Next reminder " + new Date(next).toLocaleDateString());
+  const resolveLabel = { signature: "✓ Signed", payment: "✓ Paid", info: "✓ Answered", approval: "✓ Approved", general: "✓ Done" }[r.kind] || "✓ Done";
+  return '<div class="fu-card' + (overdue ? " fu-overdue" : due ? " fu-due" : "") + '">' +
+    '<div class="fu-subject">' + escHtml(r.label ? r.label + ": " + r.subject : r.subject) + '</div>' +
+    '<div class="fu-meta"><span class="fu-chip">' + escHtml(FU_KINDS[r.kind] || r.kind) + '</span>' +
+      (r.project_number ? escHtml(r.project_number) + " · " : "") +
+      escHtml([r.counterpart_name || r.counterpart_email, age, nextTxt].filter(Boolean).join(" · ")) +
+      (r.amount ? " · $" + Number(r.amount).toLocaleString() : "") + '</div>' +
+    '<div class="fu-actions">' +
+      '<button data-fu="reminded" data-id="' + r.id + '" title="Record that you sent a reminder; schedules the next one">Reminded</button>' +
+      '<button data-fu="snooze3" data-id="' + r.id + '">Snooze 3d</button>' +
+      '<button data-fu="snooze7" data-id="' + r.id + '">Snooze 1w</button>' +
+      '<button class="fu-done" data-fu="resolved" data-id="' + r.id + '">' + resolveLabel + '</button>' +
+      '<button data-fu="dismissed" data-id="' + r.id + '" title="No longer needed">Dismiss</button>' +
+    '</div></div>';
+}
+async function fuAction(id, action) {
+  const row = _fuRows.find(r => r.id === id);
+  if (!row) return;
+  const nowIso = new Date().toISOString();
+  const who = fuCallerEmail();
+  let patch;
+  if (action === "resolved" || action === "dismissed") {
+    const how = action === "dismissed" ? "No longer needed"
+      : { signature: "Signed copy received", payment: "Paid", info: "Answered", approval: "Approved", general: "Done" }[row.kind] || "Done";
+    patch = { status: action, resolution: how, resolved_at: nowIso, resolved_by: who };
+  } else if (action === "reminded") {
+    const count = (row.reminder_count || 0) + 1;
+    const next = fuNextAfter(row.kind, nowIso, count);
+    patch = { status: "snoozed", reminder_count: count, last_reminded_at: nowIso, snoozed_until: next, next_followup_at: next };
+  } else {
+    const next = new Date(Date.now() + (action === "snooze7" ? 7 : 3) * FU_DAY_MS).toISOString();
+    patch = { status: "snoozed", snoozed_until: next, next_followup_at: next };
+  }
+  try {
+    await fuRest("PATCH", FOLLOWUPS_TABLE + "?id=eq." + id, patch);
+    await fuLoadAndRender();
+  } catch (e) {
+    setStatus("followupsStatus", "error", "✗ " + humanizeError(e));
+  }
+}
+
+async function fuTrackCurrentEmail() {
+  const who = fuCallerEmail();
+  if (!who) { setStatus("followupsStatus", "error", "Sign in to Setty first."); return; }
+  if (!fuIsMailItem()) return;
+  setStatus("followupsStatus", "info", "⏳ Tracking…");
+  try {
+    const msgId = await ensureInternetMessageId();
+    if (msgId) {
+      const dup = await fuRest("GET", FOLLOWUPS_TABLE + "?select=id&internet_message_id=eq." + encodeURIComponent(msgId));
+      if (dup.length) { setStatus("followupsStatus", "success", "Already tracked."); await fuLoadAndRender(); return; }
+    }
+    const kind = document.getElementById("fuKind").value;
+    const days = Math.max(1, Number(document.getElementById("fuDays").value) || (FU_CADENCE_DAYS[kind] || [5])[0]);
+    const sentAt = emailItem.dateTimeCreated ? new Date(emailItem.dateTimeCreated).toISOString() : new Date().toISOString();
+    const amt = document.getElementById("fuAmount").value;
+    const to = (Array.isArray(emailItem.to) && emailItem.to[0]) || emailItem.from || {};
+    await fuRest("POST", FOLLOWUPS_TABLE, {
+      kind, label: document.getElementById("fuLabel").value.trim() || null,
+      subject: emailItem.subject || "(No subject)",
+      project_number: selectedProject?.projectNumber || null,
+      counterpart_name: to.displayName || null, counterpart_email: to.emailAddress || null,
+      amount: amt === "" ? null : Number(amt),
+      internet_message_id: msgId || null, conversation_id: (await getCurrentConversationId()) || null,
+      sent_at: sentAt, next_followup_at: new Date(Date.now() + days * FU_DAY_MS).toISOString(),
+      source: "manual", owner_email: who, created_by: who,
+    });
+    document.getElementById("fuLabel").value = "";
+    document.getElementById("fuAmount").value = "";
+    setStatus("followupsStatus", "success", "✓ Tracking. Reminder in " + days + " day" + (days > 1 ? "s" : "") + ".");
+    await fuLoadAndRender();
+  } catch (e) {
+    setStatus("followupsStatus", "error", "✗ " + humanizeError(e));
+  }
+}
+
+// Pull messages the sender flagged in Sent Items into the list. The flag's due date
+// becomes the first reminder. Items already tracked (any status) are left alone, so
+// resolving or dismissing one is never undone by the next sync.
+async function fuSyncFlagged(userClicked) {
+  const who = fuCallerEmail();
+  if (!who) { setStatus("followupsStatus", "error", "Sign in to Setty first."); return; }
+  if (userClicked) setStatus("followupsStatus", "info", "⏳ Checking flagged sent mail…");
+  try {
+    const data = await graphFetch("GET",
+      "/me/mailFolders/sentitems/messages?$filter=" + encodeURIComponent("flag/flagStatus eq 'flagged'") +
+      "&$select=id,internetMessageId,conversationId,subject,toRecipients,sentDateTime,flag&$top=50", null);
+    const msgs = (data?.value || []).filter(m => m.internetMessageId);
+    if (!msgs.length) { setStatus("followupsStatus", "success", "No flagged sent mail found."); await fuLoadAndRender(); return; }
+    const inList = "(" + msgs.map(m => '"' + m.internetMessageId.replace(/"/g, '\\"') + '"').join(",") + ")";
+    const have = new Set((await fuRest("GET", FOLLOWUPS_TABLE + "?select=internet_message_id&internet_message_id=in." + encodeURIComponent(inList)))
+      .map(r => r.internet_message_id));
+    const fresh = msgs.filter(m => !have.has(m.internetMessageId));
+    // Best effort: tie each message to a project through the email log.
+    const projByMsg = {};
+    try {
+      const rows = await fuRest("GET", PROJECT_EMAILS_TABLE + "?select=msg_id,project_id&msg_id=in." + encodeURIComponent(inList));
+      rows.forEach(r => { const p = getProjectById(r.project_id); if (p?.projectNumber) projByMsg[r.msg_id] = p.projectNumber; });
+    } catch {}
+    const toAdd = fresh.map(m => {
+      const kind = fuGuessKind(m.subject, []);
+      const sentAt = m.sentDateTime ? new Date(m.sentDateTime).toISOString() : new Date().toISOString();
+      const d = m.flag?.dueDateTime;
+      // Graph returns the flag due date as a UTC dateTimeTimeZone without an offset.
+      const flagDue = d?.dateTime ? new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(d.dateTime) ? d.dateTime : d.dateTime + "Z").toISOString() : null;
+      const to = m.toRecipients?.[0]?.emailAddress || {};
+      return {
+        kind, subject: m.subject || "(No subject)", project_number: projByMsg[m.internetMessageId] || null,
+        counterpart_name: to.name || null, counterpart_email: to.address || null,
+        internet_message_id: m.internetMessageId, message_id: m.id, conversation_id: m.conversationId || null,
+        sent_at: sentAt, flag_due_at: flagDue, next_followup_at: flagDue || fuNextAfter(kind, sentAt, 0),
+        source: "outlook_flag", owner_email: who, created_by: who,
+      };
+    });
+    if (toAdd.length) await fuRest("POST", FOLLOWUPS_TABLE, toAdd);
+    setStatus("followupsStatus", "success", toAdd.length ? "✓ Added " + toAdd.length + " flagged message" + (toAdd.length > 1 ? "s" : "") + "." : "Already up to date.");
+    await fuLoadAndRender();
+  } catch (e) {
+    setStatus("followupsStatus", "error", "✗ " + humanizeError(e));
+  }
 }
