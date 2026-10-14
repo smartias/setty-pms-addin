@@ -11639,6 +11639,26 @@ function projectPmsUrl(project) {
   if (project.id) return PMS_PROJECT_BASE_URL + encodeURIComponent(project.id);
   return PMS_DASHBOARD_URL;
 }
+// Hide the SharePoint, OneNote and Teams actions for a project that has none of that
+// set up, so nobody clicks into a dead end. All three read fields that
+// _stripProjectForCache already keeps. With no project selected nothing is hidden
+// (the buttons show disabled, as before) so the layout does not jump when one is picked.
+// Hiding uses the .integration-off class, separate from .disabled and style.display,
+// which applyPipelineUiRules / applyEmailFlowEmphasis / refreshEmailSavedIndicator own.
+function updateIntegrationButtons() {
+  const p = selectedProject;
+  const off = (el, hide) => { if (el) el.classList.toggle("integration-off", !!hide); };
+  const noSp    = !!p && !p.projectFolderUrl;
+  const noNote  = !!p && !(p.teamsOneNoteNotebookId || p.oneNoteNotebookId);
+  const noTeams = !!p && !p.teamsChannelId;
+  off(document.getElementById("saveSpBtn"), noSp);
+  // The row and caption exist only for the SharePoint button (Save to Project is retired
+  // and hidden), so they go with it. The "no SharePoint folder" hint stays visible.
+  off(document.querySelector(".save-row"), noSp);
+  off(document.querySelector(".save-row-caption"), noSp);
+  off(document.getElementById("logNoteBtn"), noNote);
+  off(document.getElementById("sendToTeamsBtn"), noTeams);
+}
 function updateProjectQuickLinks() {
   const pmsBtn = document.getElementById("openPmsBtn");
   const spBtn = document.getElementById("openSpFolderBtn");
@@ -11658,6 +11678,7 @@ function updateProjectQuickLinks() {
   if (spHint) {
     spHint.style.display = (selectedProject && !selectedProject.projectFolderUrl) ? "block" : "none";
   }
+  updateIntegrationButtons();
   applyPipelineUiRules();
 }
 function openSelectedProjectInPms() {

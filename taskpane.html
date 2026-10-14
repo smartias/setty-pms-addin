@@ -262,6 +262,10 @@
     .btn-onenote { background: #7719AA; color: #fff; border-color: #7719AA; }
     .btn-onenote:hover:not(:disabled) { background: #5e147f; }
     .btn-teams   { background: #6264A7; color: #fff; border-color: #6264A7; }
+    /* Set by updateIntegrationButtons(): the selected project has no SharePoint folder,
+       OneNote notebook or Teams channel. A class (not style.display or .disabled) so the
+       attachment and pipeline rules that toggle those cannot undo it. */
+    .integration-off { display: none !important; }
     .btn-teams:hover:not(:disabled)   { background: #4f519e; }
     .btn-teams-sent { background: #107c41; color: #fff; border-color: #107c41; }
     .btn-teams-sent:hover:not(:disabled) { background: #0d6435; }
@@ -1405,6 +1409,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-10-08-my-pms-permissions"></script>
+<script src="taskpane.js?v=2026-10-14-hide-unset-integrations"></script>
 </body>
 </html>
