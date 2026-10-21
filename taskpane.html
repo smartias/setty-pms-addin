@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-10-14-followups-tab";</script>
+  <script>window.__appVersion = "2026-10-21-join-team";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -971,6 +971,27 @@
     <!-- Jobcard: at-a-glance project status, filled by renderJobcard() from already-loaded data. -->
     <div id="jobcardBody" style="display:none;border-top:1px solid #b6e3b6;padding-top:6px;"></div>
   </div>
+  <!-- Join-team nudge: shows when the signed-in user isn't on the tagged
+       project's team roster. One click appends them (name + email from the
+       Outlook/MSAL profile, role from the picker) — see refreshJoinTeamBanner(). -->
+  <div id="joinTeamBanner" style="display:none;margin:-4px 0 10px;padding:8px 10px;background:var(--primary-soft);border:1px solid #b7daf2;border-radius:4px;font-size:12px;color:var(--primary-hov);line-height:1.5;">
+    <div style="font-weight:600;margin-bottom:6px;">👥 You're not on this project's team yet.</div>
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+      <select id="joinTeamRole" style="flex:1;min-width:120px;font-size:12px;padding:4px 6px;">
+        <option value="Project Manager">Project Manager</option>
+        <option value="Project Engineer" selected>Project Engineer</option>
+        <option value="Engineer">Engineer</option>
+        <option value="Designer">Designer</option>
+        <option value="CAD / Drafter">CAD / Drafter</option>
+        <option value="QA/QC Reviewer">QA/QC Reviewer</option>
+        <option value="Principal">Principal</option>
+        <option value="Admin / Support">Admin / Support</option>
+        <option value="Team Member">Other</option>
+      </select>
+      <button type="button" id="joinTeamBtn" class="btn btn-primary" style="flex:none;width:auto;font-size:12px;padding:4px 10px;">+ Add me to the team</button>
+    </div>
+  </div>
+  <div id="joinTeamStatus" class="status-msg"></div>
   <div id="projectPipelineHint" style="display:none;margin:-4px 0 10px;padding:6px 10px;background:var(--warn-bg);border:1px solid #f1d875;border-radius:4px;font-size:12px;color:var(--warn);font-weight:600;"></div>
 
   <!-- SharePoint folder hint — shows when a project is selected but doesn't

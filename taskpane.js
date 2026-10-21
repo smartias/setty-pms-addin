@@ -300,6 +300,7 @@ function setupEventListeners() {
   // don't appear mid-session otherwise (project data is loaded once at open).
   document.getElementById("refreshProjectsBtn").onclick = () => refreshProjectData();
   document.getElementById("sendToTeamsBtn").onclick = sendToTeamsChannel;
+  document.getElementById("joinTeamBtn").onclick = joinProjectTeam;
   document.getElementById("openFollowupsBtn").onclick = openFollowupsView;
   document.getElementById("followupsBack").onclick = () => showView("mainView");
   document.getElementById("fuTrackBtn").onclick = fuTrackCurrentEmail;
@@ -3265,6 +3266,85 @@ function refreshActionItemOwnerOptions() {
     + teamMembers.map(name => `<option value="${escHtml(name)}">${escHtml(name)}</option>`).join("");
   if (previous && teamMembers.includes(previous)) ownerSelect.value = previous;
 }
+
+// ─── JOIN PROJECT TEAM (self-add) ───────────────────────────────────────────
+// Setty staff are normally added to a project's team roster from the Teams tab
+// in PMS. When someone opens an email tagged to a project they're not on, the
+// add-in offers a one-click "add me": it appends a member record (name + email
+// from the signed-in profile, role from the picker) through the same
+// fetch-mutate-save path every other project edit uses, so a concurrent PMS
+// edit can't be clobbered. Anyone signed in may self-add — by design.
+function myStaffIdentity() {
+  const email = (msalAccount?.username || "").trim();
+  let name = "";
+  try { name = (Office.context.mailbox.userProfile.displayName || "").trim(); } catch {}
+  if (!name) name = (msalAccount?.name || "").trim();
+  return { email, name };
+}
+// Already on the roster? Email match first (authoritative); fall back to an
+// exact name match for legacy member rows that were saved without an email,
+// so we never offer to add a duplicate of someone PMS already lists.
+function isMeOnProjectTeam(project, me) {
+  const emailLc = (me?.email || "").toLowerCase();
+  const nameLc = (me?.name || "").toLowerCase();
+  return (project?.teamMembers || []).some(m => {
+    if (!m || typeof m !== "object") return false;
+    const mEmail = (m.email || "").trim().toLowerCase();
+    if (emailLc && mEmail) return mEmail === emailLc;
+    const mName = (m.name || "").trim().toLowerCase();
+    return !!nameLc && mName === nameLc;
+  });
+}
+function refreshJoinTeamBanner() {
+  const banner = document.getElementById("joinTeamBanner");
+  if (!banner) return;
+  try { setStatus("joinTeamStatus", "", ""); } catch {}
+  const me = myStaffIdentity();
+  // Needs a tagged project, a read-mode item, a known identity, and a session
+  // that can actually save. Non-Setty sign-ins never belong on the roster.
+  const show = !!selectedProject && !isComposeMode() && !!me.email &&
+    isSettyInternalEmail(me.email) && !_signedOutForSaves() &&
+    !isMeOnProjectTeam(selectedProject, me);
+  banner.style.display = show ? "block" : "none";
+  const btn = document.getElementById("joinTeamBtn");
+  if (btn) { btn.disabled = false; btn.textContent = "+ Add me to the team"; }
+}
+async function joinProjectTeam() {
+  const project = selectedProject;
+  const me = myStaffIdentity();
+  if (!project || !me.email) return;
+  const role = (document.getElementById("joinTeamRole")?.value || "Team Member").trim();
+  const btn = document.getElementById("joinTeamBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "adding…"; }
+  setStatus("joinTeamStatus", "info", "⏳ Adding you to " + (project.name || "the project") + "…");
+  // Same id scheme the add-in uses for directory entries it creates (uid()),
+  // so PMS sees a familiar "addin-…" id on the member row.
+  const member = {
+    id: uid(),
+    name: me.name || me.email,
+    email: me.email,
+    role,
+    addedAt: new Date().toISOString(),
+    addedBy: me.email,
+    addedVia: "outlook-addin",
+  };
+  try {
+    await applyLocalChangeAndSave(project.id, fresh => {
+      // Re-check against the FRESH row: a PM may have added us in PMS since
+      // the pane loaded, in which case this is a no-op save.
+      if (isMeOnProjectTeam(fresh, me)) return fresh;
+      return { ...fresh, teamMembers: [...(fresh.teamMembers || []), member] };
+    });
+    // applyLocalChangeAndSave swapped selectedProject for the saved copy, so
+    // the owner/assignee dropdowns pick up the new member on re-populate.
+    refreshActionItemOwnerOptions();
+    refreshJoinTeamBanner();
+    setStatus("joinTeamStatus", "success", "✓ You're on the " + (project.name || "project") + " team as " + role + ".");
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "+ Add me to the team"; }
+    setStatus("joinTeamStatus", "error", "✗ " + humanizeError(e));
+  }
+}
 async function clearProjectTagForCurrentEmail() {
   // Snapshot BEFORE any await: the prompt/removal below must act on the email
   // and project the user was looking at when they clicked ✕, not whatever is
@@ -3559,6 +3639,7 @@ function setSelectedProject(project, persistForEmail = false) {
   updateProjectQuickLinks();
   try { renderJobcard(selectedProject); } catch (e) { console.warn("[jobcard] render failed:", e.message); }
   refreshActionItemOwnerOptions();
+  refreshJoinTeamBanner();
   refreshEmailSavedIndicator();
   refreshOneNoteLinkBanner();
   refreshCalendarStatus();
