@@ -3433,14 +3433,15 @@ async function joinProjectTeam() {
     refreshJoinTeamBanner();
     setStatus("joinTeamStatus", "success", "✓ You're on the " + (project.name || "project") + " team as " + role + ".");
     // Only when we actually wrote the row — a PM beating us to it is a quiet no-op.
-    if (appended) celebrateTeamJoin({ project, role, teamSizeBefore });
+    if (appended) celebrateTeamJoin({ project, role, teamSizeBefore, member });
   } catch (e) {
     if (btn) { btn.disabled = false; btn.textContent = "+ Add me"; }
     setStatus("joinTeamStatus", "error", "✗ " + humanizeError(e));
   }
 }
 // ─── JOIN-TEAM EASTER EGGS ──────────────────────────────────────────────────
-// A toast + confetti the moment someone adds themselves to a team. Most joins
+// A name badge drops in on a lanyard the moment someone adds themselves to a
+// team (distinct from the confetti used for save milestones). Most joins
 // get a random welcome line; a handful of conditions (first on the roster,
 // lucky seventh, a Friday-afternoon join, the rare golden hard hat…) swap in
 // a special one. Pure flavor: every branch is wrapped so nothing here can
@@ -3479,7 +3480,8 @@ function bumpTeamJoinCount() {
   } catch { return 0; }
 }
 // Picks the celebration for a join. `now` and `rand` are injectable for tests.
-// Returns { pool, confetti? } — the pool goes through pickQuip for {name}.
+// Returns { pool, gold? } — the pool goes through pickQuip for {name}; gold
+// switches the badge to the golden hard hat styling.
 function pickJoinTeamEgg(ctx, now = new Date(), rand = Math.random) {
   const role = ctx.role || "";
   const sizeAfter = (ctx.teamSizeBefore || 0) + 1;
@@ -3488,8 +3490,7 @@ function pickJoinTeamEgg(ctx, now = new Date(), rand = Math.random) {
   const hour = now.getHours(), dow = now.getDay();
   // Rare: ~1 in 40 joins gets the golden hard hat (gold confetti).
   if (rand() < 0.025) {
-    return { pool: ["🪖 GOLDEN HARD HAT{name}! A 1-in-40 join. Wear it with pride."],
-             confetti: { colors: ["#ffd700", "#ffecb3", "#ffb300", "#fff8e1"], shapes: ["star", "circle"], scalar: 1.1 } };
+    return { pool: ["🪖 GOLDEN HARD HAT{name}! A 1-in-40 join. Wear it with pride."], gold: true };
   }
   if (ctx.teamSizeBefore === 0) return { pool: ["🚧 First on site{name} — you just founded this team.", "🏕️ Empty roster, no more. The team starts with you{name}."] };
   if (/007/.test(num)) return { pool: ["🕵️ Reporting for duty on project " + num + "{name}. This message will self-file."] };
@@ -3506,11 +3507,47 @@ function pickJoinTeamEgg(ctx, now = new Date(), rand = Math.random) {
   if (rolePool && rand() < 0.5) return { pool: rolePool };
   return { pool: JOIN_TEAM_WELCOME_QUIPS };
 }
+// Initials for the badge avatar: first letter of the first two words of the
+// name ("Sara Arias" → "SA"); falls back to the first letter of an email.
+function badgeInitials(name) {
+  const words = String(name || "").replace(/@.*$/, "").trim().split(/[\s._-]+/).filter(Boolean);
+  return words.slice(0, 2).map(w => w[0].toUpperCase()).join("") || "?";
+}
+// Show the badge (name, role, project, quip). Re-showable: a second join
+// mid-animation restarts the drop. Lifts away on its own after ~3.6s.
+function showTeamBadge({ name, role, project, quip, gold }) {
+  const el = document.getElementById("teamBadge");
+  if (!el) return;
+  const set = (id, txt) => { const n = document.getElementById(id); if (n) n.textContent = txt || ""; };
+  set("teamBadgeInitials", badgeInitials(name));
+  set("teamBadgeName", name);
+  set("teamBadgeRole", role);
+  set("teamBadgeProject", [project?.projectNumber, project?.name].filter(Boolean).join(" — "));
+  set("teamBadgeQuip", quip);
+  set("teamBadgeStrip", gold ? "🪖 Golden Hard Hat" : "Setty · Project Team");
+  el.classList.toggle("gold", !!gold);
+  // Force reflow so the drop animation restarts even if one is in flight.
+  el.classList.remove("show", "hide");
+  void el.offsetWidth;
+  el.classList.add("show");
+  clearTimeout(showTeamBadge._t);
+  showTeamBadge._t = setTimeout(() => {
+    el.classList.remove("show");
+    el.classList.add("hide");
+    showTeamBadge._t = setTimeout(() => el.classList.remove("hide"), 500);
+  }, 3600);
+}
 function celebrateTeamJoin(ctx) {
   try {
     const joinCount = bumpTeamJoinCount();
     const egg = pickJoinTeamEgg({ ...ctx, joinCount });
-    triggerCelebration(pickQuip(egg.pool), egg.confetti);
+    showTeamBadge({
+      name: ctx.member?.name || myStaffIdentity().name || myStaffIdentity().email,
+      role: ctx.role,
+      project: ctx.project,
+      quip: pickQuip(egg.pool),
+      gold: !!egg.gold,
+    });
   } catch (e) { console.warn("[join-team] celebration skipped:", e?.message); }
 }
 async function clearProjectTagForCurrentEmail() {
@@ -7360,7 +7397,7 @@ function triggerFirstSaveCelebration() {
   });
 }
 
-function triggerCelebration(message, extraConfettiOpts) {
+function triggerCelebration(message) {
   const toast = document.getElementById("celebrationToast");
   if (toast) {
     toast.textContent = message;
@@ -7380,8 +7417,7 @@ function triggerCelebration(message, extraConfettiOpts) {
     if (!ok || typeof confetti !== "function") return;
     // Two bursts a beat apart — feels more alive than one big shot.
     // Seasonal opts layer on top (snowflakes in Dec, hearts on Valentine's, etc.)
-    // Caller opts (an Easter egg's palette) win over the seasonal layer.
-    const seasonal = { ...(getSeasonalConfettiOpts() || {}), ...(extraConfettiOpts || {}) };
+    const seasonal = getSeasonalConfettiOpts() || {};
     confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85, ...seasonal });
     setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7, ...seasonal }), 220);
   });

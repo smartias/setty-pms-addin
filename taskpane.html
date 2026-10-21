@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-10-21-join-team-eggs";</script>
+  <script>window.__appVersion = "2026-10-21-join-team-badge";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -492,6 +492,79 @@
       to   { opacity: 1; transform: scale(1) translateY(0); }
     }
     .header-logo { cursor: pointer; user-select: none; }
+    /* Team-join name badge — an ID card on a lanyard drops in from the top of
+       the pane, swings once, then lifts away. Replaces confetti for self-joins
+       so the two celebrations stay visually distinct. All colors come from the
+       theme tokens so it follows dark mode. */
+    #teamBadge {
+      position: fixed;
+      top: 0;
+      left: 50%;
+      width: 232px;
+      z-index: 9999;
+      pointer-events: none;
+      display: none;
+      transform: translateX(-50%) translateY(-110%);
+      transform-origin: 50% 0;
+    }
+    #teamBadge.show { display: block; animation: tbDrop 1.15s cubic-bezier(0.2, 0.8, 0.2, 1) forwards; }
+    #teamBadge.hide { display: block; animation: tbLift 0.45s ease-in forwards; }
+    @keyframes tbDrop {
+      0%   { transform: translateX(-50%) translateY(-110%) rotate(0deg); opacity: 0; }
+      50%  { transform: translateX(-50%) translateY(0) rotate(5deg); opacity: 1; }
+      72%  { transform: translateX(-50%) translateY(0) rotate(-3.5deg); }
+      88%  { transform: translateX(-50%) translateY(0) rotate(1.5deg); }
+      100% { transform: translateX(-50%) translateY(0) rotate(0deg); opacity: 1; }
+    }
+    @keyframes tbLift {
+      from { transform: translateX(-50%) translateY(0); opacity: 1; }
+      to   { transform: translateX(-50%) translateY(-110%); opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #teamBadge.show, #teamBadge.hide { animation-duration: 0.01s; }
+    }
+    #teamBadge .tb-lanyard {
+      width: 8px; height: 44px; margin: 0 auto;
+      background: repeating-linear-gradient(180deg, var(--primary) 0 6px, var(--primary-hov) 6px 12px);
+      border-radius: 0 0 3px 3px;
+    }
+    #teamBadge .tb-card {
+      position: relative;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22), 0 2px 4px rgba(0, 0, 0, 0.12);
+      overflow: hidden;
+      text-align: center;
+    }
+    #teamBadge .tb-clip {
+      position: absolute; top: -1px; left: 50%; transform: translateX(-50%);
+      width: 34px; height: 9px; border-radius: 0 0 6px 6px;
+      background: var(--border-strong);
+    }
+    #teamBadge .tb-strip {
+      background: var(--primary); color: #fff;
+      font-size: 10px; font-weight: 800; letter-spacing: 1.4px; text-transform: uppercase;
+      padding: 12px 10px 6px;
+    }
+    #teamBadge.gold .tb-strip { background: linear-gradient(135deg, #ffd86b 0%, #f5a623 100%); color: #4a2800; }
+    #teamBadge.gold .tb-card { border-color: #f5a623; box-shadow: 0 10px 24px rgba(245, 166, 35, 0.45), 0 2px 4px rgba(0, 0, 0, 0.12); }
+    #teamBadge .tb-body { padding: 12px 12px 8px; }
+    #teamBadge .tb-avatar {
+      width: 46px; height: 46px; margin: 0 auto 8px; border-radius: 50%;
+      background: var(--primary-soft); color: var(--primary-hov);
+      font-weight: 800; font-size: 17px; line-height: 46px;
+    }
+    #teamBadge.gold .tb-avatar { background: #fff3cd; color: #7a4a00; }
+    #teamBadge .tb-name { font-size: 15px; font-weight: 700; line-height: 1.2; word-break: break-word; }
+    #teamBadge .tb-role { font-size: 12px; color: var(--text-soft); margin-top: 2px; }
+    #teamBadge .tb-project { font-size: 11px; color: var(--text-soft); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #teamBadge .tb-quip {
+      border-top: 1px dashed var(--border-strong);
+      padding: 7px 10px 9px; font-size: 11px; font-style: italic; line-height: 1.35;
+      color: var(--text);
+    }
     /* Celebration toast — appears at the top of the pane on weekly milestone hits.
        Gold gradient + slide-down + pop motion so the moment feels rewarding. */
     #celebrationToast {
@@ -870,6 +943,20 @@
 </head>
 <body>
 <div id="celebrationToast" aria-live="polite"></div>
+<div id="teamBadge" aria-live="polite">
+  <div class="tb-lanyard"></div>
+  <div class="tb-card">
+    <div class="tb-clip"></div>
+    <div class="tb-strip" id="teamBadgeStrip">Setty · Project Team</div>
+    <div class="tb-body">
+      <div class="tb-avatar" id="teamBadgeInitials"></div>
+      <div class="tb-name" id="teamBadgeName"></div>
+      <div class="tb-role" id="teamBadgeRole"></div>
+      <div class="tb-project" id="teamBadgeProject"></div>
+    </div>
+    <div class="tb-quip" id="teamBadgeQuip"></div>
+  </div>
+</div>
 <!-- Hidden credits overlay — revealed by clicking the SETTY PMS logo 5x.
      Pure easter egg, no app function. Click anywhere to dismiss. -->
 <div id="creditsOverlay">
