@@ -3418,10 +3418,13 @@ async function joinProjectTeam() {
       disciplines: Array.isArray(staffRec?.disciplines) ? staffRec.disciplines : [],
       email: (staffRec?.email || "").trim() || me.email,
     };
+    let teamSizeBefore = 0, appended = false;
     await applyLocalChangeAndSave(project.id, fresh => {
       // Re-check against the FRESH row: a PM may have added us in PMS since
       // the pane loaded, in which case this is a no-op save.
       if (isMeOnProjectTeam(fresh, me)) return fresh;
+      teamSizeBefore = (fresh.teamMembers || []).length;
+      appended = true;
       return { ...fresh, teamMembers: [...(fresh.teamMembers || []), member] };
     });
     // applyLocalChangeAndSave swapped selectedProject for the saved copy, so
@@ -3429,10 +3432,86 @@ async function joinProjectTeam() {
     refreshActionItemOwnerOptions();
     refreshJoinTeamBanner();
     setStatus("joinTeamStatus", "success", "✓ You're on the " + (project.name || "project") + " team as " + role + ".");
+    // Only when we actually wrote the row — a PM beating us to it is a quiet no-op.
+    if (appended) celebrateTeamJoin({ project, role, teamSizeBefore });
   } catch (e) {
     if (btn) { btn.disabled = false; btn.textContent = "+ Add me"; }
     setStatus("joinTeamStatus", "error", "✗ " + humanizeError(e));
   }
+}
+// ─── JOIN-TEAM EASTER EGGS ──────────────────────────────────────────────────
+// A toast + confetti the moment someone adds themselves to a team. Most joins
+// get a random welcome line; a handful of conditions (first on the roster,
+// lucky seventh, a Friday-afternoon join, the rare golden hard hat…) swap in
+// a special one. Pure flavor: every branch is wrapped so nothing here can
+// ever break the save that just succeeded. Per-device join counter lives in
+// localStorage, same approach as the weekly save streak.
+const TEAM_JOIN_COUNT_KEY = "setty_pms_team_joins_v1";
+const JOIN_TEAM_WELCOME_QUIPS = [
+  "🎉 Welcome aboard{name}! Hard hat optional, coffee mandatory.",
+  "🏗️ You're on the team{name}. The project just got a little more buildable.",
+  "📐 Roster updated. Somewhere, a Gantt chart sighed with relief.",
+  "🤝 Welcome to the team{name} — RFIs will find you now.",
+  "🧰 Badge printed, locker assigned (metaphorically). Welcome{name}!",
+  "🚀 Onboarded in one click. The PM didn't even have to open PMS.",
+  "📋 Name on the roster, name on the sign-in sheet. Welcome{name}!",
+  "✨ Team +1. Scope creep trembles.",
+  "🦺 Safety vest on. Welcome to the project{name}!",
+  "🏁 You're in. Let the coordination begin.",
+];
+const JOIN_TEAM_ROLE_QUIPS = {
+  "Director": [
+    "🎬 The Director has entered the chat. Places, everyone.",
+    "🎩 A Director joins the roster — the project just got executive sponsorship.",
+    "🧭 Director on board{name}. Steer true.",
+  ],
+  "Engineer": [
+    "⚙️ Engineer online{name}. Calculations may now commence.",
+    "🔩 Another engineer on the job — the margin of safety just improved.",
+    "📏 Engineer added. Measure twice, build once.",
+  ],
+};
+function bumpTeamJoinCount() {
+  try {
+    const n = (parseInt(localStorage.getItem(TEAM_JOIN_COUNT_KEY) || "0", 10) || 0) + 1;
+    localStorage.setItem(TEAM_JOIN_COUNT_KEY, String(n));
+    return n;
+  } catch { return 0; }
+}
+// Picks the celebration for a join. `now` and `rand` are injectable for tests.
+// Returns { pool, confetti? } — the pool goes through pickQuip for {name}.
+function pickJoinTeamEgg(ctx, now = new Date(), rand = Math.random) {
+  const role = ctx.role || "";
+  const sizeAfter = (ctx.teamSizeBefore || 0) + 1;
+  const num = String(ctx.project?.projectNumber || "");
+  const joins = ctx.joinCount || 0;
+  const hour = now.getHours(), dow = now.getDay();
+  // Rare: ~1 in 40 joins gets the golden hard hat (gold confetti).
+  if (rand() < 0.025) {
+    return { pool: ["🪖 GOLDEN HARD HAT{name}! A 1-in-40 join. Wear it with pride."],
+             confetti: { colors: ["#ffd700", "#ffecb3", "#ffb300", "#fff8e1"], shapes: ["star", "circle"], scalar: 1.1 } };
+  }
+  if (ctx.teamSizeBefore === 0) return { pool: ["🚧 First on site{name} — you just founded this team.", "🏕️ Empty roster, no more. The team starts with you{name}."] };
+  if (/007/.test(num)) return { pool: ["🕵️ Reporting for duty on project " + num + "{name}. This message will self-file."] };
+  if (sizeAfter === 7) return { pool: ["🍀 Lucky number seven{name}. The roster is officially a full week."] };
+  if (sizeAfter === 12) return { pool: ["🥚 A full dozen! Twelve on the roster — that's a team with a group chat."] };
+  if (sizeAfter === 20) return { pool: ["🏟️ Twenty strong. This isn't a team anymore, it's a department."] };
+  if (joins === 5) return { pool: ["🧳 Fifth team joined from this desk. Serial collaborator{name}."] };
+  if (joins === 10) return { pool: ["🎪 Ten teams joined. You contain multitudes{name}."] };
+  if (joins === 25) return { pool: ["🏅 Twenty-five teams. At this point you ARE the org chart."] };
+  if (dow === 5 && hour >= 15) return { pool: ["🎉 Joining a team at " + (hour > 12 ? hour - 12 : hour) + "pm on a Friday. Bold. Respected."] };
+  if (hour < 7) return { pool: ["🌅 Early bird{name} — on the roster before the coffee's even brewed."] };
+  if (hour >= 19) return { pool: ["🌙 Night shift{name}. The project never sleeps, apparently neither do you."] };
+  const rolePool = JOIN_TEAM_ROLE_QUIPS[role];
+  if (rolePool && rand() < 0.5) return { pool: rolePool };
+  return { pool: JOIN_TEAM_WELCOME_QUIPS };
+}
+function celebrateTeamJoin(ctx) {
+  try {
+    const joinCount = bumpTeamJoinCount();
+    const egg = pickJoinTeamEgg({ ...ctx, joinCount });
+    triggerCelebration(pickQuip(egg.pool), egg.confetti);
+  } catch (e) { console.warn("[join-team] celebration skipped:", e?.message); }
 }
 async function clearProjectTagForCurrentEmail() {
   // Snapshot BEFORE any await: the prompt/removal below must act on the email
@@ -7281,7 +7360,7 @@ function triggerFirstSaveCelebration() {
   });
 }
 
-function triggerCelebration(message) {
+function triggerCelebration(message, extraConfettiOpts) {
   const toast = document.getElementById("celebrationToast");
   if (toast) {
     toast.textContent = message;
@@ -7301,7 +7380,8 @@ function triggerCelebration(message) {
     if (!ok || typeof confetti !== "function") return;
     // Two bursts a beat apart — feels more alive than one big shot.
     // Seasonal opts layer on top (snowflakes in Dec, hearts on Valentine's, etc.)
-    const seasonal = getSeasonalConfettiOpts() || {};
+    // Caller opts (an Easter egg's palette) win over the seasonal layer.
+    const seasonal = { ...(getSeasonalConfettiOpts() || {}), ...(extraConfettiOpts || {}) };
     confetti({ particleCount: 80, spread: 75, startVelocity: 35, origin: { y: 0.55 }, scalar: 0.85, ...seasonal });
     setTimeout(() => confetti({ particleCount: 50, spread: 110, startVelocity: 28, origin: { y: 0.45 }, scalar: 0.7, ...seasonal }), 220);
   });
