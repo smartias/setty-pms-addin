@@ -477,6 +477,10 @@ function loadItemContext() {
   // section doesn't need email metadata.
   if (isComposeMode()) {
     emailItem = null;
+    // A pinned pane moving from a tagged read item into Reply/Forward keeps
+    // selectedProject, and nothing below runs — so hide the join banner here
+    // (it's read-mode only; the predicate inside checks isComposeMode).
+    try { refreshJoinTeamBanner(); } catch {}
     return;
   }
   // Leaving the pane pinned all day? Quietly pull the latest projects/schedules
@@ -3298,13 +3302,18 @@ function myStaffIdentity() {
 // in the directory" is a definite null and is cached for the session. Either
 // way the join falls back to the Outlook profile name + the default role.
 let _myStaffPromise = null;
+let _myStaffPromiseEmail = ""; // sign-in email the cached lookup was made for
 function ensureMyStaffRecord() {
-  if (_myStaffPromise) return _myStaffPromise;
+  // Keyed by the signed-in email: signing out and back in as someone else
+  // (without a pane reload) must not reuse the first person's record.
+  const emailNow = (myStaffIdentity().email || "").toLowerCase();
+  if (_myStaffPromise && _myStaffPromiseEmail === emailNow) return _myStaffPromise;
+  _myStaffPromiseEmail = emailNow;
   _myStaffPromise = (async () => {
     try {
       await settyAuthReady;
       if (!window.settyAuth || _signedOutForSaves()) return undefined;
-      const emailLc = (myStaffIdentity().email || "").toLowerCase();
+      const emailLc = emailNow;
       if (!emailLc) return undefined;
       const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.app_meta&select=data",
         { headers: SB_HEADERS }, { label: "sb staff directory", maxAttempts: 2 });
@@ -3316,7 +3325,8 @@ function ensureMyStaffRecord() {
     } catch { return undefined; }
   })();
   // Let a transient failure be retried on the next banner refresh.
-  _myStaffPromise.then(r => { if (r === undefined) _myStaffPromise = null; });
+  const mine = _myStaffPromise;
+  mine.then(r => { if (r === undefined && _myStaffPromise === mine) _myStaffPromise = null; });
   return _myStaffPromise;
 }
 // Role to preselect: the Staff directory default unless it's a protected PM
@@ -3340,14 +3350,19 @@ function isMeOnProjectTeam(project, me) {
     return !!nameLc && mName === nameLc;
   });
 }
+// `touched` = the user changed the picker since the banner was (re)shown; a
+// late staff-directory result then adds the directory role as an option but
+// leaves their choice selected instead of resetting it to the default.
 function renderJoinTeamRoleOptions(staffRec) {
   const sel = document.getElementById("joinTeamRole");
   const hint = document.getElementById("joinTeamHint");
   if (!sel) return;
   const def = joinTeamDefaultRole(staffRec);
-  const options = [...new Set([def, ...JOIN_TEAM_ROLE_OPTIONS])];
+  const touched = sel.dataset.touched === "1";
+  const keep = touched ? sel.value : "";
+  const options = [...new Set([def, ...JOIN_TEAM_ROLE_OPTIONS, ...(keep ? [keep] : [])])];
   sel.innerHTML = options.map(r => `<option value="${escHtml(r)}">${escHtml(r)}</option>`).join("");
-  sel.value = def;
+  sel.value = keep || def;
   if (hint) {
     hint.textContent = staffRec
       ? "Joining as " + (staffRec.name || myStaffIdentity().name || "you") + " (Staff directory)."
@@ -3368,6 +3383,8 @@ function refreshJoinTeamBanner() {
   const btn = document.getElementById("joinTeamBtn");
   if (btn) { btn.disabled = false; btn.textContent = "+ Add me"; }
   if (!show) return;
+  const sel = document.getElementById("joinTeamRole");
+  if (sel) { sel.dataset.touched = ""; sel.onchange = () => { sel.dataset.touched = "1"; }; }
   // Paint the fallback immediately, then the Staff directory default once the
   // (cached) lookup lands — guarded so a project switch mid-fetch can't repaint
   // a banner that's since been hidden.
@@ -3386,9 +3403,11 @@ async function joinProjectTeam() {
   const btn = document.getElementById("joinTeamBtn");
   if (btn) { btn.disabled = true; btn.textContent = "adding…"; }
   setStatus("joinTeamStatus", "info", "⏳ Adding you to " + (project.name || "the project") + "…");
+  // Read the picker BEFORE awaiting: the banner's own lookup callback may
+  // repaint the select while we wait, and the user's choice must win.
+  const picked = (document.getElementById("joinTeamRole")?.value || "").trim();
   try {
     const staffRec = (await ensureMyStaffRecord()) || null;
-    const picked = (document.getElementById("joinTeamRole")?.value || "").trim();
     const role = picked && !JOIN_TEAM_PROTECTED_ROLES.includes(picked) ? picked : joinTeamDefaultRole(staffRec);
     // Same shape PMS's own self-join writes (My Projects → joinProject).
     const member = {
