@@ -3270,16 +3270,61 @@ function refreshActionItemOwnerOptions() {
 // ─── JOIN PROJECT TEAM (self-add) ───────────────────────────────────────────
 // Setty staff are normally added to a project's team roster from the Teams tab
 // in PMS. When someone opens an email tagged to a project they're not on, the
-// add-in offers a one-click "add me": it appends a member record (name + email
-// from the signed-in profile, role from the picker) through the same
-// fetch-mutate-save path every other project edit uses, so a concurrent PMS
-// edit can't be clobbered. Anyone signed in may self-add — by design.
+// add-in offers a one-click "add me". Mirrors PMS's own self-join (My Projects
+// → joinProject): the member record is built from the person's row in the
+// Staff directory (pms_meta.app_meta.staff — name, default role, rate,
+// disciplines), saved through the same fetch-mutate-save path every other
+// project edit uses so a concurrent PMS edit can't be clobbered. Anyone signed
+// in may self-add — by design.
+const JOIN_TEAM_FALLBACK_ROLE = "Engineer";
+// PM / Deputy PM are positional slots on the PMS Team tab, so a self-join
+// never claims them (same rule PMS applies); the picker offers Engineer and
+// Director plus whatever the person's Staff directory role is.
+const JOIN_TEAM_PROTECTED_ROLES = ["Project Manager", "Deputy Project Manager"];
+const JOIN_TEAM_ROLE_OPTIONS = ["Engineer", "Director"];
+// Same id scheme PMS uses for team members (SettyPMS.html uid()).
+function pmsUid() { return Math.random().toString(36).slice(2, 10); }
+
 function myStaffIdentity() {
   const email = (msalAccount?.username || "").trim();
   let name = "";
   try { name = (Office.context.mailbox.userProfile.displayName || "").trim(); } catch {}
   if (!name) name = (msalAccount?.name || "").trim();
   return { email, name };
+}
+// My row in the Staff directory, looked up once per session by sign-in email.
+// pms_meta is readable by any authenticated user (pms_meta_select). Any failure
+// (signed out, offline) resolves to undefined so the next refresh retries; "not
+// in the directory" is a definite null and is cached for the session. Either
+// way the join falls back to the Outlook profile name + the default role.
+let _myStaffPromise = null;
+function ensureMyStaffRecord() {
+  if (_myStaffPromise) return _myStaffPromise;
+  _myStaffPromise = (async () => {
+    try {
+      await settyAuthReady;
+      if (!window.settyAuth || _signedOutForSaves()) return undefined;
+      const emailLc = (myStaffIdentity().email || "").toLowerCase();
+      if (!emailLc) return undefined;
+      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.app_meta&select=data",
+        { headers: SB_HEADERS }, { label: "sb staff directory", maxAttempts: 2 });
+      if (!res.ok) return undefined;
+      const rows = await res.json();
+      const staff = rows?.[0]?.data?.staff;
+      if (!Array.isArray(staff)) return undefined;
+      return staff.find(s => s && (s.email || "").trim().toLowerCase() === emailLc) || null;
+    } catch { return undefined; }
+  })();
+  // Let a transient failure be retried on the next banner refresh.
+  _myStaffPromise.then(r => { if (r === undefined) _myStaffPromise = null; });
+  return _myStaffPromise;
+}
+// Role to preselect: the Staff directory default unless it's a protected PM
+// slot, else Engineer.
+function joinTeamDefaultRole(staffRec) {
+  const r = (staffRec?.role || "").trim();
+  if (!r || JOIN_TEAM_PROTECTED_ROLES.includes(r)) return JOIN_TEAM_FALLBACK_ROLE;
+  return r;
 }
 // Already on the roster? Email match first (authoritative); fall back to an
 // exact name match for legacy member rows that were saved without an email,
@@ -3295,6 +3340,20 @@ function isMeOnProjectTeam(project, me) {
     return !!nameLc && mName === nameLc;
   });
 }
+function renderJoinTeamRoleOptions(staffRec) {
+  const sel = document.getElementById("joinTeamRole");
+  const hint = document.getElementById("joinTeamHint");
+  if (!sel) return;
+  const def = joinTeamDefaultRole(staffRec);
+  const options = [...new Set([def, ...JOIN_TEAM_ROLE_OPTIONS])];
+  sel.innerHTML = options.map(r => `<option value="${escHtml(r)}">${escHtml(r)}</option>`).join("");
+  sel.value = def;
+  if (hint) {
+    hint.textContent = staffRec
+      ? "Joining as " + (staffRec.name || myStaffIdentity().name || "you") + " (Staff directory)."
+      : "You're not in the PMS Staff directory yet — joining with your Outlook name.";
+  }
+}
 function refreshJoinTeamBanner() {
   const banner = document.getElementById("joinTeamBanner");
   if (!banner) return;
@@ -3307,28 +3366,39 @@ function refreshJoinTeamBanner() {
     !isMeOnProjectTeam(selectedProject, me);
   banner.style.display = show ? "block" : "none";
   const btn = document.getElementById("joinTeamBtn");
-  if (btn) { btn.disabled = false; btn.textContent = "+ Add me to the team"; }
+  if (btn) { btn.disabled = false; btn.textContent = "+ Add me"; }
+  if (!show) return;
+  // Paint the fallback immediately, then the Staff directory default once the
+  // (cached) lookup lands — guarded so a project switch mid-fetch can't repaint
+  // a banner that's since been hidden.
+  renderJoinTeamRoleOptions(null);
+  const pid = selectedProject.id;
+  void ensureMyStaffRecord().then(rec => {
+    if (!rec || !selectedProject || selectedProject.id !== pid) return;
+    if (banner.style.display === "none") return;
+    renderJoinTeamRoleOptions(rec);
+  });
 }
 async function joinProjectTeam() {
   const project = selectedProject;
   const me = myStaffIdentity();
   if (!project || !me.email) return;
-  const role = (document.getElementById("joinTeamRole")?.value || "Team Member").trim();
   const btn = document.getElementById("joinTeamBtn");
   if (btn) { btn.disabled = true; btn.textContent = "adding…"; }
   setStatus("joinTeamStatus", "info", "⏳ Adding you to " + (project.name || "the project") + "…");
-  // Same id scheme the add-in uses for directory entries it creates (uid()),
-  // so PMS sees a familiar "addin-…" id on the member row.
-  const member = {
-    id: uid(),
-    name: me.name || me.email,
-    email: me.email,
-    role,
-    addedAt: new Date().toISOString(),
-    addedBy: me.email,
-    addedVia: "outlook-addin",
-  };
   try {
+    const staffRec = (await ensureMyStaffRecord()) || null;
+    const picked = (document.getElementById("joinTeamRole")?.value || "").trim();
+    const role = picked && !JOIN_TEAM_PROTECTED_ROLES.includes(picked) ? picked : joinTeamDefaultRole(staffRec);
+    // Same shape PMS's own self-join writes (My Projects → joinProject).
+    const member = {
+      id: pmsUid(),
+      name: (staffRec?.name || "").trim() || me.name || me.email,
+      role,
+      rate: staffRec?.rate || 0,
+      disciplines: Array.isArray(staffRec?.disciplines) ? staffRec.disciplines : [],
+      email: (staffRec?.email || "").trim() || me.email,
+    };
     await applyLocalChangeAndSave(project.id, fresh => {
       // Re-check against the FRESH row: a PM may have added us in PMS since
       // the pane loaded, in which case this is a no-op save.
@@ -3341,7 +3411,7 @@ async function joinProjectTeam() {
     refreshJoinTeamBanner();
     setStatus("joinTeamStatus", "success", "✓ You're on the " + (project.name || "project") + " team as " + role + ".");
   } catch (e) {
-    if (btn) { btn.disabled = false; btn.textContent = "+ Add me to the team"; }
+    if (btn) { btn.disabled = false; btn.textContent = "+ Add me"; }
     setStatus("joinTeamStatus", "error", "✗ " + humanizeError(e));
   }
 }
