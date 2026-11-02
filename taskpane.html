@@ -1412,6 +1412,10 @@
   <button class="back-btn" id="rfiResponseBack">← Back</button>
   <div class="section-title">Log RFI Response</div>
   <div id="rfiResponseHeader" style="font-size:13px;color:#1e293b;background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <!-- Claude review panel — filled by renderCaAiReviewPanel("rfi"): either the
+       saved aiReview suggestion with accept/dismiss, or the send-to-Claude +
+       check-again prompt when no review is on the record yet. -->
+  <div id="rfiAiReviewPanel"></div>
   <label>Response / Resolution</label>
   <textarea id="rfiResponseText" rows="6" placeholder="The formal response that will go to the contractor…"></textarea>
   <label>Date Responded</label>
@@ -1433,6 +1437,8 @@
   <button class="back-btn" id="subReviewBack">← Back</button>
   <div class="section-title">Log Submittal Review</div>
   <div id="subReviewHeader" style="font-size:13px;color:#1e293b;background:#ede9fe;border:1px solid #c4b5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <!-- Claude review panel — see rfiAiReviewPanel; same renderer, kind="sub". -->
+  <div id="subAiReviewPanel"></div>
   <label>Stamp</label>
   <select id="subReviewStamp">
     <option value="Approved">Approved</option>

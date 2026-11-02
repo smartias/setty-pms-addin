@@ -10381,6 +10381,322 @@ async function uploadEmailToArtifactInFolder({ driveId, token, artifactRootPath,
 // current default status ("Responded"). The button that calls this is rendered
 // by refreshLoggedArtifactChips when an RFI matching the current email is open.
 let _activeResponseRfiId = "";
+// ─── CLAUDE CA REVIEW PANEL (aiReview) ───────────────────────────────────────
+// Closes the review loop inside Outlook. When Claude's seat saves a review via
+// save_ca_review (started from the chip's Send to Claude button, or from the
+// PMS), the record carries an `aiReview` block: suggested response (+ stamp
+// for submittals), internal notes, red flags, references. The PMS detail
+// modal lets the human accept/dismiss it; this panel mirrors that inside the
+// Log Response / Log Review views so the whole motion — log → send to Claude
+// → accept → return — never leaves the add-in. Same invariants as the PMS:
+// accepting APPENDS to the field (never clobbers half-written text) and is
+// idempotent; dismissing clears the block after a confirm; nothing here ever
+// sends, stamps, or returns anything by itself.
+
+// Outcome of a Claude CA-review suggestion once the reviewer logs the
+// response/review: where the FINAL text landed relative to the SUGGESTED one.
+// Ported verbatim from the PMS (classifyAiReviewOutcome) so both ends feed the
+// same pms_ca_review_feedback ledger with the same semantics.
+function classifyAiReviewOutcome(suggested, final) {
+  const norm = s => String(s || "").replace(/\s+/g, " ").trim();
+  const a = norm(suggested), b = norm(final);
+  if (!a || !b) return "replaced";
+  if (a === b) return "accepted";
+  if (b.includes(a)) return "edited";
+  const words = s => new Set(s.toLowerCase().match(/[a-z0-9][a-z0-9.'-]{2,}/g) || []);
+  const wa = words(a), wb = words(b);
+  if (!wa.size) return "replaced";
+  let kept = 0;
+  wa.forEach(w => { if (wb.has(w)) kept++; });
+  return kept / wa.size >= 0.5 ? "edited" : "replaced";
+}
+
+// Red-flag severity palette — same meanings as the PMS QA_SEV_COLOR, with the
+// PMS theme vars resolved to their hex values (the add-in has its own theme).
+const CA_SEV_COLOR = { "life-safety": "#e5534b", "agency": "#d4a72c", "cost": "#e8a03c", "rfi-bait": "#58a6ff", "polish": "#8b949e" };
+
+function _caListKey(kind) { return kind === "rfi" ? "rfis" : "submittals"; }
+function _caFindRecord(kind, id) { return ((selectedProject || {})[_caListKey(kind)] || []).find(x => x.id === id) || null; }
+function _caPanelEl(kind) { return document.getElementById(kind === "rfi" ? "rfiAiReviewPanel" : "subAiReviewPanel"); }
+function _caStatusElId(kind) { return kind === "rfi" ? "rfiResponseStatusMsg" : "subReviewStatusMsg"; }
+function _caRespEl(kind) { return document.getElementById(kind === "rfi" ? "rfiResponseText" : "subReviewComments"); }
+function _caWhyInputId(kind) { return kind === "rfi" ? "caAiWhyRfi" : "caAiWhySub"; }
+
+// Feedback loop (pms_ca_review_feedback): record the suggested vs the final
+// text, the stamps, and the reviewer's optional one-line "why", so the review
+// skill can read what gets edited (search_review_feedback). Same RPC and body
+// shape as the PMS modal. Fire-and-forget: never blocks or fails the save.
+// Dedup via signature so a dismiss followed by a submit (or a re-submit of the
+// same text) doesn't write the same row twice from this pane.
+let _caFeedbackSig = "";
+function recordCaReviewFeedback(kind, record, outcome, finalText, finalStamp, why) {
+  const ai = record?.aiReview;
+  if (!ai || !ai.suggestedResponse || !selectedProject) return;
+  const isRFI = kind === "rfi";
+  const body = {
+    p_project: selectedProject.projectNumber || selectedProject.name || "",
+    p_project_name: selectedProject.name || null,
+    p_item_type: isRFI ? "rfi" : "submittal",
+    p_item_number: String(record.number || ""),
+    p_item_subject: (isRFI ? record.title : record.description) || null,
+    p_discipline: record.discipline || null,
+    p_ai_at: ai.at ? String(ai.at) : "",
+    p_ai_by: ai.by || null,
+    p_suggested_response: ai.suggestedResponse,
+    p_final_response: finalText || "",
+    p_suggested_stamp: isRFI ? null : (ai.suggestedStamp || null),
+    p_final_stamp: isRFI ? null : (finalStamp || null),
+    p_outcome: outcome,
+    p_why: String(why || "").trim() || null,
+  };
+  if (!body.p_project || !body.p_item_number) return;
+  const sig = JSON.stringify([record.id, outcome, body.p_final_response, body.p_final_stamp, body.p_why]);
+  if (sig === _caFeedbackSig) return;
+  _caFeedbackSig = sig;
+  fetchWithRetry(SUPABASE_URL + "/rest/v1/rpc/pms_ca_review_feedback_record", {
+    method: "POST", headers: SB_HEADERS, body: JSON.stringify(body),
+  }, { label: "sb caReviewFeedback", maxAttempts: 2 })
+    .catch(e => console.warn("[aiReview feedback] not recorded:", e && e.message));
+}
+
+// Re-fetch the project's RFI/submittal lists from the cloud and merge them
+// into the local cache, so a review Claude saved AFTER the pane loaded shows
+// up. Returns the fresh record (or null). Best-effort: errors just keep the
+// cached copy.
+async function refreshCaRecordFromCloud(kind, id) {
+  if (!selectedProject) return null;
+  try {
+    const fresh = await fetchFreshProjectV2(selectedProject.id);
+    if (!fresh || !fresh.project) return null;
+    selectedProject = {
+      ...selectedProject,
+      rfis: fresh.project.rfis || [],
+      submittals: fresh.project.submittals || [],
+    };
+    allProjects = allProjects.map(p => p.id === selectedProject.id ? selectedProject : p);
+    return _caFindRecord(kind, id);
+  } catch (e) {
+    console.warn("[aiReview refresh]", e.message);
+    return null;
+  }
+}
+
+// Dismiss = clear the aiReview block off the record (cloud save), after the
+// same confirm the PMS uses, recording "dismissed" feedback first. QA Reviews
+// rows the review already created are untouched (same as the PMS).
+async function dismissCaAiReview(kind, id) {
+  const record = _caFindRecord(kind, id);
+  if (!record || !record.aiReview) return;
+  if (!window.confirm("Dismiss Claude's review? The suggested response, internal notes, and red flags on this record will be cleared. Any red flags already tracked in QA Reviews stay there.")) return;
+  const respEl = _caRespEl(kind);
+  const stampVal = kind === "sub" ? (document.getElementById("subReviewStamp")?.value || null) : null;
+  recordCaReviewFeedback(kind, record, "dismissed", respEl ? respEl.value : "", stampVal,
+    document.getElementById(_caWhyInputId(kind))?.value);
+  try {
+    const key = _caListKey(kind);
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      [key]: (fresh[key] || []).map(x => {
+        if (x.id !== id) return x;
+        const { aiReview, ...rest } = x;
+        return rest;
+      }),
+    }));
+    renderCaAiReviewPanel(kind, id);
+  } catch (e) {
+    setStatus(_caStatusElId(kind), "error", "Could not dismiss the review: " + e.message);
+  }
+}
+
+// Append-accept into the response/comments field. Idempotent: if the field
+// already contains the suggestion, do nothing — a double-click can't paste
+// the same paragraph twice (same guard as the PMS).
+function acceptCaAiResponse(kind, id) {
+  const record = _caFindRecord(kind, id);
+  const suggestion = (record?.aiReview?.suggestedResponse || "").trim();
+  const el = _caRespEl(kind);
+  if (!suggestion || !el) return;
+  const cur = el.value.trim();
+  if (cur.includes(suggestion)) return;
+  el.value = cur ? cur + "\n\n" + suggestion : suggestion;
+  renderCaAiReviewPanel(kind, id); // flips the button to "Added"
+}
+
+function acceptCaAiStamp(id) {
+  const record = _caFindRecord("sub", id);
+  const stamp = record?.aiReview?.suggestedStamp;
+  const sel = document.getElementById("subReviewStamp");
+  if (!stamp || !sel) return;
+  if (![...sel.options].some(o => o.value === stamp)) return; // unknown stamp — leave the human's choice alone
+  sel.value = stamp;
+  renderCaAiReviewPanel("sub", id);
+}
+
+// Render the panel into the view's container. Two states:
+//  - no aiReview on the record → compact prompt with Send to Claude + a
+//    "check again" refresh (covers "I just sent it, is the review back?").
+//  - aiReview present → the PMS modal's panel, add-in sized: meta header,
+//    marked selection (subs), red flags, suggested response/stamp with
+//    accept buttons, internal notes (display-only here — the add-in's forms
+//    have no internal-notes field), optional "what changed & why" input,
+//    Dismiss + Re-review.
+function renderCaAiReviewPanel(kind, id) {
+  const panel = _caPanelEl(kind);
+  if (!panel) return;
+  const record = _caFindRecord(kind, id);
+  // Accept-button clicks re-render the panel — carry the optional "why" text
+  // across so it isn't wiped mid-thought.
+  const prevWhy = document.getElementById(_caWhyInputId(kind))?.value || "";
+  panel.innerHTML = "";
+  if (!record) return;
+  const ai = record.aiReview || null;
+  const isRFI = kind === "rfi";
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "border:1px solid " + (ai ? "#4f8ff0" : "var(--border-strong,#475569)") +
+    ";border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--text,#e2e8f0);";
+
+  if (!ai) {
+    wrap.innerHTML =
+      `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">` +
+      `<span style="color:var(--text-soft,#94a3b8);">🤖 No Claude review on this ${isRFI ? "RFI" : "submittal"} yet.</span>` +
+      `<button data-ca="send" style="background:#374151;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">Send to Claude for review</button>` +
+      `<button data-ca="check" style="background:none;color:var(--primary,#60a5fa);border:1px solid var(--border-strong,#475569);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">⟳ Check for review</button>` +
+      `<span data-ca-note style="color:var(--text-soft,#94a3b8);font-size:11px;"></span>` +
+      `</div>`;
+    wrap.querySelector('[data-ca="send"]').onclick = () => openExternalUrl(buildCaReviewSeatUrl(kind, record));
+    wrap.querySelector('[data-ca="check"]').onclick = async (ev) => {
+      const btn = ev.currentTarget; btn.disabled = true; btn.textContent = "⏳ Checking…";
+      const fresh = await refreshCaRecordFromCloud(kind, id);
+      if (fresh?.aiReview) { renderCaAiReviewPanel(kind, id); return; }
+      btn.disabled = false; btn.textContent = "⟳ Check for review";
+      const note = wrap.querySelector("[data-ca-note]");
+      if (note) note.textContent = "No review yet — Claude may still be working. Check again in a minute.";
+    };
+    panel.appendChild(wrap);
+    return;
+  }
+
+  const esc = escHtml;
+  const meta = [ai.by ? "by " + ai.by : "", ai.at ? String(ai.at).slice(0, 10) : ""].filter(Boolean).join(" · ");
+  const aiLinks = Array.isArray(ai.docLinks) ? ai.docLinks.filter(l => l && /^https:\/\//i.test(l.url)) : [];
+  const setLink = (aiLinks.find(l => l.kind === "set") || {}).url || null;
+  const setHtml = ai.reviewedAgainstSet
+    ? (setLink ? ` · vs <a href="${esc(setLink)}" target="_blank" rel="noreferrer" style="color:var(--primary,#60a5fa);">${esc(ai.reviewedAgainstSet)}</a>` : " · vs " + esc(ai.reviewedAgainstSet))
+    : "";
+
+  let h = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">` +
+    `<span style="font-weight:700;font-size:13px;">🤖 Claude review</span>` +
+    `<span style="font-size:10.5px;color:var(--text-soft,#94a3b8);">${esc(meta)}${setHtml}</span>` +
+    `<span style="flex:1"></span>` +
+    (ai.ledgerReviewId ? `<span style="font-size:10.5px;color:#34d399;">Tracked in QA Reviews</span>` : "") +
+    `<button data-ca="rereview" style="background:none;color:var(--primary,#60a5fa);border:1px solid var(--border-strong,#475569);border-radius:6px;padding:3px 8px;font-size:10.5px;font-weight:600;cursor:pointer;">Re-review</button>` +
+    `<button data-ca="dismiss" style="background:none;color:var(--text-soft,#94a3b8);border:1px solid var(--border-strong,#475569);border-radius:6px;padding:3px 8px;font-size:10.5px;font-weight:600;cursor:pointer;">Dismiss</button>` +
+    `</div>` +
+    `<div style="font-size:11px;color:var(--text-soft,#94a3b8);margin-bottom:10px;">Suggestions for your sign-off — accepting copies text into the fields below; nothing was sent, stamped, or returned.</div>`;
+
+  if (!isRFI && ai.markedSelection) {
+    const ms = ai.markedSelection;
+    h += `<div style="margin-bottom:10px;border:1px solid ${ms.confirmed ? "var(--border-strong,#475569)" : "#d4a72c"};border-radius:6px;padding:8px 10px;">` +
+      `<div style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);margin-bottom:4px;">Marked selection on the cut sheet${ms.confirmed ? "" : " — needs your eyes"}</div>`;
+    if (ms.confirmed) {
+      h += `<div style="line-height:1.5;">${ms.product ? "<b>" + esc(ms.product) + ":</b> " : ""}${esc(ms.model || "(model not stated)")}` +
+        (Array.isArray(ms.options) && ms.options.length ? `<div style="color:var(--text-soft,#94a3b8);margin-top:2px;">Options: ${esc(ms.options.join(", "))}</div>` : "") +
+        (ms.markType || ms.location ? `<div style="font-size:10.5px;color:var(--text-soft,#94a3b8);margin-top:3px;">${esc([ms.markType && ms.markType + " mark", ms.location].filter(Boolean).join(" · "))}</div>` : "") +
+        (ms.note ? `<div style="font-size:10.5px;color:var(--text-soft,#94a3b8);margin-top:3px;">${esc(ms.note)}</div>` : "") +
+        `</div>`;
+    } else {
+      h += `<div style="color:#d4a72c;line-height:1.5;">${esc(ms.note || "No single selection could be confirmed from the cut sheet — verify what was submitted before returning.")}</div>`;
+    }
+    h += `</div>`;
+  }
+
+  if (Array.isArray(ai.redFlags) && ai.redFlags.length > 0) {
+    h += `<div style="margin-bottom:10px;">` +
+      `<div style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);margin-bottom:6px;">Red flags — ${ai.redFlags.length}</div>` +
+      ai.redFlags.map(f => {
+        const sheetFor = (label) => {
+          const t = String(label || "").toLowerCase();
+          const hit = aiLinks.find(l => { const k = String(l.label || "").toLowerCase(); return k && (t === k || t.startsWith(k + " ")); });
+          return hit ? hit.url : null;
+        };
+        const sheets = Array.isArray(f.sheets) ? f.sheets.map(sh => {
+          const u = sheetFor(sh);
+          return u ? `<a href="${esc(u)}" target="_blank" rel="noreferrer" style="color:var(--primary,#60a5fa);">${esc(sh)}</a>` : esc(sh);
+        }).join(" · ") : "";
+        return `<div style="border-left:3px solid ${CA_SEV_COLOR[f.severity] || "var(--border-strong,#475569)"};border-radius:4px;padding:6px 10px;margin-bottom:6px;">` +
+          `<div style="font-size:10px;margin-bottom:2px;">` +
+          (f.severity ? `<span style="font-weight:700;text-transform:uppercase;color:${CA_SEV_COLOR[f.severity] || "inherit"};">${esc(f.severity)}</span> ` : "") +
+          sheets + `</div>` +
+          `<div style="line-height:1.5;">${esc(f.title || "")}</div>` +
+          (f.evidence ? `<div style="font-size:11px;color:var(--text-soft,#94a3b8);margin-top:3px;white-space:pre-wrap;">${esc(f.evidence)}</div>` : "") +
+          (f.action ? `<div style="font-size:11px;color:var(--text-soft,#94a3b8);margin-top:3px;">Suggested: ${esc(f.action)}</div>` : "") +
+          `</div>`;
+      }).join("") +
+      `</div>`;
+  }
+
+  if (ai.suggestedResponse) {
+    const respEl = _caRespEl(kind);
+    const applied = !!respEl && respEl.value.includes(ai.suggestedResponse.trim());
+    h += `<div style="margin-bottom:10px;">` +
+      `<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;">` +
+      `<span style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);">Suggested ${isRFI ? "response" : "review comments"}</span>` +
+      `<button data-ca="accept-resp" ${applied ? "disabled" : ""} style="background:${applied ? "none" : "var(--primary,#2563eb)"};color:${applied ? "var(--text-soft,#94a3b8)" : "#fff"};border:${applied ? "1px solid var(--border-strong,#475569)" : "none"};border-radius:6px;padding:3px 10px;font-size:10.5px;font-weight:600;cursor:${applied ? "default" : "pointer"};">${applied ? "Added" : "Copy into " + (isRFI ? "Response" : "Comments")}</button>` +
+      `</div>` +
+      `<div style="line-height:1.5;white-space:pre-wrap;border:1px solid var(--border,#334155);border-radius:6px;padding:8px 10px;">${esc(ai.suggestedResponse)}</div>` +
+      `</div>` +
+      `<input id="${_caWhyInputId(kind)}" type="text" placeholder="What did you change and why? (optional — recorded on submit; the review skill reads it before the next draft)" style="width:100%;font-size:11px;margin-bottom:10px;" />`;
+  }
+
+  if (!isRFI && ai.suggestedStamp) {
+    const sel = document.getElementById("subReviewStamp");
+    const stampApplied = !!sel && sel.value === ai.suggestedStamp;
+    h += `<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">` +
+      `<span style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);">Suggested stamp</span>` +
+      `<span style="font-weight:700;">${esc(ai.suggestedStamp)}</span>` +
+      `<button data-ca="accept-stamp" ${stampApplied ? "disabled" : ""} style="background:none;color:${stampApplied ? "var(--text-soft,#94a3b8)" : "var(--primary,#60a5fa)"};border:1px solid var(--border-strong,#475569);border-radius:6px;padding:3px 10px;font-size:10.5px;font-weight:600;cursor:${stampApplied ? "default" : "pointer"};">${stampApplied ? "Applied" : "Use this stamp"}</button>` +
+      `</div>`;
+  }
+
+  if (ai.internalNotes) {
+    h += `<div style="margin-bottom:4px;">` +
+      `<div style="font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);margin-bottom:4px;">Internal notes — verify before returning (never included in the return email)</div>` +
+      `<div style="font-size:11.5px;line-height:1.5;white-space:pre-wrap;color:var(--text-soft,#94a3b8);border:1px solid var(--border,#334155);border-radius:6px;padding:8px 10px;">${esc(ai.internalNotes)}</div>` +
+      `</div>`;
+  }
+
+  if (aiLinks.length) {
+    h += `<div style="font-size:11px;margin-top:6px;"><span style="font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-soft,#94a3b8);">References</span> ` +
+      aiLinks.map(l => `<a href="${esc(l.url)}" target="_blank" rel="noreferrer" style="color:var(--primary,#60a5fa);margin-left:8px;text-decoration:none;">${esc((l.kind === "spec" ? "Spec " : "") + (l.label || "link"))} ↗</a>`).join(" ") +
+      `</div>`;
+  }
+  if (ai.coverage) h += `<div style="font-size:10.5px;color:var(--text-soft,#94a3b8);font-style:italic;margin-top:4px;">Coverage: ${esc(ai.coverage)}</div>`;
+
+  wrap.innerHTML = h;
+  const whyEl = wrap.querySelector("#" + _caWhyInputId(kind));
+  if (whyEl && prevWhy) whyEl.value = prevWhy;
+  const on = (selAttr, fn) => { const b = wrap.querySelector(`[data-ca="${selAttr}"]`); if (b) b.onclick = fn; };
+  on("rereview", () => openExternalUrl(buildCaReviewSeatUrl(kind, record)));
+  on("dismiss", () => { void dismissCaAiReview(kind, id); });
+  on("accept-resp", () => acceptCaAiResponse(kind, id));
+  on("accept-stamp", () => acceptCaAiStamp(id));
+  panel.appendChild(wrap);
+}
+
+// After the submit flows save the final response/review, record how the
+// suggestion fared (accepted / edited / replaced) plus the optional "why".
+function _recordCaOutcomeOnSubmit(kind, record, finalText, finalStamp) {
+  try {
+    const ai = record?.aiReview;
+    if (!ai?.suggestedResponse || !String(finalText || "").trim()) return;
+    recordCaReviewFeedback(kind, record,
+      classifyAiReviewOutcome(ai.suggestedResponse, finalText),
+      finalText, finalStamp,
+      document.getElementById(_caWhyInputId(kind))?.value);
+  } catch (e) { console.warn("[aiReview feedback]", e.message); }
+}
+
 function openRfiResponseView(rfiId) {
   const rfi = (selectedProject?.rfis || []).find(r => r.id === rfiId);
   if (!rfi) { setStatus("rfiResponseStatusMsg", "error", "RFI not found."); return; }
@@ -10392,6 +10708,15 @@ function openRfiResponseView(rfiId) {
   document.getElementById("rfiResponseDate").value = new Date().toISOString().slice(0, 10);
   document.getElementById("rfiResponseStatus").value = "Responded";
   setStatus("rfiResponseStatusMsg", "", "");
+  // Claude review panel: render from cache instantly, then re-fetch from the
+  // cloud so a review saved after the pane loaded appears without a reopen.
+  // Blank any leftover "why" text from a previously-opened item first — the
+  // re-render carry-over below is per-item, not per-session.
+  { const w = document.getElementById(_caWhyInputId("rfi")); if (w) w.value = ""; }
+  renderCaAiReviewPanel("rfi", rfiId);
+  void refreshCaRecordFromCloud("rfi", rfiId).then(() => {
+    if (_activeResponseRfiId === rfiId) renderCaAiReviewPanel("rfi", rfiId);
+  });
   showView("rfiResponseView");
 }
 
@@ -10480,6 +10805,9 @@ async function submitRfiResponse() {
         status: newStatus,
       } : r),
     }));
+    // Claude-review feedback ledger: how the final response compares to the
+    // suggestion (fire-and-forget; skipped when there is no aiReview).
+    _recordCaOutcomeOnSubmit("rfi", rfi, responseText, null);
 
     // 5. Audit-log the response generation (written by the scaffold on return).
     // Re-using the filing log so PMS reconcile sees the OUT folder activity and
@@ -10916,6 +11244,12 @@ function openSubReviewView(subId) {
   document.getElementById("subReviewDate").value = new Date().toISOString().slice(0, 10);
   document.getElementById("subReviewStatus").value = "Returned";
   setStatus("subReviewStatusMsg", "", "");
+  // Claude review panel — same pattern as openRfiResponseView.
+  { const w = document.getElementById(_caWhyInputId("sub")); if (w) w.value = ""; }
+  renderCaAiReviewPanel("sub", subId);
+  void refreshCaRecordFromCloud("sub", subId).then(() => {
+    if (_activeReviewSubId === subId) renderCaAiReviewPanel("sub", subId);
+  });
   showView("subReviewView");
 }
 
@@ -10983,6 +11317,8 @@ async function submitSubReview() {
         status: newStatus,
       } : s),
     }));
+    // Claude-review feedback ledger — see submitRfiResponse.
+    _recordCaOutcomeOnSubmit("sub", sub, comments, stamp);
 
     const filingOutcome = {
       sp_folder_url: outFolderWebUrl || null,
