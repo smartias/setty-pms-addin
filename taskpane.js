@@ -1186,10 +1186,38 @@ function refreshLinkToTargetDropdown() {
   row.style.display = "block";
 }
 
+// ── Send to Claude for review (submittal-rfi-review skill) ──────────────────
+// Mirrors the PMS jobcard's reviewSeatUrl word-for-word: a prefilled
+// claude.ai/new URL that has the user's OWN Claude seat read the just-logged
+// RFI/submittal via the Setty PMS connector, review it, and save the suggested
+// response/stamp with save_ca_review so it lands back in the PMS for sign-off.
+// Same $0 URL hand-off pattern as the Ask Claude menu — no API key, no secrets.
+// kind is "rfi" | "sub"; record is the raw rfis[]/submittals[] entry.
+function buildCaReviewSeatUrl(kind, record) {
+  const project = selectedProject || {};
+  const isRFI = kind === "rfi";
+  const projLabel = (project.name || "Project") + (project.projectNumber ? " (" + project.projectNumber + ")" : "");
+  const subject = (isRFI ? record.title : record.description) || "";
+  return "https://claude.ai/new?q=" + encodeURIComponent([
+    "Review this " + (isRFI ? "RFI" : "submittal") + " for " + projLabel + ": " + (record.number || "(unnumbered)") + (subject ? " — \"" + subject + "\"" : "") + ".",
+    "",
+    "Use the Setty PMS connector and the submittal-rfi-review skill: read it with read_rfi_submittal, review it against the current issued drawing set and the governing spec section, then save the suggested " + (isRFI ? "response" : "response and stamp") + ", internal notes, and cost/scope red flags with save_ca_review so they appear in the PMS for my sign-off." + (isRFI ? "" : " Open the submitted cut sheet (render it with view_drawing, or use the pdf-highlighted-selections skill if I attach the PDF) and confirm the MARKED selection — what's circled/highlighted/checked — against the spec and schedule basis of design; the marking is what you're reviewing, not just the notification metadata.") + " If it isn't logged in the PMS yet, backfill it from the filed PDF or notification email first with backload_ca_item. It was just logged from Outlook, so give the sync a moment if the first read misses it.",
+  ].join("\n"));
+}
+// Chip-button handler: resolve the artifact by id in the selected project's
+// cache and open the review seat. Works for both just-logged and older items.
+function openClaudeCaReview(id) {
+  if (!selectedProject) return;
+  const r = (selectedProject.rfis || []).find(x => x.id === id);
+  const s = r ? null : (selectedProject.submittals || []).find(x => x.id === id);
+  if (!r && !s) { setStatus("actionStatus", "error", "Could not find that RFI/Submittal in the project cache."); return; }
+  openExternalUrl(buildCaReviewSeatUrl(r ? "rfi" : "sub", r || s));
+}
 // Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
 // to the SharePoint folder when one is stored. Open RFIs/Submittals also get
-// a "Log Response" / "Log Review" button rendered below the chip so the user
-// can finish the workflow in one click. Hidden when nothing applies.
+// a "Log Response" / "Log Review" button and a "Send to Claude" review button
+// rendered below the chip so the user can finish the workflow in one click.
+// Hidden when nothing applies.
 // When an RFI/Submittal chip is showing for the current email, the link-to
 // dropdown, save buttons, and Log as RFI/Sub buttons become redundant — the
 // email is already filed and linked. Hide them. Restoration is automatic:
@@ -1266,7 +1294,9 @@ function refreshLoggedArtifactChips() {
       const action = a.kind === "rfi" ? "log-rfi-response" : "log-sub-review";
       const label  = a.kind === "rfi" ? "📤 Log Response"  : "📤 Log Review";
       const btnColor = a.kind === "rfi" ? "#1e40af" : "#6d28d9";
-      actionHtml = `<button data-action="${action}" data-id="${a.id.replace(/"/g, "&quot;")}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>`;
+      const idAttr = a.id.replace(/"/g, "&quot;");
+      actionHtml = `<button data-action="${action}" data-id="${idAttr}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>` +
+        `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">🤖 Send to Claude</button>`;
     }
     return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}</div>`;
   });
@@ -1280,6 +1310,7 @@ function refreshLoggedArtifactChips() {
     const id = btn.getAttribute("data-id");
     if (action === "log-rfi-response") openRfiResponseView(id);
     else if (action === "log-sub-review") openSubReviewView(id);
+    else if (action === "claude-ca-review") openClaudeCaReview(id);
   };
 }
 // ── Open action items (project-level) ────────────────────────────────────────
@@ -10860,7 +10891,15 @@ async function saveArtifactThen(kind, another) {
     const noun = isRfi ? "RFI" : "submittal";
     setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
   } else {
-    try { setStatus("actionStatus", "success", r.successMessage || "✓ Logged."); } catch {}
+    // Back on the main view the just-logged artifact renders as a chip with a
+    // "🤖 Send to Claude" button — point at it so sending the item to Claude
+    // for review becomes part of the logging motion, not a separate trip to
+    // the PMS jobcard.
+    try {
+      setStatus("actionStatus", "success",
+        (r.successMessage || "✓ Logged.") +
+        " · 🤖 Use “Send to Claude” below to get a drafted " + (isRfi ? "response" : "review") + ".");
+    } catch {}
     showView("mainView");
   }
 }
