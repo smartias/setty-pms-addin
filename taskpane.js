@@ -349,6 +349,13 @@ function setupEventListeners() {
   if (saveRfiAnotherBtn) saveRfiAnotherBtn.onclick = () => { void saveArtifactThen("rfi", true); };
   const saveSubAnotherBtn = document.getElementById("saveSubAnotherBtn");
   if (saveSubAnotherBtn) saveSubAnotherBtn.onclick = () => { void saveArtifactThen("sub", true); };
+  // Response view: "Pending Sub Response" needs a sub; picking one points the draft at them.
+  { const st = document.getElementById("rfiResponseStatus"), wrap = document.getElementById("rfiPendingSubWrap"), sel = document.getElementById("rfiPendingSub");
+    if (st && wrap && sel) {
+      st.onchange = () => { wrap.style.display = st.value === "Pending Sub Response" ? "" : "none"; if (st.value === "Pending Sub Response") sel.onchange(); else if (_activeResponseRfiId) { const r = (selectedProject?.rfis || []).find(x => x.id === _activeResponseRfiId); if (r) fillResponseRecipients("rfi", r, selectedProject); } };
+      sel.onchange = () => { const s = (selectedProject?.subconsultants || []).find(x => x.id === sel.value); const to = document.getElementById("rfiResponseTo"); const hint = document.getElementById("rfiResponseToHint");
+        if (s && to) { to.value = s.email || ""; if (hint) hint.textContent = s.email ? "(" + (s.contact || s.firm || "the sub") + " — the question goes to them)" : "(no email on file for " + (s.firm || "this sub") + " — type it)"; } };
+    } }
   // Review view: the stamp decides the status unless the user overrides it.
   { const st = document.getElementById("subReviewStamp"), ss = document.getElementById("subReviewStatus");
     if (st && ss) st.onchange = () => { ss.value = subStatusForStamp(st.value); }; }
@@ -996,6 +1003,7 @@ function getLoggedRfiSubArtifacts(project) {
         spFolderUrl: r.spFolderUrl || "",
         status: r.status || "Open",
         relationship: isSource ? "source" : "linked",
+        aiReview: !!r.aiReview,
       });
     }
   }
@@ -1014,6 +1022,7 @@ function getLoggedRfiSubArtifacts(project) {
         spFolderUrl: s.spFolderUrl || "",
         status: s.status || "Received",
         relationship: isSource ? "source" : "linked",
+        aiReview: !!s.aiReview,
       });
     }
   }
@@ -1295,7 +1304,7 @@ function refreshLoggedArtifactChips() {
     // "Logged as" for the email the RFI/Sub was originally created from;
     // "Linked to" for emails added via the Link to dropdown after the fact.
     const verb = a.relationship === "linked" ? "Linked to" : "Logged as";
-    const label = `${icon} ${verb} ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}${statusLabel}`;
+    const label = `${icon} ${verb} ${a.number}${a.title ? " — " + a.title.slice(0, 40) : ""} on ${dateStr}${statusLabel}${a.aiReview ? " · 🤖 review waiting" : ""}`;
     const safeLabel = label.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     let chipHtml;
     if (a.spFolderUrl) {
@@ -9271,23 +9280,26 @@ function setSubMode(mode) {
   document.getElementById("subModeNew").className      = "btn mode-tab " + (mode === "new"      ? "btn-purple" : "btn-ghost");
   document.getElementById("subModeExisting").className = "btn mode-tab " + (mode === "existing" ? "btn-purple" : "btn-ghost");
 }
-function renderRfiPicker() {
-  const sel  = document.getElementById("rfiExistingSelect");
-  const rfis = selectedProject?.rfis || [];
-  // escHtml on title: RFI titles are prefilled from external email subjects,
-  // which can carry & < > " and corrupt the <option> markup unescaped.
-  sel.innerHTML = rfis.length
-    ? rfis.map(r => `<option value="${escHtml(r.id)}">${escHtml(r.number)}${r.title ? " — " + escHtml(r.title.slice(0, 45)) : ""}</option>`).join("")
-    : '<option value="">No RFIs on this project</option>';
+// File-to-existing pickers: open items first, soonest due first, each with
+// its status and due date; closed ones after, under their own heading.
+// escHtml on titles: they come from external email subjects.
+function renderArtifactPicker(kind) {
+  const isRFI = kind === "rfi";
+  const sel = document.getElementById(isRFI ? "rfiExistingSelect" : "subExistingSelect");
+  const items = (isRFI ? selectedProject?.rfis : selectedProject?.submittals) || [];
+  if (!items.length) { sel.innerHTML = `<option value="">No ${isRFI ? "RFIs" : "submittals"} on this project</option>`; return; }
+  const openSet = isRFI ? RFI_OPEN_STATUSES : SUB_OPEN_STATUSES;
+  const due = r => (r.dueDate || "9999-99-99");
+  const short = iso => /^\d{4}-\d{2}-\d{2}/.test(iso || "") ? new Date(iso.slice(0, 10) + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
+  const label = r => `${escHtml(r.number || "")}${(isRFI ? r.title : r.description) ? " — " + escHtml(String(isRFI ? r.title : r.description).slice(0, 40)) : ""} · ${escHtml(r.status || "")}${r.dueDate ? " · due " + short(r.dueDate) : ""}`;
+  const open = items.filter(r => openSet.has(r.status || "")).sort((a, b) => due(a).localeCompare(due(b)));
+  const rest = items.filter(r => !openSet.has(r.status || "")).sort((a, b) => String(b.dateReceived || "").localeCompare(String(a.dateReceived || "")));
+  const opt = r => `<option value="${escHtml(r.id)}">${label(r)}</option>`;
+  sel.innerHTML = (open.length ? `<optgroup label="Open">${open.map(opt).join("")}</optgroup>` : "") +
+                  (rest.length ? `<optgroup label="Responded / closed">${rest.map(opt).join("")}</optgroup>` : "");
 }
-function renderSubPicker() {
-  const sel  = document.getElementById("subExistingSelect");
-  const subs = selectedProject?.submittals || [];
-  // Same escaping rationale as renderRfiPicker.
-  sel.innerHTML = subs.length
-    ? subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.number)}${s.description ? " — " + escHtml(s.description.slice(0, 45)) : ""}</option>`).join("")
-    : '<option value="">No submittals on this project</option>';
-}
+function renderRfiPicker() { renderArtifactPicker("rfi"); }
+function renderSubPicker() { renderArtifactPicker("sub"); }
 // ─── LOG RFI ──────────────────────────────────────────────────────────────────
 // Mirrors the PMS helper of the same name (SettyPMS.html line 156). A project
 // is "Setty-prime" when the prime firm name contains "setty" (case-insensitive).
@@ -10084,15 +10096,17 @@ async function buildSubReviewDocx({ sub, project, comments, stamp, dateReturned,
 // Best-effort — if the API isn't available or fails, we log and return false
 // so callers can surface "draft couldn't be opened — open Outlook and forward
 // manually" rather than silently failing.
-function openComposeDraft({ toEmail, toName, subject, htmlBody }) {
+// toEmail/toName (one person) or toList [{email,name}] (several); ccList optional.
+function openComposeDraft({ toEmail, toName, toList, ccList, subject, htmlBody }) {
   try {
     if (!Office?.context?.mailbox?.displayNewMessageForm) return false;
-    const toRecipients = toEmail ? [{ displayName: toName || toEmail, emailAddress: toEmail }] : [];
-    Office.context.mailbox.displayNewMessageForm({
-      toRecipients,
-      subject: subject || "",
-      htmlBody: htmlBody || "",
-    });
+    const rec = r => ({ displayName: r.name || r.email, emailAddress: r.email });
+    const toRecipients = (toList && toList.length) ? toList.filter(r => r && r.email).map(rec)
+      : (toEmail ? [{ displayName: toName || toEmail, emailAddress: toEmail }] : []);
+    const ccRecipients = (ccList || []).filter(r => r && r.email).map(rec);
+    const form = { toRecipients, subject: subject || "", htmlBody: htmlBody || "" };
+    if (ccRecipients.length) form.ccRecipients = ccRecipients;
+    Office.context.mailbox.displayNewMessageForm(form);
     return true;
   } catch (e) {
     console.warn("[draft] displayNewMessageForm failed:", e.message);
@@ -10106,40 +10120,42 @@ function openComposeDraft({ toEmail, toName, subject, htmlBody }) {
 // Option value encodes the kind so doSaveRfi can route the write correctly:
 //   "staff:<id>"  → assignedTo = [staffId]
 //   "sub:<id>"    → subAssigned = subId
-function populateRfiAssigneeDropdown() {
-  const sel = document.getElementById("rfiAssignedTo");
-  const hint = document.getElementById("rfiAssignHint");
-  if (!sel) return;
+// Assignees are a checkbox list (several people can own an answer, as in the
+// PMS modal); the sub firm is a separate select shown only when Setty is prime.
+function populateAssignees(kind) {
+  const box = document.getElementById(kind === "rfi" ? "rfiAssignedTo" : "subAssignedTo");
+  const hint = document.getElementById(kind === "rfi" ? "rfiAssignHint" : "subAssignHint");
+  const subWrap = document.getElementById(kind === "rfi" ? "rfiSubWrap" : "subSubWrap");
+  const subSel = document.getElementById(kind === "rfi" ? "rfiSubAssigned" : "subSubAssigned");
+  if (!box) return;
   const project = selectedProject;
-  const team = (project?.teamMembers || []).filter(m => m && (m.name || m.role));
-  const subs = (project?.subconsultants || []).filter(s => s && s.firm);
+  const team = (project?.teamMembers || []).filter(m => m && (m.name || m.role) && m.id);
+  const subs = (project?.subconsultants || []).filter(s => s && (s.firm || s.name) && s.id);
   const isPrime = isSettyFirm(project?.prime || "");
-  const opts = ['<option value="">— Unassigned —</option>'];
-  if (team.length) {
-    opts.push('<optgroup label="Team (internal)">');
-    for (const m of team) {
-      const label = m.name || m.role || "Unnamed";
-      const role = m.role && m.name ? ` · ${m.role}` : "";
-      opts.push(`<option value="staff:${m.id}">${escHtml(label)}${escHtml(role)}</option>`);
-    }
-    opts.push('</optgroup>');
-  }
-  if (isPrime && subs.length) {
-    opts.push('<optgroup label="Subconsultants">');
-    for (const s of subs) {
-      const contact = s.contact ? ` · ${s.contact}` : "";
-      opts.push(`<option value="sub:${s.id}">${escHtml(s.firm)}${escHtml(contact)}</option>`);
-    }
-    opts.push('</optgroup>');
-  }
-  sel.innerHTML = opts.join("");
-  if (hint) {
-    hint.textContent = isPrime && subs.length
-      ? "(team or sub firm — we're prime on this project)"
-      : team.length
-      ? ""
-      : "(no team members on this project)";
-  }
+  box.innerHTML = team.length
+    ? team.map(m => `<label><input type="checkbox" value="${escHtml(m.id)}"> ${escHtml(m.name || m.role || "Unnamed")}${m.role && m.name ? ` <span class="hint">· ${escHtml(m.role)}</span>` : ""}</label>`).join("")
+    : `<span class="empty">No team members on this project — add them in the PMS.</span>`;
+  if (subSel) subSel.innerHTML = '<option value="">— none —</option>' + subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.firm || s.name)}${s.contact ? " · " + escHtml(s.contact) : ""}</option>`).join("");
+  if (subWrap) subWrap.style.display = (isPrime && subs.length) ? "" : "none";
+  if (hint) hint.textContent = team.length ? (kind === "rfi" ? "(tick everyone who owns the answer)" : "(tick everyone who reviews it)") : "";
+}
+function populateRfiAssigneeDropdown() { populateAssignees("rfi"); }
+// Ticked staff ids and the chosen sub id for a form.
+function readAssignees(kind) {
+  const box = document.getElementById(kind === "rfi" ? "rfiAssignedTo" : "subAssignedTo");
+  const subSel = document.getElementById(kind === "rfi" ? "rfiSubAssigned" : "subSubAssigned");
+  return { staff: box ? [...box.querySelectorAll('input[type="checkbox"]:checked')].map(c => c.value) : [], sub: (subSel && subSel.value) || "" };
+}
+function clearAssignees(kind) {
+  const box = document.getElementById(kind === "rfi" ? "rfiAssignedTo" : "subAssignedTo");
+  const subSel = document.getElementById(kind === "rfi" ? "rfiSubAssigned" : "subSubAssigned");
+  if (box) box.querySelectorAll('input[type="checkbox"]').forEach(c => { c.checked = false; });
+  if (subSel) subSel.value = "";
+}
+// Everyone ticked who has an email on file, for the assignment draft.
+function assigneeRecipients(staffIds, project) {
+  return (staffIds || []).map(id => (project?.teamMembers || []).find(m => m.id === id)).filter(m => m && m.email)
+    .map(m => ({ email: m.email, name: m.name || m.role || "Team member" }));
 }
 
 // Tiny HTML-escape for the dropdown <option> labels. Subconsultant firm names
@@ -10188,6 +10204,36 @@ function portalItemNumber(kind, item) {
   if (kind === "rfi") return "RFI-" + ext.replace(/^(\d+)/, m => m.padStart(3, "0"));
   return /[-.]/.test(ext) ? ext + "-" + (item.rev || 0) : "SUB-" + ext.padStart(3, "0");
 }
+// Emails out of a "a@x.com; b@y.com" list, lower-cased, de-duplicated (primeCa.parseEmails).
+function parseEmailList(text) {
+  const seen = new Set(), out = [];
+  for (const m of String(text || "").match(/[^\s;,<>"']+@[^\s;,<>"']+\.[a-z]{2,}/gi) || []) { const a = m.toLowerCase(); if (!seen.has(a)) { seen.add(a); out.push(a); } }
+  return out;
+}
+// { to, cc } for an outgoing response: the contractor (extraTo) first, then the
+// project's distribution list for that kind (project.caDistribution[type]);
+// an address never appears twice and To wins over Cc (primeCa.distributionFor).
+function caDistributionFor(project, type, extraTo) {
+  const d = ((project && project.caDistribution) || {})[type] || {};
+  const to = parseEmailList([...(extraTo || []), d.to || ""].join(";"));
+  const cc = parseEmailList(d.cc || "").filter(a => !to.includes(a));
+  return { to, cc };
+}
+// Working-day arithmetic on YYYY-MM-DD, either direction (primeCa.addWorkdays).
+function addWorkdaysISO(day, n) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(day || "")); if (!m) return "";
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])); const step = n < 0 ? -1 : 1; let left = Math.abs(n);
+  while (left > 0) { d.setUTCDate(d.getUTCDate() + step); const w = d.getUTCDay(); if (w !== 0 && w !== 6) left--; }
+  return d.toISOString().slice(0, 10);
+}
+// The sub's own deadline: 2 working days before the contractor's, never
+// earlier than the next working day (primeCa.subDueDefault).
+function subDueDefault(contractorDue, today) {
+  const floor = addWorkdaysISO(today, 1);
+  if (!/^\d{4}-\d{2}-\d{2}/.test(String(contractorDue || ""))) return floor;
+  const d = addWorkdaysISO(contractorDue, -2);
+  return d < floor ? floor : d;
+}
 // ── CA SHARED RULES (end) ───────────────────────────────────────────────────
 
 // ── PORTAL NOTIFICATION PREFILL ─────────────────────────────────────────────
@@ -10199,7 +10245,10 @@ function portalItemNumber(kind, item) {
 // the PMS ("Reply in Procore") and the automatic intake all recognise it.
 let portalEvent = null;        // { vendor, kind, item } for the open email, or null
 let pendingPortalMeta = null;  // set when a form was prefilled from portalEvent; consumed by the save
-const PORTAL_VIA = { "Procore": "Procore", "Autodesk Forma": "ACC", "Newforma": "Other", "Kahua": "Other" };
+// The "Came through" select uses the vendor names, so a hand-logged portal
+// item records the same intake.vendor the parsers would.
+const PORTAL_VENDORS = ["Procore", "Autodesk Forma", "Newforma", "Kahua"];
+const PORTAL_VIA = { "Procore": "Procore", "Autodesk Forma": "Autodesk Forma", "Newforma": "Newforma", "Kahua": "Kahua" };
 const PORTAL_PLATFORM = { "Procore": "Procore", "Autodesk Forma": "Autodesk Build", "Newforma": "Newforma", "Kahua": "Kahua" };
 window.addEventListener("caintake-ready", () => {
   if (emailItem && currentItemKind === "message" && !isComposeMode()) void detectPortalEvent(itemContextGeneration);
@@ -10279,6 +10328,7 @@ function applyPortalPrefill(kind) {
     set("rfiReceivedVia", PORTAL_VIA[vendor] || "Other");
     if (guess) set("rfiDiscipline", guess);
     const hint = document.getElementById("rfiDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
+    { const m = document.getElementById("rfiMore"); if (m) m.open = true; }
   } else {
     set("subNumber", portalItemNumber("submittal", item));
     set("subDesc", item.title);
@@ -10288,6 +10338,7 @@ function applyPortalPrefill(kind) {
     set("subReceivedVia", PORTAL_VIA[vendor] || "Other");
     if (guess) set("subDiscipline", guess);
     const hint = document.getElementById("subDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
+    { const m = document.getElementById("subMore"); if (m) m.open = true; }
   }
   pendingPortalMeta = { vendor, kind: portalEvent.kind, extNum: String(item.extNum || ""), status: item.status || "", rev: item.rev || 0, stamp: item.stamp || "" };
 }
@@ -10295,9 +10346,13 @@ function applyPortalPrefill(kind) {
 // the portal's own number (so the Tracker matches it instead of importing a
 // twin) and the vendor (so the PMS offers "Reply in Procore"). A person
 // logged it, so it is NOT an unreviewed intake item.
-function portalRecordFields(kind) {
+function portalRecordFields(kind, receivedVia) {
   const m = pendingPortalMeta;
-  if (!m || m.kind !== (kind === "rfi" ? "rfi" : "submittal")) return {};
+  if (!m || m.kind !== (kind === "rfi" ? "rfi" : "submittal")) {
+    // Typed by hand but marked as coming through a portal: record the vendor
+    // (no portal number is known), so the PMS still knows where it lives.
+    return PORTAL_VENDORS.includes(receivedVia) ? { intake: { vendor: receivedVia, at: new Date().toISOString(), by: "outlook-addin" } } : {};
+  }
   const out = { extNumber: m.extNum, intake: { vendor: m.vendor, at: new Date().toISOString(), by: "outlook-addin" } };
   if (m.status) out.status = m.status;
   if (kind !== "rfi") { out.resubNumber = m.rev || 0; if (m.stamp) out.stamp = m.stamp; }
@@ -10337,16 +10392,15 @@ function seedDescriptionFromEmailBody(fieldId, maxChars = 600) {
 // Default an assignee <select> to the project's Setty PM when they're on the
 // team roster — the most common routing for incoming RFIs/submittals. The
 // dropdown options are "staff:<member.id>", so match the PM by name.
-function defaultAssigneeToPm(selectId) {
+function defaultAssigneeToPm(boxId) {
   const pmName = (selectedProject?.settyPm || "").trim().toLowerCase();
   if (!pmName) return;
   const pm = (selectedProject?.teamMembers || []).find(m =>
     m?.id && (m.name || "").trim().toLowerCase() === pmName
   );
-  const sel = document.getElementById(selectId);
-  if (pm && sel && sel.querySelector(`option[value="staff:${pm.id}"]`)) {
-    sel.value = "staff:" + pm.id;
-  }
+  const box = document.getElementById(boxId);
+  const cb = pm && box && [...box.querySelectorAll('input[type="checkbox"]')].find(c => c.value === pm.id);
+  if (cb) cb.checked = true;
 }
 
 function prefillRfi() {
@@ -10356,11 +10410,11 @@ function prefillRfi() {
   document.getElementById("rfiNumber").value = nextAutoRfiNumber();
   document.getElementById("rfiDescription").value = "";
   document.getElementById("rfiNotes").value = "";
-  document.getElementById("rfiAssignedTo").value = "";
   // Reset to Email default — most add-in-filed RFIs come via email since the
   // user is in Outlook. They can override per-RFI if the original source was
   // Procore/ACC/etc.
   document.getElementById("rfiReceivedVia").value = "Email";
+  { const m = document.getElementById("rfiMore"); if (m) m.open = false; }
   pendingPortalMeta = null;
   // Due date from the project's own review period (the PMS field), editable.
   { const d = document.getElementById("rfiDue"); if (d) d.value = addBizDays(new Date(), caDueDays(selectedProject, "rfi")); }
@@ -10370,6 +10424,7 @@ function prefillRfi() {
   { const d = document.getElementById("rfiDiscipline"); const CI = window.CaIntake;
     d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "rfi") || "") : ""; }
   populateRfiAssigneeDropdown();
+  clearAssignees("rfi");
   defaultAssigneeToPm("rfiAssignedTo");
   seedDescriptionFromEmailBody("rfiDescription");
   setRfiMode("new");
@@ -10385,18 +10440,13 @@ async function doSaveRfi() {
   const discipline = document.getElementById("rfiDiscipline").value;
   if (!discipline) { setStatus("rfiStatus", "error", "Pick a discipline — it decides which SharePoint folder the RFI files under."); document.getElementById("rfiDiscipline").focus(); return; }
   const dueEntered = (document.getElementById("rfiDue")?.value || "").trim();
-  const portalFields = portalRecordFields("rfi");
   const fromField = document.getElementById("rfiFrom").value.trim();
   const notesField = document.getElementById("rfiNotes").value.trim();
   const receivedVia = (document.getElementById("rfiReceivedVia")?.value || "Email");
-  const assigneeRaw = (document.getElementById("rfiAssignedTo")?.value || "");
-  let assignedToStaff = [];
-  let subAssigned = "";
-  if (assigneeRaw.startsWith("staff:")) {
-    assignedToStaff = [assigneeRaw.slice("staff:".length)];
-  } else if (assigneeRaw.startsWith("sub:")) {
-    subAssigned = assigneeRaw.slice("sub:".length);
-  }
+  const portalFields = portalRecordFields("rfi", receivedVia);
+  const picked = readAssignees("rfi");
+  const assignedToStaff = picked.staff;
+  const subAssigned = picked.sub;
   return withFilingScaffold(
     { operation: "rfi-new", statusElement: "rfiStatus" },
     async ({ snapItem }) => {
@@ -10482,22 +10532,20 @@ async function doSaveRfi() {
       }));
       pendingPortalMeta = null;
 
-      // Open a prefilled draft to the assignee. Mirrors the transmittal flow:
-      // user reviews the draft and hits Send. Failure is non-fatal — the RFI
-      // is logged regardless and the user can email manually.
-      const assignee = resolveAssignee(assigneeRaw, freshProject);
+      // Open a prefilled draft to everyone ticked (and the sub, if routed).
+      // Mirrors the transmittal flow: user reviews the draft and hits Send.
+      // Failure is non-fatal — the RFI is logged regardless.
+      const recips = assigneeRecipients(assignedToStaff, freshProject);
+      const subRec = subAssigned ? resolveAssignee("sub:" + subAssigned, freshProject) : null;
+      if (subRec && subRec.email) recips.push(subRec);
+      const assignee = recips[0] || (assignedToStaff.length || subAssigned ? { email: "", name: "" } : null);
       let draftOpened = false;
-      if (assignee) {
+      if (recips.length) {
         const subjectLine = `${rfiNumber} · ${freshProject.projectNumber || ""} · ${title}`.trim();
         const htmlBody = buildRfiAssignmentEmailHtml({
-          rfi, project: freshProject, assignee, inFolderUrl: inFolderWebUrl || spFolderUrl,
+          rfi, project: freshProject, assignee: recips[0], inFolderUrl: inFolderWebUrl || spFolderUrl,
         });
-        draftOpened = openComposeDraft({
-          toEmail: assignee.email,
-          toName:  assignee.name,
-          subject: subjectLine,
-          htmlBody,
-        });
+        draftOpened = openComposeDraft({ toList: recips, subject: subjectLine, htmlBody });
       }
 
       // Clear the form for the next entry
@@ -10505,7 +10553,7 @@ async function doSaveRfi() {
       document.getElementById("rfiNumber").value = "";
       document.getElementById("rfiDescription").value = "";
       document.getElementById("rfiNotes").value = "";
-      document.getElementById("rfiAssignedTo").value = "";
+      clearAssignees("rfi");
       document.getElementById("rfiReceivedVia").value = "Email";
 
       // Refresh the "Logged as RFI" chip so the main view reflects the new state
@@ -10904,6 +10952,15 @@ function openRfiResponseView(rfiId) {
   document.getElementById("rfiResponseText").value = rfi.response || "";
   document.getElementById("rfiResponseDate").value = new Date().toISOString().slice(0, 10);
   document.getElementById("rfiResponseStatus").value = "Responded";
+  // Who the draft will open to, shown before the click: the contractor who
+  // sent it (or the routed sub), plus the project's distribution list on
+  // prime jobs. Editable.
+  fillResponseRecipients("rfi", rfi, selectedProject);
+  { const sel = document.getElementById("rfiPendingSub");
+    const subs = (selectedProject?.subconsultants || []).filter(s => s && s.id);
+    sel.innerHTML = '<option value="">— choose —</option>' + subs.map(s => `<option value="${escHtml(s.id)}">${escHtml(s.firm || s.name || "")}${s.contact ? " · " + escHtml(s.contact) : ""}</option>`).join("");
+    if (rfi.subAssigned) sel.value = rfi.subAssigned;
+    document.getElementById("rfiPendingSubWrap").style.display = "none"; }
   setStatus("rfiResponseStatusMsg", "", "");
   // Claude review panel: render from cache instantly, then re-fetch from the
   // cloud so a review saved after the pane loaded appears without a reopen.
@@ -10935,6 +10992,15 @@ async function submitRfiResponse() {
     return;
   }
 
+  // Routing to a sub: the sub must be named so the PMS can show who holds the
+  // ball and when their answer is due (subRouting, as the PMS modal writes it).
+  const pendingSubId = newStatus === "Pending Sub Response" ? (document.getElementById("rfiPendingSub")?.value || "") : "";
+  if (newStatus === "Pending Sub Response" && !pendingSubId) {
+    setStatus("rfiResponseStatusMsg", "error", "Pick the subconsultant the question goes to.");
+    return;
+  }
+  const toList = parseEmailList(document.getElementById("rfiResponseTo")?.value).map(e => ({ email: e, name: "" }));
+  const ccList = parseEmailList(document.getElementById("rfiResponseCc")?.value).map(e => ({ email: e, name: "" }));
   const submitBtn = document.getElementById("submitRfiResponseBtn");
   if (submitBtn) submitBtn.disabled = true;
   // Queue intent, heartbeat, audit row and error handling come from
@@ -10993,6 +11059,9 @@ async function submitRfiResponse() {
     }
 
     // 4. Update the RFI record in Supabase
+    const today = new Date().toISOString().slice(0, 10);
+    const subObj = pendingSubId ? (selectedProject.subconsultants || []).find(s => s.id === pendingSubId) : null;
+    const routing = pendingSubId ? { subAssigned: pendingSubId, subRouting: { subId: pendingSubId, firm: (subObj && (subObj.firm || subObj.name)) || "", sentAt: today, dueDate: subDueDefault(rfi.dueDate, today), respondedAt: "" } } : {};
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
       ...fresh,
       rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? {
@@ -11000,6 +11069,7 @@ async function submitRfiResponse() {
         response: responseText,
         dateResponded,
         status: newStatus,
+        ...routing,
       } : r),
     }));
     // Claude-review feedback ledger: how the final response compares to the
@@ -11016,17 +11086,13 @@ async function submitRfiResponse() {
       error:         outFolderWebUrl ? null : "RFI response logged without SharePoint upload",
     };
 
-    // 6. Open a prefilled draft to the RFI's original sender (rfi.from) — or
-    // fall back to the assignee if there's no usable sender email.
-    const recipientEmail = _guessEmailForRfi(rfi, selectedProject);
-    const subjectLine = `${rfi.number} Response · ${selectedProject.projectNumber || ""} · ${rfi.title || ""}`.trim();
-    const htmlBody = _buildRfiResponseEmailHtml({ rfi, project: selectedProject, response: responseText, dateResponded, outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl, status: newStatus });
-    const draftOpened = openComposeDraft({
-      toEmail: recipientEmail?.email || "",
-      toName:  recipientEmail?.name  || "",
-      subject: subjectLine,
-      htmlBody,
-    });
+    // 6. Open the draft to the recipients shown in the form (the user saw and
+    // could edit them before clicking), with the distribution list in Cc.
+    const subjectLine = pendingSubId
+      ? `[${rfi.number}] For your input · ${selectedProject.projectNumber || ""} · ${rfi.title || ""}`.trim()
+      : `${rfi.number} Response · ${selectedProject.projectNumber || ""} · ${rfi.title || ""}`.trim();
+    const htmlBody = _buildRfiResponseEmailHtml({ rfi, project: selectedProject, response: responseText, dateResponded, outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl, status: newStatus })
+    const draftOpened = openComposeDraft({ toList, ccList, subject: subjectLine, htmlBody });
 
     setStatus("rfiResponseStatusMsg", "success",
       `✓ ${rfi.number} response logged (status: ${newStatus})` +
@@ -11046,6 +11112,23 @@ async function submitRfiResponse() {
   });
 }
 
+// Prefill the Send to / Cc boxes of a Log Response / Log Review view: the
+// contractor who sent the item (or the routed sub) in To, the project's
+// distribution list for that kind (caDistribution, kept in the PMS on prime
+// jobs) in Cc, and a hint saying where the guess came from.
+function fillResponseRecipients(kind, item, project) {
+  const isRFI = kind === "rfi";
+  const guess = isRFI ? _guessEmailForRfi(item, project) : _guessEmailForSub(item, project);
+  const dist = caDistributionFor(project, isRFI ? "rfi" : "submittal", guess && guess.email ? [guess.email] : []);
+  const toEl = document.getElementById(isRFI ? "rfiResponseTo" : "subReviewTo");
+  const ccEl = document.getElementById(isRFI ? "rfiResponseCc" : "subReviewCc");
+  const hint = document.getElementById(isRFI ? "rfiResponseToHint" : "subReviewToHint");
+  if (toEl) toEl.value = dist.to.join("; ");
+  if (ccEl) ccEl.value = dist.cc.join("; ");
+  if (hint) hint.textContent = guess && guess.email
+    ? "(" + (guess.name ? guess.name + ", " : "") + "who sent it in" + (dist.cc.length ? "; Cc from the project's distribution list" : "") + " — edit if wrong)"
+    : "(no sender on file — type the contractor's address)";
+}
 // Best-effort recipient resolver for an RFI response. Prefers an explicit
 // from-address on the source email; falls back to the assignee. Returns
 // { email, name } or null.
@@ -11214,39 +11297,7 @@ async function doFileToExistingRfi() {
 // Populate the Submittal assignee dropdown — same logic as RFI: team always,
 // subs only when Setty is prime. Option values use the same "staff:<id>" /
 // "sub:<id>" encoding so resolveAssignee handles both.
-function populateSubAssigneeDropdown() {
-  const sel = document.getElementById("subAssignedTo");
-  const hint = document.getElementById("subAssignHint");
-  if (!sel) return;
-  const project = selectedProject;
-  const team = (project?.teamMembers || []).filter(m => m && (m.name || m.role));
-  const subs = (project?.subconsultants || []).filter(s => s && s.firm);
-  const isPrime = isSettyFirm(project?.prime || "");
-  const opts = ['<option value="">— Unassigned —</option>'];
-  if (team.length) {
-    opts.push('<optgroup label="Team (internal)">');
-    for (const m of team) {
-      const label = m.name || m.role || "Unnamed";
-      const role = m.role && m.name ? ` · ${m.role}` : "";
-      opts.push(`<option value="staff:${m.id}">${escHtml(label)}${escHtml(role)}</option>`);
-    }
-    opts.push('</optgroup>');
-  }
-  if (isPrime && subs.length) {
-    opts.push('<optgroup label="Subconsultants">');
-    for (const s of subs) {
-      const contact = s.contact ? ` · ${s.contact}` : "";
-      opts.push(`<option value="sub:${s.id}">${escHtml(s.firm)}${escHtml(contact)}</option>`);
-    }
-    opts.push('</optgroup>');
-  }
-  sel.innerHTML = opts.join("");
-  if (hint) {
-    hint.textContent = isPrime && subs.length
-      ? "(team or sub firm — we're prime on this project)"
-      : team.length ? "" : "(no team members on this project)";
-  }
-}
+function populateSubAssigneeDropdown() { populateAssignees("sub"); }
 
 function nextAutoSubNumber() {
   return caNextNumber(selectedProject?.submittals || [], "submittal", (selectedProject?.caNumberHighWater || {}).submittal);
@@ -11258,14 +11309,15 @@ function prefillSub() {
   document.getElementById("subNumber").value = nextAutoSubNumber();
   document.getElementById("subFullDescription").value = "";
   document.getElementById("subNotes").value = "";
-  document.getElementById("subAssignedTo").value = "";
   document.getElementById("subReceivedVia").value = "Email";
+  { const m = document.getElementById("subMore"); if (m) m.open = false; }
   pendingPortalMeta = null;
   { const d = document.getElementById("subDue"); if (d) d.value = addBizDays(new Date(), caDueDays(selectedProject, "submittal")); }
   { const h = document.getElementById("subDueHint"); if (h) h.textContent = "(from the project's submittal review period)"; }
   { const d = document.getElementById("subDiscipline"); const CI = window.CaIntake;
     d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "submittal") || "") : ""; }
   populateSubAssigneeDropdown();
+  clearAssignees("sub");
   defaultAssigneeToPm("subAssignedTo");
   seedDescriptionFromEmailBody("subFullDescription");
   setSubMode("new");
@@ -11281,18 +11333,13 @@ async function doSaveSub() {
   const discipline = document.getElementById("subDiscipline").value;
   if (!discipline) { setStatus("subStatus", "error", "Pick a discipline — it decides which SharePoint folder the submittal files under."); document.getElementById("subDiscipline").focus(); return; }
   const dueEntered = (document.getElementById("subDue")?.value || "").trim();
-  const portalFields = portalRecordFields("sub");
   const fromField = document.getElementById("subFrom").value.trim();
   const notesField = document.getElementById("subNotes").value.trim();
   const receivedVia = (document.getElementById("subReceivedVia")?.value || "Email");
-  const assigneeRaw = (document.getElementById("subAssignedTo")?.value || "");
-  let assignedToStaff = [];
-  let subAssigned = "";
-  if (assigneeRaw.startsWith("staff:")) {
-    assignedToStaff = [assigneeRaw.slice("staff:".length)];
-  } else if (assigneeRaw.startsWith("sub:")) {
-    subAssigned = assigneeRaw.slice("sub:".length);
-  }
+  const portalFields = portalRecordFields("sub", receivedVia);
+  const picked = readAssignees("sub");
+  const assignedToStaff = picked.staff;
+  const subAssigned = picked.sub;
   return withFilingScaffold(
     { operation: "sub-new", statusElement: "subStatus" },
     async ({ snapItem }) => {
@@ -11371,20 +11418,18 @@ async function doSaveSub() {
       }));
       pendingPortalMeta = null;
 
-      // Open prefilled draft to the assignee
-      const assignee = resolveAssignee(assigneeRaw, freshProject);
+      // Open a prefilled draft to everyone ticked (and the sub, if routed).
+      const recips = assigneeRecipients(assignedToStaff, freshProject);
+      const subRec = subAssigned ? resolveAssignee("sub:" + subAssigned, freshProject) : null;
+      if (subRec && subRec.email) recips.push(subRec);
+      const assignee = recips[0] || (assignedToStaff.length || subAssigned ? { email: "", name: "" } : null);
       let draftOpened = false;
-      if (assignee) {
+      if (recips.length) {
         const subjectLine = `${subNumber} · ${freshProject.projectNumber || ""} · ${desc}`.trim();
         const htmlBody = buildSubAssignmentEmailHtml({
-          sub, project: freshProject, assignee, inFolderUrl: inFolderWebUrl || spFolderUrl,
+          sub, project: freshProject, assignee: recips[0], inFolderUrl: inFolderWebUrl || spFolderUrl,
         });
-        draftOpened = openComposeDraft({
-          toEmail: assignee.email,
-          toName:  assignee.name,
-          subject: subjectLine,
-          htmlBody,
-        });
+        draftOpened = openComposeDraft({ toList: recips, subject: subjectLine, htmlBody });
       }
 
       document.getElementById("subDesc").value = "";
@@ -11392,7 +11437,7 @@ async function doSaveSub() {
       document.getElementById("subNumber").value = "";
       document.getElementById("subFullDescription").value = "";
       document.getElementById("subNotes").value = "";
-      document.getElementById("subAssignedTo").value = "";
+      clearAssignees("sub");
       document.getElementById("subReceivedVia").value = "Email";
 
       try { refreshLoggedArtifactChips(); } catch {}
@@ -11479,6 +11524,7 @@ function openSubReviewView(subId) {
   // Status follows the stamp (Revise and Resubmit / Rejected → Resubmittal
   // Required); the select stays editable for the odd case.
   document.getElementById("subReviewStatus").value = subStatusForStamp(stampEl.value);
+  fillResponseRecipients("sub", sub, selectedProject);
   setStatus("subReviewStatusMsg", "", "");
   // Claude review panel — same pattern as openRfiResponseView.
   { const w = document.getElementById(_caWhyInputId("sub")); if (w) w.value = ""; }
@@ -11500,6 +11546,8 @@ async function submitSubReview() {
   const dateReturned = (document.getElementById("subReviewDate")?.value || new Date().toISOString().slice(0, 10));
   const newStatus = (document.getElementById("subReviewStatus")?.value || "Returned");
 
+  const toList = parseEmailList(document.getElementById("subReviewTo")?.value).map(e => ({ email: e, name: "" }));
+  const ccList = parseEmailList(document.getElementById("subReviewCc")?.value).map(e => ({ email: e, name: "" }));
   const submitBtn = document.getElementById("submitSubReviewBtn");
   if (submitBtn) submitBtn.disabled = true;
   // See submitRfiResponse: scaffolded, keyed to the submittal, not the open email.
@@ -11563,21 +11611,15 @@ async function submitSubReview() {
       error:         outFolderWebUrl ? null : "Submittal review logged without SharePoint upload",
     };
 
-    // For submittals, the return recipient is most commonly the original sender
-    // (GC/Prime) who submitted it. Same email-record lookup as RFIs.
-    const recipientEmail = _guessEmailForSub(sub, selectedProject);
+    // The draft opens to the recipients shown in the form (seen and editable
+    // before the click), with the distribution list in Cc.
     const subjectLine = `${sub.number} Review · ${selectedProject.projectNumber || ""} · ${sub.description || ""}`.trim();
     const htmlBody = _buildSubReviewEmailHtml({
       sub, project: selectedProject, stamp, comments, dateReturned,
       outFolderUrl: outFolderWebUrl, inFolderUrl: inFolderWebUrl,
       status: newStatus,
     });
-    const draftOpened = openComposeDraft({
-      toEmail: recipientEmail?.email || "",
-      toName:  recipientEmail?.name || "",
-      subject: subjectLine,
-      htmlBody,
-    });
+    const draftOpened = openComposeDraft({ toList, ccList, subject: subjectLine, htmlBody });
 
     setStatus("subReviewStatusMsg", "success",
       `✓ ${sub.number} review logged (stamp: ${stamp})` +
