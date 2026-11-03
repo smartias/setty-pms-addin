@@ -9268,17 +9268,31 @@ async function doSaveActionItem() {
   }
 }
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
+// The New / File-to-existing switch is a segmented control; the selected
+// side carries aria-selected (styled in CSS) and the matching form shows.
 function setRfiMode(mode) {
   document.getElementById("rfiNewForm").style.display      = mode === "new"      ? "" : "none";
   document.getElementById("rfiExistingForm").style.display = mode === "existing" ? "" : "none";
-  document.getElementById("rfiModeNew").className      = "btn mode-tab " + (mode === "new"      ? "btn-blue"  : "btn-ghost");
-  document.getElementById("rfiModeExisting").className = "btn mode-tab " + (mode === "existing" ? "btn-blue"  : "btn-ghost");
+  document.getElementById("rfiModeNew").setAttribute("aria-selected", String(mode === "new"));
+  document.getElementById("rfiModeExisting").setAttribute("aria-selected", String(mode === "existing"));
 }
 function setSubMode(mode) {
   document.getElementById("subNewForm").style.display      = mode === "new"      ? "" : "none";
   document.getElementById("subExistingForm").style.display = mode === "existing" ? "" : "none";
-  document.getElementById("subModeNew").className      = "btn mode-tab " + (mode === "new"      ? "btn-purple" : "btn-ghost");
-  document.getElementById("subModeExisting").className = "btn mode-tab " + (mode === "existing" ? "btn-purple" : "btn-ghost");
+  document.getElementById("subModeNew").setAttribute("aria-selected", String(mode === "new"));
+  document.getElementById("subModeExisting").setAttribute("aria-selected", String(mode === "existing"));
+}
+// Folder + PMS links under the Log Response / Log Review header, so the
+// reviewer can open the cut sheet or the full record without leaving the view.
+function renderItemLinks(kind, item, project) {
+  const el = document.getElementById(kind === "rfi" ? "rfiResponseLinks" : "subReviewLinks");
+  if (!el) return;
+  const pmsUrl = project && project.id && item && item.number
+    ? PMS_PROJECT_BASE_URL + encodeURIComponent(project.id) + ":" + (kind === "rfi" ? "rfi" : "submittal") + ":" + encodeURIComponent(item.number) : "";
+  const folder = item && /^https?:/i.test(item.spFolderUrl || "") ? item.spFolderUrl : "";
+  el.innerHTML = (folder ? `<a href="${escHtml(folder)}" target="_blank" rel="noreferrer">📂 Folder →</a>` : "") +
+                 (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer">Open in PMS →</a>` : "");
+  el.style.display = el.innerHTML ? "flex" : "none";
 }
 // File-to-existing pickers: open items first, soonest due first, each with
 // its status and due date; closed ones after, under their own heading.
@@ -10949,6 +10963,7 @@ function openRfiResponseView(rfiId) {
   // Pre-fill the header chip + form defaults
   document.getElementById("rfiResponseHeader").textContent =
     `${rfi.number}${rfi.title ? " — " + rfi.title : ""}`;
+  renderItemLinks("rfi", rfi, selectedProject);
   document.getElementById("rfiResponseText").value = rfi.response || "";
   document.getElementById("rfiResponseDate").value = new Date().toISOString().slice(0, 10);
   document.getElementById("rfiResponseStatus").value = "Responded";
@@ -11517,6 +11532,7 @@ function openSubReviewView(subId) {
   _activeReviewSubId = subId;
   document.getElementById("subReviewHeader").textContent =
     `${sub.number}${sub.description ? " — " + sub.description : ""}`;
+  renderItemLinks("sub", sub, selectedProject);
   const stampEl = document.getElementById("subReviewStamp");
   stampEl.value = (sub.stamp && sub.stamp !== "—") ? sub.stamp : "Approved";
   document.getElementById("subReviewComments").value = sub.comments || "";

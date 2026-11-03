@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-11-03-ca-p2-assignees-recipients";</script>
+  <script>window.__appVersion = "2026-11-03-ca-p3-tabs-links";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -660,7 +660,19 @@
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .mode-tab { flex: 1; font-size: 12px; padding: 6px 8px; }
+    /* New / File-to-existing switch: one segmented control. The inactive side
+       keeps full-contrast text so it reads as a choice, not a disabled button. */
+    .mode-tabs { display: flex; margin-bottom: 12px; border: 1px solid var(--border-strong); border-radius: 6px; overflow: hidden; background: var(--surface); }
+    .mode-tab { flex: 1; font-size: 12px; font-weight: 600; padding: 7px 8px; margin: 0; border: none; border-radius: 0; background: transparent; color: var(--text); cursor: pointer; font-family: inherit; }
+    .mode-tab + .mode-tab { border-left: 1px solid var(--border-strong); }
+    .mode-tab[aria-selected="true"] { background: var(--primary); color: #fff; }
+    .mode-tab[aria-selected="true"].purple { background: #5b2cad; }
+    .mode-tab:hover:not([aria-selected="true"]) { background: var(--surface-2); }
+    .mode-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+    /* Item links under the Log Response / Log Review header chip. */
+    .item-links { display: flex; gap: 14px; margin: -4px 0 10px; }
+    .item-links a { font-size: 12px; font-weight: 600; color: var(--primary); text-decoration: none; }
+    .item-links a:hover { text-decoration: underline; }
     .project-search-wrapper { position: relative; margin-bottom: 8px; }
     .project-search-wrapper input { margin-bottom: 0; }
     #projectDropdown {
@@ -1314,9 +1326,9 @@
 <!-- RFI View -->
 <div id="rfiView">
   <button class="back-btn" id="rfiBack">← Back</button>
-  <div style="display:flex;gap:6px;margin-bottom:12px;">
-    <button class="btn btn-blue mode-tab" id="rfiModeNew">➕ New RFI</button>
-    <button class="btn btn-ghost mode-tab" id="rfiModeExisting">📂 File to Existing</button>
+  <div class="mode-tabs" role="tablist" aria-label="RFI action">
+    <button type="button" class="mode-tab" role="tab" aria-selected="true" id="rfiModeNew">New RFI</button>
+    <button type="button" class="mode-tab" role="tab" aria-selected="false" id="rfiModeExisting">File to existing RFI</button>
   </div>
 
   <div id="rfiNewForm">
@@ -1374,8 +1386,8 @@
       </div>
     </details>
     <div id="rfiStatus" class="status-msg"></div>
-    <button class="btn btn-blue" id="saveRfiBtn">💾 Log New RFI</button>
-    <button class="btn btn-secondary" id="saveRfiAnotherBtn" style="margin-top:6px;">➕ Log RFI &amp; add another from this email</button>
+    <button class="btn btn-blue" id="saveRfiBtn">Log RFI</button>
+    <button class="btn btn-secondary" id="saveRfiAnotherBtn" style="margin-top:6px;">Log and add another from this email</button>
   </div>
 
   <div id="rfiExistingForm" style="display:none;">
@@ -1386,16 +1398,16 @@
     <label>RFI</label>
     <select id="rfiExistingSelect" style="margin-bottom:10px;"></select>
     <div id="rfiExistingStatus" class="status-msg"></div>
-    <button class="btn btn-blue" id="fileRfiBtn">📁 File Email to RFI</button>
+    <button class="btn btn-blue" id="fileRfiBtn">File this email to the RFI</button>
   </div>
 </div>
 
 <!-- Submittal View -->
 <div id="subView">
   <button class="back-btn" id="subBack">← Back</button>
-  <div style="display:flex;gap:6px;margin-bottom:12px;">
-    <button class="btn btn-purple mode-tab" id="subModeNew">➕ New Submittal</button>
-    <button class="btn btn-ghost mode-tab" id="subModeExisting">📂 File to Existing</button>
+  <div class="mode-tabs" role="tablist" aria-label="Submittal action">
+    <button type="button" class="mode-tab purple" role="tab" aria-selected="true" id="subModeNew">New submittal</button>
+    <button type="button" class="mode-tab purple" role="tab" aria-selected="false" id="subModeExisting">File to existing submittal</button>
   </div>
 
   <div id="subNewForm">
@@ -1460,8 +1472,8 @@
       </div>
     </details>
     <div id="subStatus" class="status-msg"></div>
-    <button class="btn btn-purple" id="saveSubBtn">💾 Log New Submittal</button>
-    <button class="btn btn-secondary" id="saveSubAnotherBtn" style="margin-top:6px;">➕ Log Submittal &amp; add another from this email</button>
+    <button class="btn btn-purple" id="saveSubBtn">Log submittal</button>
+    <button class="btn btn-secondary" id="saveSubAnotherBtn" style="margin-top:6px;">Log and add another from this email</button>
   </div>
 
   <div id="subExistingForm" style="display:none;">
@@ -1472,7 +1484,7 @@
     <label>Submittal</label>
     <select id="subExistingSelect" style="margin-bottom:10px;"></select>
     <div id="subExistingStatus" class="status-msg"></div>
-    <button class="btn btn-purple" id="fileSubBtn">📁 File Email to Submittal</button>
+    <button class="btn btn-purple" id="fileSubBtn">File this email to the submittal</button>
   </div>
 </div>
 
@@ -1484,6 +1496,7 @@
   <button class="back-btn" id="rfiResponseBack">← Back</button>
   <div class="section-title">Log RFI Response</div>
   <div id="rfiResponseHeader" style="font-size:13px;color:#1e293b;background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <div id="rfiResponseLinks" class="item-links"></div>
   <!-- Claude review panel — filled by renderCaAiReviewPanel("rfi"): either the
        saved aiReview suggestion with accept/dismiss, or the send-to-Claude +
        check-again prompt when no review is on the record yet. -->
@@ -1509,7 +1522,7 @@
   <label>Cc <span class="hint">(the project's distribution list on prime jobs)</span></label>
   <input type="text" id="rfiResponseCc" placeholder="optional"/>
   <div id="rfiResponseStatusMsg" class="status-msg"></div>
-  <button class="btn btn-blue" id="submitRfiResponseBtn">📤 Log response</button>
+  <button class="btn btn-blue" id="submitRfiResponseBtn">Log response</button>
   <div class="btn-caption">Saves the response, puts the DOCX cover sheet in the RFI's OUT folder, and opens the draft email for you to check and send.</div>
 </div>
 
@@ -1520,6 +1533,7 @@
   <button class="back-btn" id="subReviewBack">← Back</button>
   <div class="section-title">Log Submittal Review</div>
   <div id="subReviewHeader" style="font-size:13px;color:#1e293b;background:#ede9fe;border:1px solid #c4b5fd;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-weight:600;"></div>
+  <div id="subReviewLinks" class="item-links"></div>
   <!-- Claude review panel — see rfiAiReviewPanel; same renderer, kind="sub". -->
   <div id="subAiReviewPanel"></div>
   <label>Stamp</label>
@@ -1543,7 +1557,7 @@
   <label>Cc <span class="hint">(the project's distribution list on prime jobs)</span></label>
   <input type="text" id="subReviewCc" placeholder="optional"/>
   <div id="subReviewStatusMsg" class="status-msg"></div>
-  <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log review</button>
+  <button class="btn btn-purple" id="submitSubReviewBtn">Log review</button>
   <div class="btn-caption">Saves the stamp and comments, puts the DOCX in the submittal's OUT folder, and opens the draft email for you to check and send.</div>
 </div>
 
@@ -1643,6 +1657,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-11-03-ca-p2-assignees-recipients"></script>
+<script src="taskpane.js?v=2026-11-03-ca-p3-tabs-links"></script>
 </body>
 </html>
