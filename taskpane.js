@@ -11805,26 +11805,54 @@ async function doFileToExistingSub() {
   );
 }
 // ─── CALENDAR HELPERS ─────────────────────────────────────────────────────────
-let _nycCalendarId = null;
+// Which calendar milestone events go to. Same rule as the PMS web app
+// (nycCalendarMatch): the calendar named exactly "NYC Shared Calendar", else
+// the one calendar owned by Sara whose name says NYC (a sharee may rename
+// their local copy). Several candidates = refuse and name them.
+//
+// This used to be the first calendar whose name contained "nyc" or "shared".
+// On 11/3 "The Future of Work with Microsoft AI Roadshow - NYC" (an event
+// calendar Outlook had added to Sara's list) came first, and four milestones
+// across three projects were filed there while the add-in said "synced to
+// NYC Shared Calendar". The old sessionStorage key is dropped so a tab that
+// cached that calendar re-resolves.
+const NYC_CAL_NAME      = "NYC Shared Calendar";
+const NYC_CAL_OWNER     = "sara.arias@setty.com";
+const NYC_CAL_CACHE_KEY = "setty_addin_cal_v2";
+let _nycCalendar      = null;   // { id, name } once resolved
+let _nycCalendarError = null;   // why the last resolve refused (ambiguous), for the caller's message
+function pickNycCalendar(cals) {
+  const want  = NYC_CAL_NAME.toLowerCase();
+  const exact = cals.filter(c => (c.name || "").trim().toLowerCase() === want);
+  if (exact.length === 1) return { cal: exact[0], ambiguous: [] };
+  if (exact.length > 1)   return { cal: null, ambiguous: exact.map(c => c.name) };
+  const loose = cals.filter(c => (c.owner?.address || "").toLowerCase() === NYC_CAL_OWNER && /nyc/i.test(c.name || ""));
+  if (loose.length === 1) return { cal: loose[0], ambiguous: [] };
+  return { cal: null, ambiguous: loose.map(c => c.name) };
+}
 async function getNYCCalendarId() {
-  if (_nycCalendarId) return _nycCalendarId;
-  const cached = sessionStorage.getItem("setty_addin_cal_id");
-  if (cached) { _nycCalendarId = cached; return _nycCalendarId; }
+  if (_nycCalendar) return _nycCalendar.id;
+  try { sessionStorage.removeItem("setty_addin_cal_id"); } catch {}
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(NYC_CAL_CACHE_KEY) || "null");
+    if (cached && cached.id) { _nycCalendar = cached; return cached.id; }
+  } catch {}
+  _nycCalendarError = null;
   try {
     const token = await getToken();
     const data  = await graphFetch("GET", "/me/calendars?$top=50", null, token);
-    // (c.name || ""): one null-named calendar in the list used to throw inside
-    // this swallowed try → null return → milestones silently landed on the
-    // user's PERSONAL calendar while the UI implied the shared one.
-    const nyc   = (data?.value || []).find(c =>
-      (c.name || "").toLowerCase().includes("nyc") || (c.name || "").toLowerCase().includes("shared")
-    );
-    if (nyc) {
-      _nycCalendarId = nyc.id;
-      sessionStorage.setItem("setty_addin_cal_id", nyc.id);
+    const { cal, ambiguous } = pickNycCalendar(data?.value || []);
+    if (ambiguous.length) {
+      _nycCalendarError = "more than one calendar could be the " + NYC_CAL_NAME + " (" +
+        ambiguous.map(n => '"' + n + '"').join(", ") + "); nothing was put on a calendar. Ask Sara to rename or remove the extra one.";
+      return null;
+    }
+    if (cal) {
+      _nycCalendar = { id: cal.id, name: cal.name };
+      try { sessionStorage.setItem(NYC_CAL_CACHE_KEY, JSON.stringify(_nycCalendar)); } catch {}
     }
   } catch {}
-  return _nycCalendarId || null;
+  return _nycCalendar ? _nycCalendar.id : null;
 }
 async function createMilestoneCalendarEvent(milestone, project) {
   // All-day events need exclusive end = start + 1 day
@@ -11865,6 +11893,7 @@ async function createMilestoneCalendarEvent(milestone, project) {
       }
     } catch { /* body is a nice-to-have; never block the event on it */ }
     const calId = await getNYCCalendarId();
+    if (!calId && _nycCalendarError) return { success: false, error: _nycCalendarError };
     const path  = calId ? "/me/calendars/" + calId + "/events" : "/me/events";
     const res   = await graphFetch("POST", path, event, token);
     return { success: true, eventId: res?.id, onShared: !!calId };
@@ -11885,6 +11914,7 @@ async function syncMilestoneCalendar(milestone, project) {
     const end   = { dateTime: endStr          + "T00:00:00", timeZone: "Eastern Standard Time" };
     const token = await getToken();
     const calId = await getNYCCalendarId();
+    if (!calId && _nycCalendarError) return { success: false, error: _nycCalendarError };
     if (milestone.calendarEventId) {
       // Move the existing event in place — keep its subject/body, just shift dates.
       const path = (calId ? "/me/calendars/" + calId + "/events/" : "/me/events/") + milestone.calendarEventId;
