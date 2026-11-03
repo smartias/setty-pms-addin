@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-11-03-ca-rules-portal-prefill";</script>
+  <script>window.__appVersion = "2026-11-03-ca-p2-assignees-recipients";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -948,6 +948,16 @@
     details.more-expander[open] > summary::before { transform: rotate(90deg); }
     details.more-expander > summary:hover { color: var(--primary); }
     details.more-expander > .more-body { padding-top: 4px; }
+    /* RFI / submittal forms: two short fields side by side, and a checkbox
+       list for assignees (several people can own a review, as in the PMS). */
+    .two-col { display: flex; gap: 8px; }
+    .two-col > div { flex: 1; min-width: 0; }
+    .assign-list { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; margin-bottom: 10px; background: var(--surface); }
+    .assign-list label { display: flex; align-items: center; gap: 6px; font-weight: 400; font-size: 12px; color: var(--text); margin: 2px 0; }
+    .assign-list input[type="checkbox"] { width: auto; margin: 0; }
+    .assign-list .empty { font-size: 11px; color: var(--text-faint); }
+    .hint { color: #64748b; font-weight: 400; font-size: 10px; }
+    .btn-caption { font-size: 11px; color: var(--text-faint); text-align: center; margin: 4px 0 10px; line-height: 1.4; }
   </style>
 </head>
 <body>
@@ -1311,11 +1321,19 @@
 
   <div id="rfiNewForm">
     <div class="section-title">New RFI</div>
-    <label>RFI Number <span style="color:#64748b;font-weight:400;font-size:10px;">(auto-suggested — overwrite if assigned by contractor)</span></label>
-    <input type="text" id="rfiNumber" placeholder="e.g. RFI-001 or external number"/>
     <label>Title</label>
     <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
-    <label>Discipline <span style="color:#64748b;font-weight:400;font-size:10px;">(required — sets the SharePoint folder; same list as the PMS)</span></label>
+    <div class="two-col">
+      <div>
+        <label>RFI Number <span class="hint">(auto — overwrite if the contractor numbered it)</span></label>
+        <input type="text" id="rfiNumber" placeholder="e.g. RFI-001"/>
+      </div>
+      <div>
+        <label>Due <span class="hint" id="rfiDueHint">(project review period)</span></label>
+        <input type="date" id="rfiDue"/>
+      </div>
+    </div>
+    <label>Discipline <span class="hint">(required — sets the SharePoint folder; same list as the PMS)</span></label>
     <select id="rfiDiscipline">
       <option value="">— Select —</option>
       <option>Mechanical</option>
@@ -1329,25 +1347,32 @@
       <option>Multi-Discipline</option>
       <option>Other</option>
     </select>
-    <label>From (GC / Prime)</label>
-    <input type="text" id="rfiFrom" placeholder="Contractor name"/>
-    <label>Received Via</label>
-    <select id="rfiReceivedVia">
-      <option value="Email">Email</option>
-      <option value="Procore">Procore</option>
-      <option value="ACC">ACC</option>
-      <option value="Other">Other</option>
-    </select>
-    <label>Due <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiDueHint">(from the project's RFI review period)</span></label>
-    <input type="date" id="rfiDue"/>
-    <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiAssignHint"></span></label>
-    <select id="rfiAssignedTo">
-      <option value="">— Unassigned —</option>
-    </select>
     <label>Full Question / Description</label>
     <textarea id="rfiDescription" rows="4" placeholder="Full RFI question text — what's being asked, what's the issue, what response is needed…"></textarea>
-    <label>Internal Notes <span style="color:#64748b;font-weight:400;font-size:10px;">(optional)</span></label>
-    <textarea id="rfiNotes" rows="2" placeholder="Internal notes — context for your team, not the contractor"></textarea>
+    <label>Assigned To <span class="hint" id="rfiAssignHint">(tick everyone who owns the answer)</span></label>
+    <div id="rfiAssignedTo" class="assign-list"></div>
+    <div id="rfiSubWrap" style="display:none;">
+      <label>Subconsultant <span class="hint">(we're prime — route the question to a sub firm)</span></label>
+      <select id="rfiSubAssigned"><option value="">— none —</option></select>
+    </div>
+    <details class="more-expander" id="rfiMore">
+      <summary>More — who sent it, how it arrived, internal notes</summary>
+      <div class="more-body">
+        <label>From (GC / Prime)</label>
+        <input type="text" id="rfiFrom" placeholder="Contractor name"/>
+        <label>Came through <span class="hint">(a portal choice is recorded on the item, so the PMS can reply there)</span></label>
+        <select id="rfiReceivedVia">
+          <option value="Email">Email</option>
+          <option value="Procore">Procore</option>
+          <option value="Autodesk Forma">Autodesk Forma / Build</option>
+          <option value="Newforma">Newforma</option>
+          <option value="Kahua">Kahua</option>
+          <option value="Other">Other</option>
+        </select>
+        <label>Internal Notes <span class="hint">(optional)</span></label>
+        <textarea id="rfiNotes" rows="2" placeholder="Internal notes — context for your team, not the contractor"></textarea>
+      </div>
+    </details>
     <div id="rfiStatus" class="status-msg"></div>
     <button class="btn btn-blue" id="saveRfiBtn">💾 Log New RFI</button>
     <button class="btn btn-secondary" id="saveRfiAnotherBtn" style="margin-top:6px;">➕ Log RFI &amp; add another from this email</button>
@@ -1375,44 +1400,65 @@
 
   <div id="subNewForm">
     <div class="section-title">New Submittal</div>
-    <label>Submittal Number <span style="color:#64748b;font-weight:400;font-size:10px;">(auto-suggested — overwrite if assigned by contractor)</span></label>
-    <input type="text" id="subNumber" placeholder="e.g. SUB-001 or external number"/>
-    <label>Spec Section</label>
-    <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
     <label>Description</label>
     <input type="text" id="subDesc" placeholder="Submittal description"/>
-    <label>Discipline <span style="color:#64748b;font-weight:400;font-size:10px;">(required — guessed from the spec section; sets the SharePoint folder)</span></label>
-    <select id="subDiscipline">
-      <option value="">— Select —</option>
-      <option>Mechanical</option>
-      <option>Electrical</option>
-      <option>Plumbing</option>
-      <option>Fire Protection</option>
-      <option>Technology</option>
-      <option>Architectural</option>
-      <option>Structural</option>
-      <option>Civil</option>
-      <option>Other</option>
-    </select>
-    <label>From (GC / Prime)</label>
-    <input type="text" id="subFrom" placeholder="Contractor name"/>
-    <label>Received Via</label>
-    <select id="subReceivedVia">
-      <option value="Email">Email</option>
-      <option value="Procore">Procore</option>
-      <option value="ACC">ACC</option>
-      <option value="Other">Other</option>
-    </select>
-    <label>Due <span style="color:#64748b;font-weight:400;font-size:10px;" id="subDueHint">(from the project's submittal review period)</span></label>
-    <input type="date" id="subDue"/>
-    <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="subAssignHint"></span></label>
-    <select id="subAssignedTo">
-      <option value="">— Unassigned —</option>
-    </select>
+    <div class="two-col">
+      <div>
+        <label>Submittal Number <span class="hint">(auto — overwrite if numbered)</span></label>
+        <input type="text" id="subNumber" placeholder="e.g. SUB-001"/>
+      </div>
+      <div>
+        <label>Spec Section</label>
+        <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
+      </div>
+    </div>
+    <div class="two-col">
+      <div>
+        <label>Discipline <span class="hint">(required)</span></label>
+        <select id="subDiscipline">
+          <option value="">— Select —</option>
+          <option>Mechanical</option>
+          <option>Electrical</option>
+          <option>Plumbing</option>
+          <option>Fire Protection</option>
+          <option>Technology</option>
+          <option>Architectural</option>
+          <option>Structural</option>
+          <option>Civil</option>
+          <option>Other</option>
+        </select>
+      </div>
+      <div>
+        <label>Due <span class="hint" id="subDueHint">(project review period)</span></label>
+        <input type="date" id="subDue"/>
+      </div>
+    </div>
     <label>Full Description / Scope</label>
     <textarea id="subFullDescription" rows="4" placeholder="What's being submitted, what needs to be reviewed, special requirements…"></textarea>
-    <label>Internal Notes <span style="color:#64748b;font-weight:400;font-size:10px;">(optional)</span></label>
-    <textarea id="subNotes" rows="2" placeholder="Internal notes — context for your team"></textarea>
+    <label>Assigned To <span class="hint" id="subAssignHint">(tick everyone who reviews it)</span></label>
+    <div id="subAssignedTo" class="assign-list"></div>
+    <div id="subSubWrap" style="display:none;">
+      <label>Subconsultant <span class="hint">(we're prime — route the review to a sub firm)</span></label>
+      <select id="subSubAssigned"><option value="">— none —</option></select>
+    </div>
+    <details class="more-expander" id="subMore">
+      <summary>More — who sent it, how it arrived, internal notes</summary>
+      <div class="more-body">
+        <label>From (GC / Prime)</label>
+        <input type="text" id="subFrom" placeholder="Contractor name"/>
+        <label>Came through <span class="hint">(a portal choice is recorded on the item)</span></label>
+        <select id="subReceivedVia">
+          <option value="Email">Email</option>
+          <option value="Procore">Procore</option>
+          <option value="Autodesk Forma">Autodesk Forma / Build</option>
+          <option value="Newforma">Newforma</option>
+          <option value="Kahua">Kahua</option>
+          <option value="Other">Other</option>
+        </select>
+        <label>Internal Notes <span class="hint">(optional)</span></label>
+        <textarea id="subNotes" rows="2" placeholder="Internal notes — context for your team"></textarea>
+      </div>
+    </details>
     <div id="subStatus" class="status-msg"></div>
     <button class="btn btn-purple" id="saveSubBtn">💾 Log New Submittal</button>
     <button class="btn btn-secondary" id="saveSubAnotherBtn" style="margin-top:6px;">➕ Log Submittal &amp; add another from this email</button>
@@ -1450,10 +1496,21 @@
   <select id="rfiResponseStatus">
     <option value="Responded">Responded</option>
     <option value="Closed">Closed</option>
-    <option value="Pending Sub Response">Pending Sub Response</option>
+    <option value="Pending Sub Response">Pending Sub Response — forward to a sub first</option>
   </select>
+  <!-- Shown only for Pending Sub Response: the sub who gets the question, so
+       the PMS's ball-in-court line and sub deadline are recorded, not just a status. -->
+  <div id="rfiPendingSubWrap" style="display:none;">
+    <label>Which subconsultant? <span class="hint">(recorded as sent today; their due date is 2 working days before the contractor's)</span></label>
+    <select id="rfiPendingSub"><option value="">— choose —</option></select>
+  </div>
+  <label>Send to <span class="hint" id="rfiResponseToHint">(who the draft email opens to — edit if wrong)</span></label>
+  <input type="text" id="rfiResponseTo" placeholder="name@contractor.com; …"/>
+  <label>Cc <span class="hint">(the project's distribution list on prime jobs)</span></label>
+  <input type="text" id="rfiResponseCc" placeholder="optional"/>
   <div id="rfiResponseStatusMsg" class="status-msg"></div>
-  <button class="btn btn-blue" id="submitRfiResponseBtn">📤 Log Response · Generate DOCX · Draft Email</button>
+  <button class="btn btn-blue" id="submitRfiResponseBtn">📤 Log response</button>
+  <div class="btn-caption">Saves the response, puts the DOCX cover sheet in the RFI's OUT folder, and opens the draft email for you to check and send.</div>
 </div>
 
 <!-- Submittal Review View — same pattern as RFI Response, but with stamp
@@ -1476,13 +1533,18 @@
   <textarea id="subReviewComments" rows="6" placeholder="Comments returning with the submittal…"></textarea>
   <label>Date Returned</label>
   <input type="date" id="subReviewDate"/>
-  <label>New Status <span style="color:#64748b;font-weight:400;font-size:10px;">(set from the stamp — change only if needed)</span></label>
+  <label>New Status <span class="hint">(set from the stamp — change only if needed)</span></label>
   <select id="subReviewStatus">
     <option value="Returned">Returned</option>
     <option value="Resubmittal Required">Resubmittal Required</option>
   </select>
+  <label>Send to <span class="hint" id="subReviewToHint">(who the draft email opens to — edit if wrong)</span></label>
+  <input type="text" id="subReviewTo" placeholder="name@contractor.com; …"/>
+  <label>Cc <span class="hint">(the project's distribution list on prime jobs)</span></label>
+  <input type="text" id="subReviewCc" placeholder="optional"/>
   <div id="subReviewStatusMsg" class="status-msg"></div>
-  <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log Review · Generate DOCX · Draft Email</button>
+  <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log review</button>
+  <div class="btn-caption">Saves the stamp and comments, puts the DOCX in the submittal's OUT folder, and opens the draft email for you to check and send.</div>
 </div>
 
 <!-- Dates View -->
@@ -1581,6 +1643,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-11-03-ca-rules-portal-prefill"></script>
+<script src="taskpane.js?v=2026-11-03-ca-p2-assignees-recipients"></script>
 </body>
 </html>

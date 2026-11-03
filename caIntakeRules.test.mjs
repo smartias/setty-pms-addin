@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 const src = readFileSync(new URL("./taskpane.js", import.meta.url), "utf8");
 const a = src.indexOf("// ── CA SHARED RULES (begin)"), b = src.indexOf("// ── CA SHARED RULES (end)");
 assert.ok(a > 0 && b > a, "shared-rules markers must exist in taskpane.js");
-const rules = new Function(src.slice(a, b) + "\nreturn { caNumberValue, caNextNumber, caBumpHighWater, caDueDays, subStatusForStamp, portalItemNumber };")();
+const rules = new Function(src.slice(a, b) + "\nreturn { caNumberValue, caNextNumber, caBumpHighWater, caDueDays, subStatusForStamp, portalItemNumber, parseEmailList, caDistributionFor, addWorkdaysISO, subDueDefault };")();
 
 test("next number is highest-ever + 1, never count + 1", () => {
   const rfis = [{ number: "RFI-001" }, { number: "RFI-003" }];           // RFI-002 was deleted
@@ -57,4 +57,23 @@ test("portal items are numbered the way the Tracker's import names them", () => 
   assert.equal(rules.portalItemNumber("submittal", { extNum: "233400-001", rev: 1 }), "233400-001-1");
   assert.equal(rules.portalItemNumber("submittal", { extNum: "233400-001" }), "233400-001-0");
   assert.equal(rules.portalItemNumber("submittal", { extNum: "12" }), "SUB-012");
+});
+
+test("email lists parse the way the PMS distribution editor writes them", () => {
+  assert.deepEqual(rules.parseEmailList("A@gc.com; b@owner.org , A@gc.com"), ["a@gc.com", "b@owner.org"]);
+  assert.deepEqual(rules.parseEmailList(""), []);
+});
+
+test("distribution: contractor first in To, project list in Cc, no address twice", () => {
+  const project = { caDistribution: { rfi: { to: "pm@owner.org", cc: "sub@mech.com; gc@gc.com" } } };
+  assert.deepEqual(rules.caDistributionFor(project, "rfi", ["gc@gc.com"]), { to: ["gc@gc.com", "pm@owner.org"], cc: ["sub@mech.com"] });
+  assert.deepEqual(rules.caDistributionFor({}, "submittal", ["gc@gc.com"]), { to: ["gc@gc.com"], cc: [] });
+});
+
+test("sub due date: 2 working days before the contractor's, never before tomorrow", () => {
+  assert.equal(rules.addWorkdaysISO("2026-11-06", -2), "2026-11-04");       // Fri → Wed
+  assert.equal(rules.addWorkdaysISO("2026-11-09", -2), "2026-11-05");       // Mon → Thu (skips the weekend)
+  assert.equal(rules.subDueDefault("2026-11-12", "2026-11-03"), "2026-11-10");
+  assert.equal(rules.subDueDefault("2026-11-04", "2026-11-03"), "2026-11-04"); // floor: next working day
+  assert.equal(rules.subDueDefault("", "2026-11-06"), "2026-11-09");          // no contractor date → next working day (Mon)
 });
