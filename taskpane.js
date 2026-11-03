@@ -349,6 +349,12 @@ function setupEventListeners() {
   if (saveRfiAnotherBtn) saveRfiAnotherBtn.onclick = () => { void saveArtifactThen("rfi", true); };
   const saveSubAnotherBtn = document.getElementById("saveSubAnotherBtn");
   if (saveSubAnotherBtn) saveSubAnotherBtn.onclick = () => { void saveArtifactThen("sub", true); };
+  // Review view: the stamp decides the status unless the user overrides it.
+  { const st = document.getElementById("subReviewStamp"), ss = document.getElementById("subReviewStatus");
+    if (st && ss) st.onchange = () => { ss.value = subStatusForStamp(st.value); }; }
+  // Spec section typed by hand → guess the discipline (same rules as the Tracker) while it is still unset.
+  { const sp = document.getElementById("subSpec"), sd = document.getElementById("subDiscipline");
+    if (sp && sd) sp.oninput = () => { const CI = window.CaIntake; if (!sd.value && CI && CI.inferDiscipline) { const g = CI.inferDiscipline({ specSection: sp.value, title: document.getElementById("subDesc")?.value || "" }, "submittal"); if (g) sd.value = g; } }; }
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
@@ -477,6 +483,8 @@ function loadItemContext() {
   // section doesn't need email metadata.
   if (isComposeMode()) {
     emailItem = null;
+    portalEvent = null; try { renderPortalIntakeBanner(); } catch (e) {}
+    hideArtifactDone();
     // A pinned pane moving from a tagged read item into Reply/Forward keeps
     // selectedProject, and nothing below runs — so hide the join banner here
     // (it's read-mode only; the predicate inside checks isComposeMode).
@@ -706,6 +714,9 @@ function loadItemContext() {
     try { refreshLinkToTargetDropdown(); } catch {}
     try { refreshLoggedArtifactChips(); } catch {}
     maybeShowAecQuip();
+    // Portal notification? Offer "Log as RFI / submittal" prefilled from it.
+    hideArtifactDone();
+    void detectPortalEvent(myGen);
     // Score this client email; if it looks like it needs a reply, add it to
     // the shared watchlist. Async + silent — never blocks item loading.
     void maybeAddToWatchlist(myGen);
@@ -1008,7 +1019,10 @@ function getLoggedRfiSubArtifacts(project) {
 // stop showing the Log Response button once the RFI is Responded/Closed/Void.
 const RFI_OPEN_STATUSES = new Set(["Open", "Pending Sub Response"]);
 // Same notion for submittals: while still under review (not yet returned).
-const SUB_OPEN_STATUSES = new Set(["Received", "In Review", "Pending Sub Response"]);
+// Submittal vocabulary is the PMS's (SUB_STATUSES in SettyPMS.html and the
+// Tracker): the old "In Review" / "Pending Sub Response" names never existed
+// there, so a submittal the PMS moved to Under Review lost its Log Review button.
+const SUB_OPEN_STATUSES = new Set(["Received", "Under Review", "Pending Sub Review", "Resubmittal Required"]);
 
 // Populate the "Link to RFI/Submittal" dropdown on the main view. Lists only
 // OPEN artifacts (the user can't link to a closed RFI in a meaningful way).
@@ -1312,6 +1326,8 @@ function refreshLoggedArtifactChips() {
     else if (action === "log-sub-review") openSubReviewView(id);
     else if (action === "claude-ca-review") openClaudeCaReview(id);
   };
+  // Chips present → the email is logged; the portal banner must not offer it again.
+  try { renderPortalIntakeBanner(); } catch (e) {}
 }
 // ── Open action items (project-level) ────────────────────────────────────────
 // Friendly short date for UI rows and chips: "Tue 8/18", adding a 2-digit year
@@ -3826,6 +3842,8 @@ function setSelectedProject(project, persistForEmail = false) {
   }
   // Re-populate the "Link to" dropdown — open RFIs/Subs differ per project.
   try { refreshLinkToTargetDropdown(); } catch (e) { console.warn("[link-to] refresh failed:", e.message); }
+  // The portal banner depends on the project (phase, confirmed platform, already logged).
+  try { renderPortalIntakeBanner(); } catch (e) { console.warn("[portal-banner]", e.message); }
   // "N new" count depends on the selected project's directory.
   try { updatePeopleButtonBadge(); } catch {}
   const badge = document.getElementById("selectedProjectBadge");
@@ -9282,9 +9300,13 @@ const DISCIPLINE_TO_CODE = {
   "Electrical":      "E",
   "Plumbing":        "P",
   "Fire Protection": "FP",
-  "General":         "GEN",
+  "Technology":      "T",
   "Architectural":   "A",
   "Structural":      "S",
+  "Civil":           "C",
+  "Multi-Discipline":"MD",
+  "Other":           "GEN",
+  "General":         "GEN", // legacy value from the old add-in list; kept so old records still resolve
 };
 function getDisciplineCode(disciplineName) {
   if (!disciplineName) return "GEN";
@@ -10122,13 +10144,163 @@ function escHtml(s) {
   return String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
 }
 
-// Compute the next auto-RFI number for the selected project. Mirrors PMS:
-// "RFI-NNN" where NNN = (existingRfis.length + 1) zero-padded. We do this
-// against the cached project's rfis array; if a contractor-assigned number
-// is provided the user just overwrites the field.
+// ── CA SHARED RULES (begin) ─────────────────────────────────────────────────
+// Mirrored from SettyPMS.html (caNumberValue / caNextNumber / caWithNewItem)
+// so an item logged from Outlook gets the same number and due date the PMS
+// would give it. Keep these in step with the PMS; caIntakeRules.test.mjs
+// slices this block out of the file and checks it.
+function caNumberValue(num) {
+  const m = String(num == null ? "" : num).match(/(\d+)(?:\.\d+)?\s*$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+// Next log number: one past the highest ever used (items in the log plus the
+// project's high-water mark, which remembers deleted and voided ones). The old
+// rule, count + 1, reissued a number after a delete.
+function caNextNumber(items, type, highWater) {
+  let max = +highWater || 0;
+  (items || []).forEach(it => { const n = caNumberValue(it && it.number); if (n != null && n > max) max = n; });
+  return (type === "rfi" ? "RFI-" : "SUB-") + String(max + 1).padStart(3, "0");
+}
+function caBumpHighWater(project, type, number) {
+  const hw = { ...((project && project.caNumberHighWater) || {}) };
+  hw[type] = Math.max(+hw[type] || 0, caNumberValue(number) || 0);
+  return hw;
+}
+// Review period per project (the PMS fields), with the firm defaults.
+function caDueDays(project, kind) {
+  return kind === "rfi" ? (+(project && project.rfiDueDays) || 5) : (+(project && project.submittalDueDays) || 10);
+}
+// A stamp that sends the submittal back means the ball is in the contractor's court.
+function subStatusForStamp(stamp) {
+  return (stamp === "Revise and Resubmit" || stamp === "Rejected") ? "Resubmittal Required" : "Returned";
+}
+// Record number for a portal item, the way the Tracker's import names them:
+// Procore / Kahua RFI #2218 → RFI-2218 (short ones zero-padded, RFI-091);
+// spec-based submittal ids keep their revision (233400-001-0); Forma's bare
+// numbers become SUB-012.
+function portalItemNumber(kind, item) {
+  const ext = String(item.extNum || "").trim();
+  if (kind === "rfi") return "RFI-" + ext.replace(/^(\d+)/, m => m.padStart(3, "0"));
+  return /[-.]/.test(ext) ? ext + "-" + (item.rev || 0) : "SUB-" + ext.padStart(3, "0");
+}
+// ── CA SHARED RULES (end) ───────────────────────────────────────────────────
+
+// ── PORTAL NOTIFICATION PREFILL ─────────────────────────────────────────────
+// A Procore / Forma / Newforma / Kahua notification used to be typed by hand:
+// the Procore number was lost, the item got the next hand number, and the
+// Tracker then showed the same item as NEW to import. Now the shared parsers
+// read the email, the main view offers "Log as RFI" with the fields filled,
+// and the saved record carries the portal number and vendor so the Tracker,
+// the PMS ("Reply in Procore") and the automatic intake all recognise it.
+let portalEvent = null;        // { vendor, kind, item } for the open email, or null
+let pendingPortalMeta = null;  // set when a form was prefilled from portalEvent; consumed by the save
+const PORTAL_VIA = { "Procore": "Procore", "Autodesk Forma": "ACC", "Newforma": "Other", "Kahua": "Other" };
+const PORTAL_PLATFORM = { "Procore": "Procore", "Autodesk Forma": "Autodesk Build", "Newforma": "Newforma", "Kahua": "Kahua" };
+async function detectPortalEvent(myGen) {
+  portalEvent = null;
+  renderPortalIntakeBanner();
+  const CI = window.CaIntake;
+  if (!CI || !emailItem || currentItemKind !== "message") return;
+  const subject = getResolvedItemSubject();
+  const from = (emailFromAddress || "").toLowerCase();
+  const gate = v => v.match.source === "." ? /^\s*(RFI|Submittal)\s+(Forwarded|Responded to and Closed)\s*:/i.test(subject) : (v.match.test(from) || v.match.test(subject));
+  if (!(CI.VENDORS || []).some(gate)) return;          // not a portal sender: no body fetch
+  const body = await getBodyTextReliable(emailItem);
+  if (myGen !== itemContextGeneration) return;         // the user moved to another email
+  const email = {
+    record_id: emailItem.itemId || "", subject, from_name: emailFrom || "", from_address: emailFromAddress || "",
+    email_date: emailItem.dateTimeCreated ? new Date(emailItem.dateTimeCreated).toISOString() : new Date().toISOString(),
+    body_text: body || "", sp_folder_url: "",
+  };
+  for (const v of CI.VENDORS) {
+    if (!gate(v)) continue;
+    let ev = null;
+    try { ev = v.parse(email); } catch (e) { ev = null; }
+    if (!ev) continue;
+    let item = null;
+    try { item = (CI.collapse([ev], v.kind) || [])[0] || null; } catch (e) { item = null; }
+    if (!item) continue;
+    portalEvent = { vendor: v.vendor, kind: v.kind, item };
+    break;
+  }
+  renderPortalIntakeBanner();
+}
+function renderPortalIntakeBanner() {
+  const el = document.getElementById("portalIntakeBanner");
+  if (!el) return;
+  const hide = () => { el.style.display = "none"; el.innerHTML = ""; };
+  if (!portalEvent || !emailItem) return hide();
+  // Already logged or linked from this email: the chip row says so.
+  try { if (selectedProject && getLoggedRfiSubArtifacts(selectedProject).length > 0) return hide(); } catch (e) {}
+  // Same phase rule as the Log as RFI / Submittal buttons.
+  if (selectedProject && selectedProject.status !== "In Construction Administration") return hide();
+  const { vendor, kind, item } = portalEvent;
+  const noun = kind === "rfi" ? "RFI" : "submittal";
+  const title = (item.title || "").slice(0, 70);
+  const confirmedSame = !!(selectedProject && selectedProject.caPortal && selectedProject.caPortal.platform && selectedProject.caPortal.platform === PORTAL_PLATFORM[vendor]);
+  el.innerHTML =
+    `<div class="suggestion-label">📨 Looks like a ${escHtml(vendor)} ${noun} #${escHtml(String(item.extNum || ""))}${title ? " — " + escHtml(title) : ""}</div>` +
+    (selectedProject
+      ? `<button type="button" class="btn ${kind === "rfi" ? "btn-blue" : "btn-purple"}" id="portalLogBtn" style="margin-bottom:${confirmedSame ? "6px" : "0"};">${kind === "rfi" ? "🔵" : "📋"} Log as ${noun} with these details</button>` +
+        (confirmedSame
+          ? `<div style="font-size:11px;color:var(--text-soft);line-height:1.4;">This project's platform is confirmed as ${escHtml(selectedProject.caPortal.platform)}, so the Tracker imports these on its own. Log here only if you need it in the log right now.</div>`
+          : "")
+      : `<div style="font-size:11px;color:var(--text-soft);">Pick the project above, then log it from here with the fields filled in.</div>`);
+  el.style.display = "block";
+  const btn = document.getElementById("portalLogBtn");
+  if (btn) btn.onclick = () => {
+    if (kind === "rfi") { prefillRfi(); applyPortalPrefill("rfi"); showView("rfiView"); }
+    else { prefillSub(); applyPortalPrefill("sub"); showView("subView"); }
+  };
+}
+// Fill the New RFI / New Submittal form from the parsed portal item. Runs
+// after prefillRfi/prefillSub (which reset the form and start the async body
+// seed, guarded to never overwrite a non-empty field, so what is set here wins).
+function applyPortalPrefill(kind) {
+  if (!portalEvent || portalEvent.kind !== (kind === "rfi" ? "rfi" : "submittal")) return;
+  const { vendor, item } = portalEvent;
+  const CI = window.CaIntake;
+  const set = (id, v) => { const e = document.getElementById(id); if (e && v != null && v !== "") e.value = v; };
+  const guess = CI && CI.inferDiscipline ? (CI.inferDiscipline({ specSection: item.specSection || "", title: item.title || "", question: item.question || "" }, kind === "rfi" ? "rfi" : "submittal") || "") : "";
+  if (kind === "rfi") {
+    set("rfiNumber", portalItemNumber("rfi", item));
+    set("rfiTitle", item.title);
+    set("rfiFrom", item.from);
+    set("rfiDescription", (item.question || "").trim());
+    set("rfiDue", item.dueDate);
+    set("rfiReceivedVia", PORTAL_VIA[vendor] || "Other");
+    if (guess) set("rfiDiscipline", guess);
+    const hint = document.getElementById("rfiDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
+  } else {
+    set("subNumber", portalItemNumber("submittal", item));
+    set("subDesc", item.title);
+    set("subSpec", item.specSection);
+    set("subFrom", item.ballInCourt);
+    set("subDue", item.dueDate);
+    set("subReceivedVia", PORTAL_VIA[vendor] || "Other");
+    if (guess) set("subDiscipline", guess);
+    const hint = document.getElementById("subDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
+  }
+  pendingPortalMeta = { vendor, kind: portalEvent.kind, extNum: String(item.extNum || ""), status: item.status || "", rev: item.rev || 0, stamp: item.stamp || "" };
+}
+// What the saved record carries when it came from a portal notification:
+// the portal's own number (so the Tracker matches it instead of importing a
+// twin) and the vendor (so the PMS offers "Reply in Procore"). A person
+// logged it, so it is NOT an unreviewed intake item.
+function portalRecordFields(kind) {
+  const m = pendingPortalMeta;
+  if (!m || m.kind !== (kind === "rfi" ? "rfi" : "submittal")) return {};
+  const out = { extNumber: m.extNum, intake: { vendor: m.vendor, at: new Date().toISOString(), by: "outlook-addin" } };
+  if (m.status) out.status = m.status;
+  if (kind !== "rfi") { out.resubNumber = m.rev || 0; if (m.stamp) out.stamp = m.stamp; }
+  return out;
+}
+
+// Next auto number for the selected project — same rule as the PMS
+// (caNextNumber): highest number ever used + 1, never count + 1. A
+// contractor-assigned number just overwrites the field.
 function nextAutoRfiNumber() {
-  const count = (selectedProject?.rfis || []).length + 1;
-  return "RFI-" + String(count).padStart(3, "0");
+  return caNextNumber(selectedProject?.rfis || [], "rfi", (selectedProject?.caNumberHighWater || {}).rfi);
 }
 
 // Seed a description textarea with the email's plain-text body. Async —
@@ -10181,6 +10353,14 @@ function prefillRfi() {
   // user is in Outlook. They can override per-RFI if the original source was
   // Procore/ACC/etc.
   document.getElementById("rfiReceivedVia").value = "Email";
+  pendingPortalMeta = null;
+  // Due date from the project's own review period (the PMS field), editable.
+  { const d = document.getElementById("rfiDue"); if (d) d.value = addBizDays(new Date(), caDueDays(selectedProject, "rfi")); }
+  { const h = document.getElementById("rfiDueHint"); if (h) h.textContent = "(from the project's RFI review period)"; }
+  // Discipline is required (it decides the SharePoint folder); guess it from
+  // the subject with the shared rules, the way the Tracker does.
+  { const d = document.getElementById("rfiDiscipline"); const CI = window.CaIntake;
+    d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "rfi") || "") : ""; }
   populateRfiAssigneeDropdown();
   defaultAssigneeToPm("rfiAssignedTo");
   seedDescriptionFromEmailBody("rfiDescription");
@@ -10195,6 +10375,9 @@ async function doSaveRfi() {
   const userEnteredNumber = (document.getElementById("rfiNumber")?.value || "").trim();
   const description = (document.getElementById("rfiDescription")?.value || "").trim();
   const discipline = document.getElementById("rfiDiscipline").value;
+  if (!discipline) { setStatus("rfiStatus", "error", "Pick a discipline — it decides which SharePoint folder the RFI files under."); document.getElementById("rfiDiscipline").focus(); return; }
+  const dueEntered = (document.getElementById("rfiDue")?.value || "").trim();
+  const portalFields = portalRecordFields("rfi");
   const fromField = document.getElementById("rfiFrom").value.trim();
   const notesField = document.getElementById("rfiNotes").value.trim();
   const receivedVia = (document.getElementById("rfiReceivedVia")?.value || "Email");
@@ -10225,7 +10408,7 @@ async function doSaveRfi() {
       } catch { /* fall back to cache; logged in applyLocalChangeAndSave too */ }
 
       const existingRfis = freshProject.rfis || [];
-      const autoNum = "RFI-" + String(existingRfis.length + 1).padStart(3, "0");
+      const autoNum = caNextNumber(existingRfis, "rfi", (freshProject.caNumberHighWater || {}).rfi);
       const rfiNumber = userEnteredNumber || autoNum;
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
@@ -10269,7 +10452,7 @@ async function doSaveRfi() {
         from: fromField,
         receivedVia,
         dateReceived: received.toISOString().slice(0, 10),
-        dueDate: addBizDays(received, 5),
+        dueDate: dueEntered || addBizDays(received, caDueDays(freshProject, "rfi")),
         status: "Open",
         notes: notesField,
         assignedTo: assignedToStaff,
@@ -10281,11 +10464,15 @@ async function doSaveRfi() {
         sourceMessageId:  getCurrentSharedMessageId() || "",
         sourceCalendarUId: currentItemICalUId || "",
         createdAt: new Date().toISOString(),
+        // Portal number + vendor when the form was filled from a notification.
+        ...portalFields,
       };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
         rfis: [...(fresh.rfis || []), rfi],
+        caNumberHighWater: caBumpHighWater(fresh, "rfi", rfi.number),
       }));
+      pendingPortalMeta = null;
 
       // Open a prefilled draft to the assignee. Mirrors the transmittal flow:
       // user reviews the draft and hits Send. Failure is non-fatal — the RFI
@@ -10329,6 +10516,8 @@ async function doSaveRfi() {
         status:         emailFolderUrl ? "success" : (spFolderUrl ? "partial" : "partial"),
         error:          emailFolderUrl ? null : (spUploadError || "RFI logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
+        // For the done block on the main view (showArtifactDone).
+        done: { kind: "rfi", number: rfiNumber, folderUrl: spFolderUrl, draftOpened, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
@@ -11052,8 +11241,7 @@ function populateSubAssigneeDropdown() {
 }
 
 function nextAutoSubNumber() {
-  const count = (selectedProject?.submittals || []).length + 1;
-  return "SUB-" + String(count).padStart(3, "0");
+  return caNextNumber(selectedProject?.submittals || [], "submittal", (selectedProject?.caNumberHighWater || {}).submittal);
 }
 
 function prefillSub() {
@@ -11064,6 +11252,11 @@ function prefillSub() {
   document.getElementById("subNotes").value = "";
   document.getElementById("subAssignedTo").value = "";
   document.getElementById("subReceivedVia").value = "Email";
+  pendingPortalMeta = null;
+  { const d = document.getElementById("subDue"); if (d) d.value = addBizDays(new Date(), caDueDays(selectedProject, "submittal")); }
+  { const h = document.getElementById("subDueHint"); if (h) h.textContent = "(from the project's submittal review period)"; }
+  { const d = document.getElementById("subDiscipline"); const CI = window.CaIntake;
+    d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "submittal") || "") : ""; }
   populateSubAssigneeDropdown();
   defaultAssigneeToPm("subAssignedTo");
   seedDescriptionFromEmailBody("subFullDescription");
@@ -11078,6 +11271,9 @@ async function doSaveSub() {
   const fullDescription = (document.getElementById("subFullDescription")?.value || "").trim();
   const specSection = document.getElementById("subSpec").value.trim();
   const discipline = document.getElementById("subDiscipline").value;
+  if (!discipline) { setStatus("subStatus", "error", "Pick a discipline — it decides which SharePoint folder the submittal files under."); document.getElementById("subDiscipline").focus(); return; }
+  const dueEntered = (document.getElementById("subDue")?.value || "").trim();
+  const portalFields = portalRecordFields("sub");
   const fromField = document.getElementById("subFrom").value.trim();
   const notesField = document.getElementById("subNotes").value.trim();
   const receivedVia = (document.getElementById("subReceivedVia")?.value || "Email");
@@ -11106,7 +11302,7 @@ async function doSaveSub() {
       } catch { /* fall back to cache */ }
 
       const existing = freshProject.submittals || [];
-      const autoNum = "SUB-" + String(existing.length + 1).padStart(3, "0");
+      const autoNum = caNextNumber(existing, "submittal", (freshProject.caNumberHighWater || {}).submittal);
       const subNumber = userEnteredNumber || autoNum;
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
@@ -11147,8 +11343,9 @@ async function doSaveSub() {
         from: fromField,
         receivedVia,
         dateReceived: received.toISOString().slice(0, 10),
-        dueDate: addBizDays(received, 10),
+        dueDate: dueEntered || addBizDays(received, caDueDays(freshProject, "submittal")),
         status: "Received",
+        stamp: "—", resubNumber: 0,
         notes: notesField,
         assignedTo: assignedToStaff,
         subAssigned,
@@ -11157,11 +11354,14 @@ async function doSaveSub() {
         sourceMessageId:   getCurrentSharedMessageId() || "",
         sourceCalendarUId: currentItemICalUId || "",
         createdAt: new Date().toISOString(),
+        ...portalFields,
       };
       await applyLocalChangeAndSave(selectedProject.id, fresh => ({
         ...fresh,
         submittals: [...(fresh.submittals || []), sub],
+        caNumberHighWater: caBumpHighWater(fresh, "submittal", sub.number),
       }));
+      pendingPortalMeta = null;
 
       // Open prefilled draft to the assignee
       const assignee = resolveAssignee(assigneeRaw, freshProject);
@@ -11198,6 +11398,7 @@ async function doSaveSub() {
         status:         emailFolderUrl ? "success" : "partial",
         error:          emailFolderUrl ? null : (spUploadError || "Submittal logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
+        done: { kind: "submittal", number: subNumber, folderUrl: spFolderUrl, draftOpened, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
@@ -11219,18 +11420,42 @@ async function saveArtifactThen(kind, another) {
     const noun = isRfi ? "RFI" : "submittal";
     setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
   } else {
-    // Back on the main view the just-logged artifact renders as a chip with a
-    // "🤖 Send to Claude" button — point at it so sending the item to Claude
-    // for review becomes part of the logging motion, not a separate trip to
-    // the PMS jobcard.
-    try {
-      setStatus("actionStatus", "success",
-        (r.successMessage || "✓ Logged.") +
-        " · 🤖 Use “Send to Claude” below to get a drafted " + (isRfi ? "response" : "review") + ".");
-    } catch {}
+    // Back on the main view: a done block with the number, where it went and
+    // links (folder, PMS item), above the chip row whose "🤖 Send to Claude"
+    // button is the natural next step.
+    try { showArtifactDone(r.done, r.successMessage); } catch {}
     showView("mainView");
   }
 }
+// The done state after logging. Text is escaped; links are built from URLs we
+// made ourselves. Hidden again when the user moves to another email.
+function showArtifactDone(d, fallbackMsg) {
+  const el = document.getElementById("artifactDone");
+  if (!el) return;
+  if (!d) { if (fallbackMsg) setStatus("actionStatus", "success", fallbackMsg); return; }
+  const noun = d.kind === "rfi" ? "RFI" : "Submittal";
+  const pmsUrl = d.projectId ? PMS_PROJECT_BASE_URL + encodeURIComponent(d.projectId) + ":" + (d.kind === "rfi" ? "rfi" : "submittal") + ":" + encodeURIComponent(d.number || "") : "";
+  const bits = [];
+  bits.push(d.folderUrl ? "filed to SharePoint" : (d.spUploadError ? "logged, but the SharePoint upload failed" : "logged (no SharePoint folder on this project)"));
+  if (d.draftOpened) bits.push("assignment draft opened");
+  else if (d.assigneeNoEmail) bits.push("assignee has no email on file");
+  const linkStyle = "font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;margin-right:12px;";
+  el.innerHTML =
+    `<div style="display:flex;align-items:center;gap:8px;">` +
+      `<span style="font-size:18px;color:var(--success);font-weight:700;">✓</span>` +
+      `<div style="min-width:0;">` +
+        `<div style="font-size:13px;font-weight:700;color:var(--success);">${/^(RFI|SUB)-/i.test(d.number || "") ? "" : escHtml(noun) + " "}${escHtml(d.number || "")} logged</div>` +
+        `<div style="font-size:11px;color:var(--text-soft);">${escHtml(bits.join(" · "))}${d.spUploadError ? " — " + escHtml(String(d.spUploadError).slice(0, 120)) : ""}</div>` +
+      `</div>` +
+    `</div>` +
+    `<div style="margin-top:6px;">` +
+      (d.folderUrl ? `<a href="${escHtml(d.folderUrl)}" target="_blank" rel="noreferrer" style="${linkStyle}">📂 Folder →</a>` : "") +
+      (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer" style="${linkStyle}">Open in PMS →</a>` : "") +
+      `<span style="font-size:11px;color:var(--text-soft);">🤖 “Send to Claude” below drafts the ${d.kind === "rfi" ? "response" : "review"}.</span>` +
+    `</div>`;
+  el.style.display = "block";
+}
+function hideArtifactDone() { const el = document.getElementById("artifactDone"); if (el) { el.style.display = "none"; el.innerHTML = ""; } }
 // ─── LOG SUBMITTAL REVIEW ────────────────────────────────────────────────────
 let _activeReviewSubId = "";
 function openSubReviewView(subId) {
@@ -11239,10 +11464,13 @@ function openSubReviewView(subId) {
   _activeReviewSubId = subId;
   document.getElementById("subReviewHeader").textContent =
     `${sub.number}${sub.description ? " — " + sub.description : ""}`;
-  document.getElementById("subReviewStamp").value = sub.stamp || "Approved";
+  const stampEl = document.getElementById("subReviewStamp");
+  stampEl.value = (sub.stamp && sub.stamp !== "—") ? sub.stamp : "Approved";
   document.getElementById("subReviewComments").value = sub.comments || "";
   document.getElementById("subReviewDate").value = new Date().toISOString().slice(0, 10);
-  document.getElementById("subReviewStatus").value = "Returned";
+  // Status follows the stamp (Revise and Resubmit / Rejected → Resubmittal
+  // Required); the select stays editable for the odd case.
+  document.getElementById("subReviewStatus").value = subStatusForStamp(stampEl.value);
   setStatus("subReviewStatusMsg", "", "");
   // Claude review panel — same pattern as openRfiResponseView.
   { const w = document.getElementById(_caWhyInputId("sub")); if (w) w.value = ""; }

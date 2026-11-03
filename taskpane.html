@@ -8,12 +8,21 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-10-21-join-team-badge";</script>
+  <script>window.__appVersion = "2026-11-03-ca-rules-portal-prefill";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
        repo on the same origin so the session is shared with the web apps). -->
   <script src="https://smartias.github.io/setty-pms/setty-auth.js"></script>
+  <!-- Shared CA rules (same origin as setty-auth.js): the portal notification
+       parsers and the discipline guesser the Tracker and the connector use.
+       Hung on window.CaIntake; if it fails to load, portal emails are simply
+       not recognised and the forms still work by hand. -->
+  <script type="module">
+    import("https://smartias.github.io/setty-pms/caIntake.js")
+      .then(m => { window.CaIntake = m; window.dispatchEvent(new Event("caintake-ready")); })
+      .catch(e => console.warn("[caIntake] not loaded:", e && e.message));
+  </script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
   <!-- docx: generates DOCX cover sheets for RFI Responses and Submittal Reviews
@@ -1116,6 +1125,14 @@
   <!-- "Already logged as RFI / Submittal" chip row. Populated by
        refreshLoggedArtifactChips() based on RFI/Submittal records whose
        sourceItemId matches the current email. Empty by default. -->
+  <!-- Portal notification banner — shown when the open email parses as a
+       Procore / Forma / Newforma / Kahua RFI or submittal notification that
+       is not logged yet. One click opens the form prefilled from the email
+       (detectPortalEvent / renderPortalIntakeBanner). -->
+  <div id="portalIntakeBanner" class="suggestion-block" style="display:none;"></div>
+  <!-- Done state after Log as RFI / Submittal: number, where it went, links.
+       Replaces the old one-line status so "did it save?" has an answer. -->
+  <div id="artifactDone" style="display:none;margin-bottom:10px;background:var(--success-bg);border:1px solid #b6e3b6;border-radius:6px;padding:8px 10px;"></div>
   <div id="loggedAsArtifactChips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;"></div>
   <div id="openActionItemChips" style="display:none;flex-direction:column;gap:6px;margin-bottom:8px;"></div>
 
@@ -1298,16 +1315,19 @@
     <input type="text" id="rfiNumber" placeholder="e.g. RFI-001 or external number"/>
     <label>Title</label>
     <input type="text" id="rfiTitle" placeholder="RFI subject / description"/>
-    <label>Discipline</label>
+    <label>Discipline <span style="color:#64748b;font-weight:400;font-size:10px;">(required — sets the SharePoint folder; same list as the PMS)</span></label>
     <select id="rfiDiscipline">
       <option value="">— Select —</option>
       <option>Mechanical</option>
       <option>Electrical</option>
       <option>Plumbing</option>
       <option>Fire Protection</option>
-      <option>General</option>
+      <option>Technology</option>
       <option>Architectural</option>
       <option>Structural</option>
+      <option>Civil</option>
+      <option>Multi-Discipline</option>
+      <option>Other</option>
     </select>
     <label>From (GC / Prime)</label>
     <input type="text" id="rfiFrom" placeholder="Contractor name"/>
@@ -1318,6 +1338,8 @@
       <option value="ACC">ACC</option>
       <option value="Other">Other</option>
     </select>
+    <label>Due <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiDueHint">(from the project's RFI review period)</span></label>
+    <input type="date" id="rfiDue"/>
     <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="rfiAssignHint"></span></label>
     <select id="rfiAssignedTo">
       <option value="">— Unassigned —</option>
@@ -1359,16 +1381,18 @@
     <input type="text" id="subSpec" placeholder="e.g. 23 05 00"/>
     <label>Description</label>
     <input type="text" id="subDesc" placeholder="Submittal description"/>
-    <label>Discipline</label>
+    <label>Discipline <span style="color:#64748b;font-weight:400;font-size:10px;">(required — guessed from the spec section; sets the SharePoint folder)</span></label>
     <select id="subDiscipline">
       <option value="">— Select —</option>
       <option>Mechanical</option>
       <option>Electrical</option>
       <option>Plumbing</option>
       <option>Fire Protection</option>
-      <option>General</option>
+      <option>Technology</option>
       <option>Architectural</option>
       <option>Structural</option>
+      <option>Civil</option>
+      <option>Other</option>
     </select>
     <label>From (GC / Prime)</label>
     <input type="text" id="subFrom" placeholder="Contractor name"/>
@@ -1379,6 +1403,8 @@
       <option value="ACC">ACC</option>
       <option value="Other">Other</option>
     </select>
+    <label>Due <span style="color:#64748b;font-weight:400;font-size:10px;" id="subDueHint">(from the project's submittal review period)</span></label>
+    <input type="date" id="subDue"/>
     <label>Assigned To <span style="color:#64748b;font-weight:400;font-size:10px;" id="subAssignHint"></span></label>
     <select id="subAssignedTo">
       <option value="">— Unassigned —</option>
@@ -1450,10 +1476,10 @@
   <textarea id="subReviewComments" rows="6" placeholder="Comments returning with the submittal…"></textarea>
   <label>Date Returned</label>
   <input type="date" id="subReviewDate"/>
-  <label>New Status</label>
+  <label>New Status <span style="color:#64748b;font-weight:400;font-size:10px;">(set from the stamp — change only if needed)</span></label>
   <select id="subReviewStatus">
     <option value="Returned">Returned</option>
-    <option value="Closed">Closed</option>
+    <option value="Resubmittal Required">Resubmittal Required</option>
   </select>
   <div id="subReviewStatusMsg" class="status-msg"></div>
   <button class="btn btn-purple" id="submitSubReviewBtn">📤 Log Review · Generate DOCX · Draft Email</button>
@@ -1555,6 +1581,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-10-14-followups-tab"></script>
+<script src="taskpane.js?v=2026-11-03-ca-rules-portal-prefill"></script>
 </body>
 </html>
