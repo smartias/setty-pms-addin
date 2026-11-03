@@ -501,6 +501,12 @@ function loadItemContext() {
   itemContextGeneration++;
   const myGen = itemContextGeneration;
   emailItem = Office.context.mailbox.item;
+  // Portal state belongs to one email: clear it before either branch below so
+  // an appointment opened after a Procore notification never shows that
+  // email's banner (setSelectedProject re-renders it for any item kind).
+  portalEvent = null; pendingPortalMeta = null;
+  try { renderPortalIntakeBanner(); } catch (e) {}
+  hideArtifactDone();
   refreshTeamsBtn();
   currentConversationId = "";
   currentItemICalUId = "";
@@ -715,7 +721,6 @@ function loadItemContext() {
     try { refreshLoggedArtifactChips(); } catch {}
     maybeShowAecQuip();
     // Portal notification? Offer "Log as RFI / submittal" prefilled from it.
-    hideArtifactDone();
     void detectPortalEvent(myGen);
     // Score this client email; if it looks like it needs a reply, add it to
     // the shared watchlist. Async + silent — never blocks item loading.
@@ -10196,6 +10201,9 @@ let portalEvent = null;        // { vendor, kind, item } for the open email, or 
 let pendingPortalMeta = null;  // set when a form was prefilled from portalEvent; consumed by the save
 const PORTAL_VIA = { "Procore": "Procore", "Autodesk Forma": "ACC", "Newforma": "Other", "Kahua": "Other" };
 const PORTAL_PLATFORM = { "Procore": "Procore", "Autodesk Forma": "Autodesk Build", "Newforma": "Newforma", "Kahua": "Kahua" };
+window.addEventListener("caintake-ready", () => {
+  if (emailItem && currentItemKind === "message" && !isComposeMode()) void detectPortalEvent(itemContextGeneration);
+});
 async function detectPortalEvent(myGen) {
   portalEvent = null;
   renderPortalIntakeBanner();
@@ -10229,7 +10237,7 @@ function renderPortalIntakeBanner() {
   const el = document.getElementById("portalIntakeBanner");
   if (!el) return;
   const hide = () => { el.style.display = "none"; el.innerHTML = ""; };
-  if (!portalEvent || !emailItem) return hide();
+  if (!portalEvent || !emailItem || currentItemKind !== "message") return hide();
   // Already logged or linked from this email: the chip row says so.
   try { if (selectedProject && getLoggedRfiSubArtifacts(selectedProject).length > 0) return hide(); } catch (e) {}
   // Same phase rule as the Log as RFI / Submittal buttons.
