@@ -57,8 +57,8 @@ The task pane opens on the right with:
 3. Once a project is selected:
    - **📁 Save to SharePoint + Project Record** — uploads email as HTML to `/Emails/YYYY_MM_DD Subject/` and saves to the project's Emails tab in PMS
    - **📝 Log as Note** — pre-fills subject as note body, pick category (Meeting, Site Visit, Client Communication, etc.), saves to Notes tab
-   - **🔵 Log as RFI** — pre-fills title from subject and From as contractor, auto-assigns RFI number and 5-day due date
-   - **📋 Log as Submittal** — same pattern, 10-day due date
+   - **🔵 Log as RFI** — pre-fills title from subject and From as contractor; the number is the project's next (highest ever used + 1, the same rule as the PMS) and the due date comes from the project's RFI review period (default 5 business days). Discipline is required because it sets the SharePoint folder. A Procore / Forma / Newforma / Kahua notification is recognised on the main view and offered as "Log as RFI with these details", prefilled from the email and saved with the portal's own number and vendor so the Tracker and the PMS treat it as the same item.
+   - **📋 Log as Submittal** — same pattern; the due date comes from the project's submittal review period (default 10 business days). On Log Review, the stamp sets the status (Revise and Resubmit / Rejected → Resubmittal Required).
    - **👤 Extract Contact** — parses the email signature for name, title, company, email, phone; lets you save to the Client Directory or project POC list
 
 ---
