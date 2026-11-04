@@ -10546,20 +10546,22 @@ async function doSaveRfi() {
       }));
       pendingPortalMeta = null;
 
-      // Open a prefilled draft to everyone ticked (and the sub, if routed).
-      // Mirrors the transmittal flow: user reviews the draft and hits Send.
-      // Failure is non-fatal — the RFI is logged regardless.
+      // Prepare the assignment draft to everyone ticked (and the sub, if
+      // routed) but do NOT open it yet: policy is Claude review first, then the
+      // engineer. The done block offers "Send to Claude" and then "Email the
+      // assignees" (showArtifactDone), so the person logging sends it after the
+      // review is on the item. Failure is non-fatal — the RFI is logged regardless.
       const recips = assigneeRecipients(assignedToStaff, freshProject);
       const subRec = subAssigned ? resolveAssignee("sub:" + subAssigned, freshProject) : null;
       if (subRec && subRec.email) recips.push(subRec);
       const assignee = recips[0] || (assignedToStaff.length || subAssigned ? { email: "", name: "" } : null);
-      let draftOpened = false;
+      let assignDraft = null;
       if (recips.length) {
         const subjectLine = `${rfiNumber} · ${freshProject.projectNumber || ""} · ${title}`.trim();
         const htmlBody = buildRfiAssignmentEmailHtml({
           rfi, project: freshProject, assignee: recips[0], inFolderUrl: inFolderWebUrl || spFolderUrl,
         });
-        draftOpened = openComposeDraft({ toList: recips, subject: subjectLine, htmlBody });
+        assignDraft = { toList: recips, subject: subjectLine, htmlBody };
       }
 
       // Clear the form for the next entry
@@ -10576,7 +10578,7 @@ async function doSaveRfi() {
     try { refreshLinkToTargetDropdown(); } catch {}
 
       const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
-      const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : ""));
+      const draftMsg = assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : "");
       const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
       return {
         // sp_folder_url points at the per-email subfolder so the reconcile
@@ -10587,7 +10589,7 @@ async function doSaveRfi() {
         error:          emailFolderUrl ? null : (spUploadError || "RFI logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
         // For the done block on the main view (showArtifactDone).
-        done: { kind: "rfi", number: rfiNumber, folderUrl: spFolderUrl, draftOpened, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
+        done: { kind: "rfi", number: rfiNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
@@ -11433,18 +11435,19 @@ async function doSaveSub() {
       }));
       pendingPortalMeta = null;
 
-      // Open a prefilled draft to everyone ticked (and the sub, if routed).
+      // Prepare the assignment draft but do not open it yet (Claude review
+      // first — see the RFI branch and showArtifactDone).
       const recips = assigneeRecipients(assignedToStaff, freshProject);
       const subRec = subAssigned ? resolveAssignee("sub:" + subAssigned, freshProject) : null;
       if (subRec && subRec.email) recips.push(subRec);
       const assignee = recips[0] || (assignedToStaff.length || subAssigned ? { email: "", name: "" } : null);
-      let draftOpened = false;
+      let assignDraft = null;
       if (recips.length) {
         const subjectLine = `${subNumber} · ${freshProject.projectNumber || ""} · ${desc}`.trim();
         const htmlBody = buildSubAssignmentEmailHtml({
           sub, project: freshProject, assignee: recips[0], inFolderUrl: inFolderWebUrl || spFolderUrl,
         });
-        draftOpened = openComposeDraft({ toList: recips, subject: subjectLine, htmlBody });
+        assignDraft = { toList: recips, subject: subjectLine, htmlBody };
       }
 
       document.getElementById("subDesc").value = "";
@@ -11459,14 +11462,14 @@ async function doSaveSub() {
     try { refreshLinkToTargetDropdown(); } catch {}
 
       const baseMsg = "✓ " + subNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
-      const draftMsg = draftOpened ? " · ✉️ Draft opened" : (assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "");
+      const draftMsg = assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "";
       const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
       return {
         sp_folder_url:  emailFolderUrl || spFolderUrl || null,
         status:         emailFolderUrl ? "success" : "partial",
         error:          emailFolderUrl ? null : (spUploadError || "Submittal logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
-        done: { kind: "submittal", number: subNumber, folderUrl: spFolderUrl, draftOpened, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
+        done: { kind: "submittal", number: subNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
@@ -11505,8 +11508,7 @@ function showArtifactDone(d, fallbackMsg) {
   const pmsUrl = d.projectId ? PMS_PROJECT_BASE_URL + encodeURIComponent(d.projectId) + ":" + (d.kind === "rfi" ? "rfi" : "submittal") + ":" + encodeURIComponent(d.number || "") : "";
   const bits = [];
   bits.push(d.folderUrl ? "filed to SharePoint" : (d.spUploadError ? "logged, but the SharePoint upload failed" : "logged (no SharePoint folder on this project)"));
-  if (d.draftOpened) bits.push("assignment draft opened");
-  else if (d.assigneeNoEmail) bits.push("assignee has no email on file");
+  if (d.assigneeNoEmail) bits.push("assignee has no email on file");
   const linkStyle = "font-size:12px;font-weight:600;color:var(--primary);text-decoration:none;margin-right:12px;";
   el.innerHTML =
     `<div style="display:flex;align-items:center;gap:8px;">` +
@@ -11519,9 +11521,22 @@ function showArtifactDone(d, fallbackMsg) {
     `<div style="margin-top:6px;">` +
       (d.folderUrl ? `<a href="${escHtml(d.folderUrl)}" target="_blank" rel="noreferrer" style="${linkStyle}">📂 Folder →</a>` : "") +
       (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer" style="${linkStyle}">Open in PMS →</a>` : "") +
-      `<span style="font-size:11px;color:var(--text-soft);">🤖 “Send to Claude” below drafts the ${d.kind === "rfi" ? "response" : "review"}.</span>` +
+      (d.assignDraft
+        ? `<button type="button" id="artifactDoneEmailBtn" style="background:#1e40af;color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-right:8px;">✉ Email the assignees</button>`
+        : "") +
+      `<span style="font-size:11px;color:var(--text-soft);">${d.assignDraft
+        ? "Policy: 🤖 “Send to Claude” below first, then email the assignees so they open it with the review on it."
+        : "🤖 “Send to Claude” below drafts the " + (d.kind === "rfi" ? "response" : "review") + "."}</span>` +
     `</div>`;
   el.style.display = "block";
+  // The assignment draft is prepared at log time but opened only on request
+  // (Claude review first). Stays on the done block until the next log.
+  const emailBtn = document.getElementById("artifactDoneEmailBtn");
+  if (emailBtn && d.assignDraft) emailBtn.onclick = () => {
+    const ok = openComposeDraft(d.assignDraft);
+    emailBtn.disabled = true;
+    emailBtn.textContent = ok ? "✉ Draft opened" : "✉ Could not open a draft";
+  };
 }
 function hideArtifactDone() { const el = document.getElementById("artifactDone"); if (el) { el.style.display = "none"; el.innerHTML = ""; } }
 // ─── LOG SUBMITTAL REVIEW ────────────────────────────────────────────────────
