@@ -1036,7 +1036,10 @@ const RFI_OPEN_STATUSES = new Set(["Open", "Pending Sub Response"]);
 // Submittal vocabulary is the PMS's (SUB_STATUSES in SettyPMS.html and the
 // Tracker): the old "In Review" / "Pending Sub Response" names never existed
 // there, so a submittal the PMS moved to Under Review lost its Log Review button.
-const SUB_OPEN_STATUSES = new Set(["Received", "Under Review", "Pending Sub Review", "Resubmittal Required"]);
+// Resubmittal Required is the contractor's move (stamped Revise and Resubmit /
+// Rejected): not open, matching the PMS and the Tracker. When the revision
+// arrives the item is set back to Received and gets its Log Review button again.
+const SUB_OPEN_STATUSES = new Set(["Received", "Under Review", "Pending Sub Review"]);
 
 // Populate the "Link to RFI/Submittal" dropdown on the main view. Lists only
 // OPEN artifacts (the user can't link to a closed RFI in a meaningful way).
