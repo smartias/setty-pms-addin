@@ -1013,6 +1013,7 @@ function getLoggedRfiSubArtifacts(project) {
         status: r.status || "Open",
         relationship: isSource ? "source" : "linked",
         aiReview: !!r.aiReview,
+        aiState: caAiState(r).state,
       });
     }
   }
@@ -1032,6 +1033,7 @@ function getLoggedRfiSubArtifacts(project) {
         status: s.status || "Received",
         relationship: isSource ? "source" : "linked",
         aiReview: !!s.aiReview,
+        aiState: caAiState(s).state,
       });
     }
   }
@@ -1251,7 +1253,7 @@ function openClaudeCaReview(id) {
   const r = (selectedProject.rfis || []).find(x => x.id === id);
   const s = r ? null : (selectedProject.submittals || []).find(x => x.id === id);
   if (!r && !s) { setStatus("actionStatus", "error", "Could not find that RFI/Submittal in the project cache."); return; }
-  openExternalUrl(buildCaReviewSeatUrl(r ? "rfi" : "sub", r || s));
+  sendCaReview(r ? "rfi" : "sub", id);
 }
 // Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
 // to the SharePoint folder when one is stored. Open RFIs/Submittals also get
@@ -1336,7 +1338,7 @@ function refreshLoggedArtifactChips() {
       const btnColor = a.kind === "rfi" ? "#1e40af" : "#6d28d9";
       const idAttr = a.id.replace(/"/g, "&quot;");
       actionHtml = `<button data-action="${action}" data-id="${idAttr}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>` +
-        `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">🤖 Send to Claude</button>`;
+        `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">${a.aiState === "ready" ? "🤖 Re-review" : (a.aiState === "waiting" || a.aiState === "stale") ? "⏳ Waiting for Claude · re-send" : "🤖 Send to Claude"}</button>`;
     }
     return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}</div>`;
   });
@@ -10692,6 +10694,77 @@ function classifyAiReviewOutcome(suggested, final) {
 const CA_SEV_COLOR = { "life-safety": "#e5534b", "agency": "#d4a72c", "cost": "#e8a03c", "rfi-bait": "#58a6ff", "polish": "#8b949e" };
 
 function _caListKey(kind) { return kind === "rfi" ? "rfis" : "submittals"; }
+// ── Claude review request state ─────────────────────────────────────────────
+// "Send to Claude" only opens a Claude tab, so the click records
+// aiReviewRequested {at, by} on the item (the PMS and the Tracker write the
+// same field) and the state is derived: none → waiting (sent, nothing back) →
+// stale (nothing back after CA_AI_STALE_MIN; usually the Claude tab was closed
+// before Enter, or the chat stalled) → ready (aiReview.at newer than the request).
+const CA_AI_STALE_MIN = 30;
+function caAiState(item) {
+  const req = item && item.aiReviewRequested, ai = item && item.aiReview;
+  const reqAt = req ? (Date.parse(req.at || "") || 0) : 0, aiAt = ai ? (Date.parse(ai.at || "") || 0) : 0;
+  if (reqAt && reqAt > aiAt) {
+    const mins = Math.max(0, Math.round((Date.now() - reqAt) / 60000));
+    return { state: mins >= CA_AI_STALE_MIN ? "stale" : "waiting", mins, by: String(req.by || "") };
+  }
+  return { state: ai ? "ready" : "none" };
+}
+function caAgoLabel(m) { return m < 1 ? "just now" : m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago"; }
+function caWhoName() {
+  try {
+    const a = window.settyAuth;
+    if (!a || !a.isSignedIn || !a.isSignedIn()) return "";
+    return String((a.displayName && a.displayName()) || (a.email && a.email()) || "").trim();
+  } catch (e) { return ""; }
+}
+// Record the request on the item (version-guarded save through the usual
+// path). Best-effort: the Claude tab is already open; a failed stamp only
+// means no ⏳ until the next try.
+async function markCaReviewRequested(kind, id) {
+  if (!selectedProject || !selectedProject.id) return false;
+  const key = _caListKey(kind);
+  const stamp = { at: new Date().toISOString(), by: caWhoName() || "(unknown)" };
+  try {
+    await applyLocalChangeAndSave(selectedProject.id, fresh => ({
+      ...fresh,
+      [key]: (fresh[key] || []).map(x => x.id === id ? { ...x, aiReviewRequested: stamp } : x),
+    }));
+    const rec = _caFindRecord(kind, id); if (rec) rec.aiReviewRequested = stamp;
+    return true;
+  } catch (e) { console.warn("[aiReview request] not recorded:", e.message); return false; }
+}
+// One entry point for every "Send to Claude" button: open the seat first (a
+// click-synchronous open stays out of pop-up blockers), then stamp and
+// refresh whatever is showing the item.
+function sendCaReview(kind, id) {
+  const record = _caFindRecord(kind, id);
+  if (!record) { setStatus("actionStatus", "error", "Could not find that RFI/Submittal in the project cache."); return; }
+  openExternalUrl(buildCaReviewSeatUrl(kind, record));
+  void markCaReviewRequested(kind, id).then(() => {
+    try { renderCaAiReviewPanel(kind, id); } catch (e) {}
+    try { refreshLoggedArtifactChips(); } catch (e) {}
+    startCaWaitPoll(kind, id);
+  });
+}
+// While the response / review view shows an item that is waiting on Claude,
+// look every 20 s and swap the panel in when the review lands.
+let _caWaitTimer = null;
+function startCaWaitPoll(kind, id) {
+  if (_caWaitTimer) { clearInterval(_caWaitTimer); _caWaitTimer = null; }
+  const rec = _caFindRecord(kind, id);
+  if (!rec || caAiState(rec).state === "ready" || caAiState(rec).state === "none") return;
+  const active = () => kind === "rfi" ? _activeResponseRfiId === id : _activeReviewSubId === id;
+  _caWaitTimer = setInterval(async () => {
+    if (!active()) { clearInterval(_caWaitTimer); _caWaitTimer = null; return; }
+    const fresh = await refreshCaRecordFromCloud(kind, id);
+    if (fresh && caAiState(fresh).state === "ready") {
+      clearInterval(_caWaitTimer); _caWaitTimer = null;
+      renderCaAiReviewPanel(kind, id);
+      setStatus(kind === "rfi" ? "rfiResponseStatusMsg" : "subReviewStatusMsg", "success", "🤖 Claude review ready — see the panel above.");
+    }
+  }, 20000);
+}
 function _caFindRecord(kind, id) { return ((selectedProject || {})[_caListKey(kind)] || []).find(x => x.id === id) || null; }
 function _caPanelEl(kind) { return document.getElementById(kind === "rfi" ? "rfiAiReviewPanel" : "subAiReviewPanel"); }
 function _caStatusElId(kind) { return kind === "rfi" ? "rfiResponseStatusMsg" : "subReviewStatusMsg"; }
@@ -10817,6 +10890,7 @@ function acceptCaAiStamp(id) {
 //    have no internal-notes field), optional "what changed & why" input,
 //    Dismiss + Re-review.
 function renderCaAiReviewPanel(kind, id) {
+  const esc0 = escHtml;
   const panel = _caPanelEl(kind);
   if (!panel) return;
   const record = _caFindRecord(kind, id);
@@ -10833,14 +10907,22 @@ function renderCaAiReviewPanel(kind, id) {
     ";border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--text,#e2e8f0);";
 
   if (!ai) {
+    const st = caAiState(record);
+    const waiting = st.state === "waiting" || st.state === "stale";
+    if (waiting) wrap.style.borderColor = "#d4a72c";
+    const lead = st.state === "stale"
+      ? `⏳ Sent to Claude ${esc0(caAgoLabel(st.mins))} and nothing has come back. Usually the Claude tab was closed before the request was sent, or the chat stalled part way: re-send it, or type "continue" in that chat.`
+      : st.state === "waiting"
+        ? `⏳ Sent to Claude${st.by ? " by " + esc0(st.by) : ""} ${esc0(caAgoLabel(st.mins))}. Waiting for the review — it usually takes a few minutes; this panel updates on its own.`
+        : `🤖 No Claude review on this ${isRFI ? "RFI" : "submittal"} yet.`;
     wrap.innerHTML =
       `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">` +
-      `<span style="color:var(--text-soft,#94a3b8);">🤖 No Claude review on this ${isRFI ? "RFI" : "submittal"} yet.</span>` +
-      `<button data-ca="send" style="background:#374151;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">Send to Claude for review</button>` +
+      `<span style="color:var(--text-soft,#94a3b8);flex:1 1 200px;">${lead}</span>` +
+      `<button data-ca="send" style="background:#374151;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">${waiting ? "Re-send" : "Send to Claude for review"}</button>` +
       `<button data-ca="check" style="background:none;color:var(--primary,#60a5fa);border:1px solid var(--border-strong,#475569);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">⟳ Check for review</button>` +
       `<span data-ca-note style="color:var(--text-soft,#94a3b8);font-size:11px;"></span>` +
       `</div>`;
-    wrap.querySelector('[data-ca="send"]').onclick = () => openExternalUrl(buildCaReviewSeatUrl(kind, record));
+    wrap.querySelector('[data-ca="send"]').onclick = () => sendCaReview(kind, id);
     wrap.querySelector('[data-ca="check"]').onclick = async (ev) => {
       const btn = ev.currentTarget; btn.disabled = true; btn.textContent = "⏳ Checking…";
       const fresh = await refreshCaRecordFromCloud(kind, id);
@@ -10953,7 +11035,7 @@ function renderCaAiReviewPanel(kind, id) {
   const whyEl = wrap.querySelector("#" + _caWhyInputId(kind));
   if (whyEl && prevWhy) whyEl.value = prevWhy;
   const on = (selAttr, fn) => { const b = wrap.querySelector(`[data-ca="${selAttr}"]`); if (b) b.onclick = fn; };
-  on("rereview", () => openExternalUrl(buildCaReviewSeatUrl(kind, record)));
+  on("rereview", () => sendCaReview(kind, record.id));
   on("dismiss", () => { void dismissCaAiReview(kind, id); });
   on("accept-resp", () => acceptCaAiResponse(kind, id));
   on("accept-stamp", () => acceptCaAiStamp(id));
@@ -11001,7 +11083,7 @@ function openRfiResponseView(rfiId) {
   { const w = document.getElementById(_caWhyInputId("rfi")); if (w) w.value = ""; }
   renderCaAiReviewPanel("rfi", rfiId);
   void refreshCaRecordFromCloud("rfi", rfiId).then(() => {
-    if (_activeResponseRfiId === rfiId) renderCaAiReviewPanel("rfi", rfiId);
+    if (_activeResponseRfiId === rfiId) { renderCaAiReviewPanel("rfi", rfiId); startCaWaitPoll("rfi", rfiId); }
   });
   showView("rfiResponseView");
 }
@@ -11576,7 +11658,7 @@ function openSubReviewView(subId) {
   { const w = document.getElementById(_caWhyInputId("sub")); if (w) w.value = ""; }
   renderCaAiReviewPanel("sub", subId);
   void refreshCaRecordFromCloud("sub", subId).then(() => {
-    if (_activeReviewSubId === subId) renderCaAiReviewPanel("sub", subId);
+    if (_activeReviewSubId === subId) { renderCaAiReviewPanel("sub", subId); startCaWaitPoll("sub", subId); }
   });
   showView("subReviewView");
 }
