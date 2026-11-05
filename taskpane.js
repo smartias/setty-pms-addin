@@ -886,6 +886,15 @@ function findSavedEmailRecord(project, msgId) {
   const candidateIds = getCurrentMessageIdCandidates();
   return _emailRowsFor(project).find(e => candidateIds.includes(e.msgId) || e.msgId === msgId) || null;
 }
+// "jane.doe@setty.com" -> "Jane Doe"; "you" when it is the signed-in user.
+function formatLoggedByName(savedBy) {
+  const raw = String(savedBy || "").trim();
+  if (!raw) return "";
+  if (raw.toLowerCase() === String(_getCurrentUserEmail() || "").toLowerCase()) return "you";
+  const local = raw.split("@")[0];
+  return local.split(/[._-]+/).filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") || raw;
+}
 function getLoggedEmailArtifactLabels(project) {
   if (!project || !emailItem?.itemId) return [];
   const labels = [];
@@ -1464,7 +1473,8 @@ function refreshEmailSavedIndicator(animate = false) {
   if (!wasFiledToSharePoint && hasAttachments) {
     applyEmailFlowEmphasis(); // keeps the SharePoint button visible for attachments
     if (confirmation) confirmation.style.display = "none";
-    setStatus("actionStatus", "success", "✓ Logged to project record — Save attachments to SharePoint below.");
+    const _by = formatLoggedByName(existing.savedBy);
+    setStatus("actionStatus", "success", "✓ Logged" + (_by ? " by " + _by : " to project record") + " — Save attachments to SharePoint below.");
     try { refreshLoggedArtifactChips(); } catch {}
     return;
   }
@@ -1480,7 +1490,8 @@ function refreshEmailSavedIndicator(animate = false) {
   const primary = wasFiledToSharePoint
     ? "Saved to SharePoint + project record"
     : "Logged to project record";
-  const secondaryParts = [`Filed ${savedDate}`];
+  const loggedBy = formatLoggedByName(existing.savedBy);
+  const secondaryParts = [loggedBy ? `Logged by ${loggedBy} · ${savedDate}` : `Filed ${savedDate}`];
   if (wasFiledToSharePoint && attCount && attCount > 0) {
     secondaryParts.push(`${attCount} file${attCount > 1 ? "s" : ""}`);
   } else if (!wasFiledToSharePoint && attCount && attCount > 0) {
@@ -2617,6 +2628,7 @@ function _mapEmailMetaRow(r) {
     date: r.email_date,
     spFolderUrl: r.sp_folder_url,
     savedAt: r.saved_at,
+    savedBy: r.saved_by || "",
     savedToSharePoint: !!r.saved_to_sharepoint,
   };
 }
@@ -2641,7 +2653,7 @@ async function ensureProjectEmailMeta(projectId, { force = false } = {}) {
   const promise = (async () => {
     const rows = await sbFetchAllRows(
       "pms_project_emails?project_id=eq." + encodeURIComponent(projectId) +
-      "&select=record_id,msg_id,conversation_id,subject,from_name,from_address,to_addresses,cc_addresses,email_date,sp_folder_url,saved_at,saved_to_sharepoint" +
+      "&select=record_id,msg_id,conversation_id,subject,from_name,from_address,to_addresses,cc_addresses,email_date,sp_folder_url,saved_at,saved_by,saved_to_sharepoint" +
       "&order=email_date.desc.nullslast,record_id.asc",
       "sb projectEmailMeta");
     const mapped = rows.map(_mapEmailMetaRow);
