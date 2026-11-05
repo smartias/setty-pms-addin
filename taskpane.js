@@ -9385,23 +9385,38 @@ function resolveAssignee(dropdownValue, project) {
 // professional. The recipient is being asked to respond to an RFI; the email
 // gives them the context, the question, and the SharePoint link to the
 // incoming RFI folder (so they can grab the attachments / forwarded email).
+// The reviewer gets the steps, not just the facts: where the item is (PMS
+// deep link), where the files are, where to write, how to issue it, and who
+// to tell if it is not theirs. Same wording as the PMS and the Tracker.
+function caAssignmentSteps({ kind, item, project, folderUrl }) {
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const isRFI = kind === "rfi";
+  const pmsUrl = project.id ? PMS_PROJECT_BASE_URL + encodeURIComponent(project.id) + ":" + (isRFI ? "rfi" : "submittal") + ":" + encodeURIComponent(item.number || "") : "";
+  const pm = (project.settyPm || "").trim();
+  const li = t => `<li style="margin:0 0 8px">${t}</li>`;
+  return `<div style="font-size:11px;font-weight:700;color:#1F3864;letter-spacing:1px;margin:14px 0 6px">WHAT TO DO</div>` +
+    `<ol style="margin:0 0 14px 18px;padding:0;line-height:1.45">` +
+    li((pmsUrl ? `<a href="${esc(pmsUrl)}">Open the item in the PMS</a>` : "Open the item in the PMS") +
+       `. Start with the Claude review box at the top: red flags first, then the suggested ${isRFI ? "answer" : "stamp and comments"} and the sheets it checked. Verify against the current set before you trust it.`) +
+    li(`The contractor's ${isRFI ? "question" : "submittal"} and attachments are in ` + (folderUrl ? `<a href="${esc(folderUrl)}">the SharePoint folder</a>` : `the SharePoint folder (no link yet; ask ${esc(pm) || "the sender"})`) + ".") +
+    li(isRFI ? `Write your answer in the <b>Response</b> field. <i>Copy into Response</i> takes the Claude suggestion if it is right; edit it until it is yours. Anything internal goes in <b>Internal notes</b>, which never leave the office.`
+             : `Pick the <b>Stamp</b> and write the <b>Review comments</b> that go back to the contractor. The status follows the stamp. Anything internal goes in <b>Internal notes</b>, which never leave the office.`) +
+    li(isRFI ? `Set <b>Responded</b> to today, Save, then <b>Email → Draft response email</b>: that opens the formal response for you to check and send. From Outlook, the same is <i>Log Response</i> on any email filed to this RFI.`
+             : `Set <b>Returned</b> to today, Save, then <b>Email → Draft return email</b>: that opens the return for you to check and send. From Outlook, the same is <i>Log Review</i> on any email filed to this submittal.`) +
+    li(`If this is not yours, or you cannot meet the date, tell ${esc(pm) || "the project manager"} today rather than on the due date.`) +
+    `</ol>`;
+}
 function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
   const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
-  const dueLine = rfi.dueDate ? `<p><strong>Due:</strong> ${esc(rfi.dueDate)}</p>` : "";
   const descLine = rfi.description ? `<p><strong>Question:</strong></p><p style="margin-left:12px">${esc(rfi.description).replace(/\n/g, "<br>")}</p>` : "";
-  const folderLine = inFolderUrl ? `<p><a href="${esc(inFolderUrl)}">📁 SharePoint folder (incoming)</a></p>` : "";
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
-    <p>Please review the attached RFI and respond by the due date.</p>
-    <p style="background:#eff6ff;border-left:3px solid #2563eb;padding:8px 12px;margin:12px 0;"><strong>📩 To respond:</strong> reply directly to this email with your answer.</p>
-    <p><strong>Project:</strong> ${esc(projLabel)}<br>
-       <strong>RFI:</strong> ${esc(rfi.number)} — ${esc(rfi.title || "")}<br>
-       <strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
+    <p>You have been assigned <b>${esc(rfi.number)}</b> — ${esc(rfi.title || "")} on ${esc(projLabel)}. Due back to the contractor <b>${esc(rfi.dueDate || "—")}</b>.</p>
+    ${caAssignmentSteps({ kind: "rfi", item: rfi, project, folderUrl: inFolderUrl || rfi.spFolderUrl })}
+    <p><strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
        <strong>From:</strong> ${esc(rfi.from || "—")}</p>
-    ${dueLine}
     ${descLine}
-    ${folderLine}
     <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
   `.trim();
 }
@@ -9411,20 +9426,14 @@ function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
 function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
   const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
-  const dueLine = sub.dueDate ? `<p><strong>Review by:</strong> ${esc(sub.dueDate)}</p>` : "";
-  const descLine = sub.description ? `<p><strong>Description:</strong></p><p style="margin-left:12px">${esc(sub.description).replace(/\n/g, "<br>")}</p>` : "";
-  const folderLine = inFolderUrl ? `<p><a href="${esc(inFolderUrl)}">📁 SharePoint folder (incoming)</a></p>` : "";
+  const descLine = sub.fullDescription || sub.description ? `<p><strong>Description:</strong></p><p style="margin-left:12px">${esc(sub.fullDescription || sub.description).replace(/\n/g, "<br>")}</p>` : "";
   return `
     <p>Hi ${esc(assignee?.name || "")},</p>
-    <p>Please review the attached submittal and return with stamp/comments by the due date.</p>
-    <p style="background:#f5f3ff;border-left:3px solid #7c3aed;padding:8px 12px;margin:12px 0;"><strong>📩 To return:</strong> reply directly to this email with your stamp + comments.</p>
-    <p><strong>Project:</strong> ${esc(projLabel)}<br>
-       <strong>Submittal:</strong> ${esc(sub.number)}${sub.specSection ? " · Spec " + esc(sub.specSection) : ""}<br>
-       <strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
+    <p>You have been assigned submittal <b>${esc(sub.number)}</b>${sub.specSection ? " (Spec " + esc(sub.specSection) + ")" : ""} — ${esc(sub.description || "")} on ${esc(projLabel)}. Due back to the contractor <b>${esc(sub.dueDate || "—")}</b>.</p>
+    ${caAssignmentSteps({ kind: "sub", item: sub, project, folderUrl: inFolderUrl || sub.spFolderUrl })}
+    <p><strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
        <strong>From:</strong> ${esc(sub.from || "—")}</p>
-    ${dueLine}
     ${descLine}
-    ${folderLine}
     <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
   `.trim();
 }
