@@ -9310,6 +9310,13 @@ function renderItemLinks(kind, item, project) {
   el.innerHTML = (folder ? `<a href="${escHtml(folder)}" target="_blank" rel="noreferrer">📂 Folder →</a>` : "") +
                  (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer">Open in PMS →</a>` : "");
   el.style.display = el.innerHTML ? "flex" : "none";
+  // Logging here emails the response; on a platform job the platform's own
+  // log still has to be closed. Say so where the person is about to press Log.
+  const g = caIssueGuide(project && project.caPortal && project.caPortal.platform, kind === "rfi");
+  let note = document.getElementById(el.id + "IssueNote");
+  if (!note) { note = document.createElement("div"); note.id = el.id + "IssueNote"; note.style.cssText = "font-size:11px;color:var(--text-soft,#94a3b8);line-height:1.4;margin:-4px 0 10px;"; el.insertAdjacentElement("afterend", note); }
+  note.textContent = g.where === "email" ? "" : "This job runs on " + g.where + ". " + g.how;
+  note.style.display = note.textContent ? "block" : "none";
 }
 // File-to-existing pickers: open items first, soonest due first, each with
 // its status and due date; closed ones after, under their own heading.
@@ -9388,6 +9395,17 @@ function resolveAssignee(dropdownValue, project) {
 // The reviewer gets the steps, not just the facts: where the item is (PMS
 // deep link), where the files are, where to write, how to issue it, and who
 // to tell if it is not theirs. Same wording as the PMS and the Tracker.
+// How a response leaves the building depends on the job's CA platform (same
+// wording as the PMS and the Tracker).
+function caIssueGuide(platform, isRFI) {
+  const p = String(platform || "").replace(/\?$/, "");
+  if (p === "Procore") return isRFI
+    ? { where: "Procore", how: "Reply in Procore (in the PMS): a reply to the Procore notification email, carrying the response, is logged by Procore as the RFI response." }
+    : { where: "Procore", how: "Procore submittals are returned in Procore: upload the stamped document and record the response there, then set the status to Returned (or Resubmittal Required)." };
+  if (p === "Client Portal") return { where: "the client portal", how: "Return via Portal (in the PMS) writes the " + (isRFI ? "response" : "stamped return") + " into the portal's Deliverables folder." };
+  if (p) return { where: p, how: "Post the " + (isRFI ? "response" : "review and stamp") + " in " + p + " so the contractor's log closes there. An email alone does not close " + p + "." };
+  return { where: "email", how: "Email the formal " + (isRFI ? "response" : "return") + " to the contractor." };
+}
 function caAssignmentSteps({ kind, item, project, folderUrl }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
   const isRFI = kind === "rfi";
@@ -9401,8 +9419,7 @@ function caAssignmentSteps({ kind, item, project, folderUrl }) {
     li(`The contractor's ${isRFI ? "question" : "submittal"} and attachments are in ` + (folderUrl ? `<a href="${esc(folderUrl)}">the SharePoint folder</a>` : `the SharePoint folder (no link yet; ask ${esc(pm) || "the sender"})`) + ".") +
     li(isRFI ? `Write your answer in the <b>Response</b> field. <i>Copy into Response</i> takes the Claude suggestion if it is right; edit it until it is yours. Anything internal goes in <b>Internal notes</b>, which never leave the office.`
              : `Pick the <b>Stamp</b> and write the <b>Review comments</b> that go back to the contractor. The status follows the stamp. Anything internal goes in <b>Internal notes</b>, which never leave the office.`) +
-    li(isRFI ? `Set <b>Responded</b> to today, Save, then <b>Email → Draft response email</b>: that opens the formal response for you to check and send. From Outlook, the same is <i>Log Response</i> on any email filed to this RFI.`
-             : `Set <b>Returned</b> to today, Save, then <b>Email → Draft return email</b>: that opens the return for you to check and send. From Outlook, the same is <i>Log Review</i> on any email filed to this submittal.`) +
+    li(`When your answer is final, either issue it yourself — the item's <b>Issue it</b> panel in the PMS shows how for this job (${esc(caIssueGuide(project.caPortal && project.caPortal.platform, isRFI).where)}) — or press <b>Answer ready — hand to CA</b> and ${esc(pm) || "the CA coordinator"} issues it. Issuing sets the status to ${isRFI ? "Responded" : "Returned"}.`) +
     li(`If this is not yours, or you cannot meet the date, tell ${esc(pm) || "the project manager"} today rather than on the due date.`) +
     `</ol>`;
 }
