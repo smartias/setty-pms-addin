@@ -1243,7 +1243,7 @@ function buildCaReviewSeatUrl(kind, record) {
   return "https://claude.ai/new?q=" + encodeURIComponent([
     "Review this " + (isRFI ? "RFI" : "submittal") + " for " + projLabel + ": " + (record.number || "(unnumbered)") + (subject ? " — \"" + subject + "\"" : "") + ".",
     "",
-    "Use the Setty PMS connector and the submittal-rfi-review skill: read it with read_rfi_submittal, review it against the current issued drawing set and the governing spec section, then save the suggested " + (isRFI ? "response" : "response and stamp") + ", internal notes, and cost/scope red flags with save_ca_review so they appear in the PMS for my sign-off." + (isRFI ? "" : " Open the submitted cut sheet (render it with view_drawing, or use the pdf-highlighted-selections skill if I attach the PDF) and confirm the MARKED selection — what's circled/highlighted/checked — against the spec and schedule basis of design; the marking is what you're reviewing, not just the notification metadata.") + " If it isn't logged in the PMS yet, backfill it from the filed PDF or notification email first with backload_ca_item. It was just logged from Outlook, so give the sync a moment if the first read misses it.",
+    "Use the Setty PMS connector and the submittal-rfi-review skill: call mark_ca_review_started for it first (so the PMS shows the review is under way), read it with read_rfi_submittal, review it against the current issued drawing set and the governing spec section, then save the suggested " + (isRFI ? "response" : "response and stamp") + ", internal notes, and cost/scope red flags with save_ca_review so they appear in the PMS for my sign-off." + (isRFI ? "" : " Open the submitted cut sheet (render it with view_drawing, or use the pdf-highlighted-selections skill if I attach the PDF) and confirm the MARKED selection — what's circled/highlighted/checked — against the spec and schedule basis of design; the marking is what you're reviewing, not just the notification metadata.") + " If it isn't logged in the PMS yet, backfill it from the filed PDF or notification email first with backload_ca_item. It was just logged from Outlook, so give the sync a moment if the first read misses it.",
   ].join("\n"));
 }
 // Chip-button handler: resolve the artifact by id in the selected project's
@@ -1338,7 +1338,7 @@ function refreshLoggedArtifactChips() {
       const btnColor = a.kind === "rfi" ? "#1e40af" : "#6d28d9";
       const idAttr = a.id.replace(/"/g, "&quot;");
       actionHtml = `<button data-action="${action}" data-id="${idAttr}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>` +
-        `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">${a.aiState === "ready" ? "🤖 Re-review" : (a.aiState === "waiting" || a.aiState === "stale") ? "⏳ Waiting for Claude · re-send" : "🤖 Send to Claude"}</button>`;
+        `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">${a.aiState === "ready" ? "🤖 Re-review" : a.aiState === "reviewing" ? "🤖 Claude is reviewing…" : a.aiState === "stalled" ? "⏳ Claude stalled · re-send" : a.aiState === "notstarted" ? "⏳ Claude hasn't started · re-send" : a.aiState === "waiting" ? "⏳ Waiting for Claude · re-send" : "🤖 Send to Claude"}</button>`;
     }
     return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}</div>`;
   });
@@ -10700,16 +10700,23 @@ function _caListKey(kind) { return kind === "rfi" ? "rfis" : "submittals"; }
 // same field) and the state is derived: none → waiting (sent, nothing back) →
 // stale (nothing back after CA_AI_STALE_MIN; usually the Claude tab was closed
 // before Enter, or the chat stalled) → ready (aiReview.at newer than the request).
-const CA_AI_STALE_MIN = 30;
+// Three stamps, five states. aiReviewStarted is written by the connector's
+// mark_ca_review_started (the review skill's first call), so "reviewing" means
+// Claude really has the item; "notstarted" after CA_AI_NOT_STARTED_MIN means
+// the request never reached Claude; "stalled" after CA_AI_STALE_MIN of
+// reviewing means the chat hung part way.
+const CA_AI_NOT_STARTED_MIN = 5, CA_AI_STALE_MIN = 30;
 function caAiState(item) {
-  const req = item && item.aiReviewRequested, ai = item && item.aiReview;
-  const reqAt = req ? (Date.parse(req.at || "") || 0) : 0, aiAt = ai ? (Date.parse(ai.at || "") || 0) : 0;
-  if (reqAt && reqAt > aiAt) {
-    const mins = Math.max(0, Math.round((Date.now() - reqAt) / 60000));
-    return { state: mins >= CA_AI_STALE_MIN ? "stale" : "waiting", mins, by: String(req.by || "") };
-  }
+  const req = item && item.aiReviewRequested, st = item && item.aiReviewStarted, ai = item && item.aiReview;
+  const t = x => x ? (Date.parse(x.at || "") || 0) : 0;
+  const reqAt = t(req), stAt = t(st), aiAt = t(ai);
+  const mins = from => Math.max(0, Math.round((Date.now() - from) / 60000));
+  const by = String((req && req.by) || "");
+  if (stAt > aiAt && stAt >= reqAt) { const m = mins(stAt); return { state: m >= CA_AI_STALE_MIN ? "stalled" : "reviewing", mins: m, by }; }
+  if (reqAt > aiAt) { const m = mins(reqAt); return { state: m >= CA_AI_NOT_STARTED_MIN ? "notstarted" : "waiting", mins: m, by }; }
   return { state: ai ? "ready" : "none" };
 }
+function caAiWaiting(item) { const st = caAiState(item).state; return st !== "ready" && st !== "none"; }
 function caAgoLabel(m) { return m < 1 ? "just now" : m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago"; }
 function caWhoName() {
   try {
@@ -10753,7 +10760,7 @@ let _caWaitTimer = null;
 function startCaWaitPoll(kind, id) {
   if (_caWaitTimer) { clearInterval(_caWaitTimer); _caWaitTimer = null; }
   const rec = _caFindRecord(kind, id);
-  if (!rec || caAiState(rec).state === "ready" || caAiState(rec).state === "none") return;
+  if (!rec || !caAiWaiting(rec)) return;
   const active = () => kind === "rfi" ? _activeResponseRfiId === id : _activeReviewSubId === id;
   _caWaitTimer = setInterval(async () => {
     if (!active()) { clearInterval(_caWaitTimer); _caWaitTimer = null; return; }
@@ -10908,12 +10915,17 @@ function renderCaAiReviewPanel(kind, id) {
 
   if (!ai) {
     const st = caAiState(record);
-    const waiting = st.state === "waiting" || st.state === "stale";
-    if (waiting) wrap.style.borderColor = "#d4a72c";
-    const lead = st.state === "stale"
-      ? `⏳ Sent to Claude ${esc0(caAgoLabel(st.mins))} and nothing has come back. Usually the Claude tab was closed before the request was sent, or the chat stalled part way: re-send it, or type "continue" in that chat.`
+    const waiting = caAiWaiting(record);
+    if (waiting) wrap.style.borderColor = st.state === "reviewing" ? "#4f8ff0" : "#d4a72c";
+    const ago = esc0(caAgoLabel(st.mins));
+    const lead = st.state === "reviewing"
+      ? `🤖 Claude is reviewing — started ${ago}. It usually takes a few minutes; this panel updates on its own when the review lands.`
+      : st.state === "stalled"
+        ? `⏳ Claude started this review ${ago} and has not finished. The chat probably stalled: type "continue" in that Claude tab, or re-send.`
+      : st.state === "notstarted"
+        ? `⏳ Sent to Claude ${ago} and Claude has not started it. Usually the Claude tab was closed before the request was sent: press Enter in that tab, or re-send.`
       : st.state === "waiting"
-        ? `⏳ Sent to Claude${st.by ? " by " + esc0(st.by) : ""} ${esc0(caAgoLabel(st.mins))}. Waiting for the review — it usually takes a few minutes; this panel updates on its own.`
+        ? `⏳ Sent to Claude${st.by ? " by " + esc0(st.by) : ""} ${ago}. Waiting for Claude to pick it up — this panel updates on its own.`
         : `🤖 No Claude review on this ${isRFI ? "RFI" : "submittal"} yet.`;
     wrap.innerHTML =
       `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">` +
