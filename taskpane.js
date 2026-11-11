@@ -1014,6 +1014,7 @@ function getLoggedRfiSubArtifacts(project) {
         relationship: isSource ? "source" : "linked",
         aiReview: !!r.aiReview,
         aiState: caAiState(r).state,
+        assignedTo: Array.isArray(r.assignedTo) ? r.assignedTo : [],
       });
     }
   }
@@ -1034,6 +1035,7 @@ function getLoggedRfiSubArtifacts(project) {
         relationship: isSource ? "source" : "linked",
         aiReview: !!s.aiReview,
         aiState: caAiState(s).state,
+        assignedTo: Array.isArray(s.assignedTo) ? s.assignedTo : [],
       });
     }
   }
@@ -1255,6 +1257,92 @@ function openClaudeCaReview(id) {
   if (!r && !s) { setStatus("actionStatus", "error", "Could not find that RFI/Submittal in the project cache."); return; }
   sendCaReview(r ? "rfi" : "sub", id);
 }
+// ── Assign from the chip row ────────────────────────────────────────────────
+// Inline picker under the "Logged as" chip: tick the engineers, save
+// assignedTo on the item and open the assignment email in Outlook. Policy
+// (same as the PMS and the Tracker): the item goes to an engineer with the
+// Claude review already on it — no review yet → warn, offer Send to Claude,
+// and let the person assign anyway. `force` is the "Assign anyway" re-render.
+function openChipAssignPanel(kind, id, force) {
+  const container = document.getElementById("loggedAsArtifactChips");
+  const panel = container && container.querySelector(`[data-assign-panel="${CSS.escape(id)}"]`);
+  const record = _caFindRecord(kind, id);
+  if (!panel || !record || !selectedProject) return;
+  // Second click on the same button folds the panel away.
+  if (panel.style.display !== "none" && !force) { panel.style.display = "none"; panel.innerHTML = ""; return; }
+  const isRFI = kind === "rfi";
+  const team = (selectedProject.teamMembers || []).filter(m => m && (m.name || m.role) && m.id);
+  const current = new Set(Array.isArray(record.assignedTo) ? record.assignedTo : []);
+  const box = "border:1px solid var(--border-strong);border-radius:8px;padding:8px 10px;margin:4px 0 2px;background:var(--primary-soft);font-size:12px;";
+  if (!record.aiReview && !force) {
+    const st = caAiState(record);
+    const waiting = caAiWaiting(record);
+    panel.innerHTML =
+      `<div style="${box}border-color:#e0b252;background:var(--warn-bg);color:var(--warn);">` +
+        `<div style="margin-bottom:6px;">🤖 No Claude review on this ${isRFI ? "RFI" : "submittal"} yet${waiting ? " (sent " + escHtml(caAgoLabel(st.mins)) + ", still waiting)" : ""}. ` +
+        `Send it for review first, so the engineer opens it with the red flags and a drafted ${isRFI ? "answer" : "stamp"} already on it.</div>` +
+        `<div style="display:flex;gap:8px;flex-wrap:wrap;">` +
+          `<button type="button" data-assign="send" style="background:#374151;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">🤖 ${waiting ? "Re-send to Claude" : "Send to Claude"}</button>` +
+          `<button type="button" data-assign="anyway" title="Open the picker without a Claude review on the item" style="background:none;color:var(--warn);border:1px solid #e0b252;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">Assign anyway</button>` +
+          `<button type="button" data-assign="cancel" style="background:none;color:var(--text-soft);border:none;font-size:11px;cursor:pointer;">Cancel</button>` +
+        `</div>` +
+      `</div>`;
+    panel.style.display = "block";
+    panel.querySelector('[data-assign="send"]').onclick = () => { panel.style.display = "none"; panel.innerHTML = ""; sendCaReview(kind, id); };
+    panel.querySelector('[data-assign="anyway"]').onclick = () => openChipAssignPanel(kind, id, true);
+    panel.querySelector('[data-assign="cancel"]').onclick = () => { panel.style.display = "none"; panel.innerHTML = ""; };
+    return;
+  }
+  const rows = team.length
+    ? team.map(m => `<label style="display:flex;align-items:center;gap:6px;margin:2px 0;cursor:pointer;"><input type="checkbox" value="${escHtml(m.id)}"${current.has(m.id) ? " checked" : ""}> ${escHtml(m.name || m.role || "Unnamed")}${m.role && m.name ? ` <span style="color:var(--text-soft);">· ${escHtml(m.role)}</span>` : ""}${m.email ? "" : ` <span style="color:var(--warn);font-size:10px;">(no email on file)</span>`}</label>`).join("")
+    : `<span style="color:var(--text-soft);">No team members on this project — add them in the PMS.</span>`;
+  panel.innerHTML =
+    `<div style="${box}">` +
+      `<div style="font-weight:700;margin-bottom:4px;">Assign ${escHtml(record.number || "")} to ${isRFI ? "(tick everyone who owns the answer)" : "(tick everyone who reviews it)"}</div>` +
+      `<div data-assign="list">${rows}</div>` +
+      `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;">` +
+        `<button type="button" data-assign="save" ${team.length ? "" : "disabled"} style="background:#1e40af;color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">✉ Save & open email</button>` +
+        `<button type="button" data-assign="cancel" style="background:none;color:var(--text-soft);border:none;font-size:11px;cursor:pointer;">Cancel</button>` +
+        `<span data-assign="note" style="font-size:11px;color:var(--text-soft);">${record.aiReview ? "The email carries the Claude review and the WHAT TO DO steps." : "No Claude review on the item — the email carries the WHAT TO DO steps only."}</span>` +
+      `</div>` +
+    `</div>`;
+  panel.style.display = "block";
+  panel.querySelector('[data-assign="cancel"]').onclick = () => { panel.style.display = "none"; panel.innerHTML = ""; };
+  panel.querySelector('[data-assign="save"]').onclick = async (ev) => {
+    const btn = ev.currentTarget;
+    const ids = [...panel.querySelectorAll('[data-assign="list"] input[type="checkbox"]:checked')].map(c => c.value);
+    const note = panel.querySelector('[data-assign="note"]');
+    if (!ids.length) { if (note) note.textContent = "Tick at least one person."; return; }
+    btn.disabled = true; btn.textContent = "Saving…";
+    try {
+      await applyLocalChangeAndSave(selectedProject.id, (p) => {
+        const key = _caListKey(kind);
+        p[key] = (p[key] || []).map(r => r.id === id ? { ...r, assignedTo: ids } : r);
+        return p;
+      });
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "✉ Save & open email";
+      if (note) note.textContent = "✗ " + (e.message || "Save failed");
+      return;
+    }
+    const fresh = _caFindRecord(kind, id) || record;
+    const recips = assigneeRecipients(ids, selectedProject);
+    if (!recips.length) {
+      setStatus("actionStatus", "success", `Assigned ${fresh.number || ""} — nobody ticked has an email on file, so no draft was opened.`);
+      refreshLoggedArtifactChips();
+      return;
+    }
+    const subject = `${fresh.number || ""} · ${selectedProject.projectNumber || ""} · ${isRFI ? (fresh.title || "") : (fresh.description || "")}`.trim();
+    const htmlBody = isRFI
+      ? buildRfiAssignmentEmailHtml({ rfi: fresh, project: selectedProject, assignee: recips[0], inFolderUrl: fresh.spFolderUrl })
+      : buildSubAssignmentEmailHtml({ sub: fresh, project: selectedProject, assignee: recips[0], inFolderUrl: fresh.spFolderUrl });
+    const ok = openComposeDraft({ toList: recips, subject, htmlBody });
+    setStatus("actionStatus", ok ? "success" : "error", ok
+      ? `Assigned ${fresh.number || ""} to ${recips.map(r => r.name).join(", ")} — the email is open in Outlook; read it over and send.`
+      : `Assigned ${fresh.number || ""}, but Outlook could not open the draft. Open the item in the PMS and use Email → Assignment there.`);
+    refreshLoggedArtifactChips();
+  };
+}
 // Render the "Logged as RFI-XXX / SUB-XXX" chips on the main view. Chips link
 // to the SharePoint folder when one is stored. Open RFIs/Submittals also get
 // a "Log Response" / "Log Review" button and a "Send to Claude" review button
@@ -1340,7 +1428,27 @@ function refreshLoggedArtifactChips() {
       actionHtml = `<button data-action="${action}" data-id="${idAttr}" style="align-self:flex-start;background:${btnColor};color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;margin-left:6px;">${label}</button>` +
         `<button data-action="claude-ca-review" data-id="${idAttr}" title="Opens your Claude seat prefilled to review this ${a.kind === "rfi" ? "RFI" : "submittal"} and save a suggested ${a.kind === "rfi" ? "response" : "response + stamp"} back to the PMS" style="align-self:flex-start;background:#374151;color:white;border:none;border-radius:6px;padding:5px 12px;font-size:11px;font-weight:600;cursor:pointer;">${a.aiState === "ready" ? "🤖 Re-review" : a.aiState === "reviewing" ? "🤖 Claude is reviewing…" : a.aiState === "stalled" ? "⏳ Claude stalled · re-send" : a.aiState === "notstarted" ? "⏳ Claude hasn't started · re-send" : a.aiState === "waiting" ? "⏳ Waiting for Claude · re-send" : "🤖 Send to Claude"}</button>`;
     }
-    return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}</div>`;
+    // Open items also get the PMS deep link and the assignment action, so the
+    // person who logged the item can hand it to an engineer from Outlook once
+    // the Claude review is on it (same policy as the PMS and the Tracker).
+    let assignHtml = "";
+    if (isOpen) {
+      const idAttr = a.id.replace(/"/g, "&quot;");
+      const pmsUrl = selectedProject.id
+        ? PMS_PROJECT_BASE_URL + encodeURIComponent(selectedProject.id) + ":" + (a.kind === "rfi" ? "rfi" : "submittal") + ":" + encodeURIComponent(a.number || "")
+        : "";
+      const names = (a.assignedTo || []).map(id => (selectedProject.teamMembers || []).find(m => m.id === id)).filter(Boolean)
+        .map(m => m.name || m.role || "").filter(Boolean);
+      const who = names.length ? `<span style="font-size:11px;color:var(--text-soft);">→ ${escHtml(names.join(", "))}</span>` : "";
+      assignHtml =
+        `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-left:4px;">` +
+          (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none;">Open in PMS →</a>` : "") +
+          `<button type="button" data-action="assign-ca" data-kind="${a.kind}" data-id="${idAttr}" title="Pick who answers this ${a.kind === "rfi" ? "RFI" : "submittal"}, save it on the item and open the assignment email in Outlook" style="background:none;color:var(--primary);border:1px solid var(--border-strong);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">✉ ${names.length ? "Reassign / email…" : "Assign…"}</button>` +
+          who +
+        `</div>` +
+        `<div data-assign-panel="${idAttr}" style="display:none;flex-basis:100%;"></div>`;
+    }
+    return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;">${chipHtml}${actionHtml}${assignHtml}</div>`;
   });
   container.innerHTML = rowsHtml.join("");
   // Event delegation: one click listener handles all action buttons.
@@ -1353,6 +1461,7 @@ function refreshLoggedArtifactChips() {
     if (action === "log-rfi-response") openRfiResponseView(id);
     else if (action === "log-sub-review") openSubReviewView(id);
     else if (action === "claude-ca-review") openClaudeCaReview(id);
+    else if (action === "assign-ca") openChipAssignPanel(btn.getAttribute("data-kind"), id);
   };
   // Chips present → the email is logged; the portal banner must not offer it again.
   try { renderPortalIntakeBanner(); } catch (e) {}
@@ -9423,6 +9532,25 @@ function caAssignmentSteps({ kind, item, project, folderUrl }) {
     li(`If this is not yours, or you cannot meet the date, tell ${esc(pm) || "the project manager"} today rather than on the due date.`) +
     `</ol>`;
 }
+// Claude review section for the INTERNAL assignment email (same content as
+// the Tracker's caAiEmailText(true)). Never used in a draft to a
+// subconsultant or contractor: internal notes are included.
+function caAiEmailHtml(kind, ai) {
+  if (!ai) return "";
+  const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
+  const nl = (s) => esc(s).replace(/\n/g, "<br>");
+  const isRFI = kind === "rfi";
+  const links = Array.isArray(ai.docLinks) ? ai.docLinks.filter(l => l && /^https:\/\//i.test(l.url)) : [];
+  const flags = Array.isArray(ai.redFlags) ? ai.redFlags.filter(Boolean) : [];
+  let h = `<div style="font-size:11px;font-weight:700;color:#1F3864;letter-spacing:1px;margin:14px 0 6px">CLAUDE REVIEW (suggestions pending your sign-off in the PMS)</div>`;
+  if (ai.reviewedAgainstSet) h += `<p style="margin:0 0 6px"><strong>Reviewed against:</strong> ${esc(ai.reviewedAgainstSet)}</p>`;
+  if (flags.length) h += `<p style="margin:0 0 4px"><strong>Red flags:</strong></p><ul style="margin:0 0 8px 18px">${flags.map(f => `<li>${nl(typeof f === "string" ? f : (f.text || f.note || JSON.stringify(f)))}</li>`).join("")}</ul>`;
+  if (!isRFI && ai.suggestedStamp) h += `<p style="margin:0 0 6px"><strong>Suggested stamp:</strong> ${esc(ai.suggestedStamp)}</p>`;
+  if (ai.suggestedResponse) h += `<p style="margin:0 0 4px"><strong>Suggested ${isRFI ? "response" : "review comments"}:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.suggestedResponse)}</p>`;
+  if (ai.internalNotes) h += `<p style="margin:0 0 4px"><strong>Internal notes — verify before returning:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.internalNotes)}</p>`;
+  if (links.length) h += `<p style="margin:0 0 4px"><strong>References:</strong></p><ul style="margin:0 0 8px 18px">${links.map(l => `<li>${l.kind === "spec" ? "Spec " : ""}<a href="${esc(l.url)}">${esc(l.label || l.url)}</a></li>`).join("")}</ul>`;
+  return h;
+}
 function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
   const esc = (s) => String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" })[c]);
   const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
@@ -9434,6 +9562,7 @@ function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
     <p><strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
        <strong>From:</strong> ${esc(rfi.from || "—")}</p>
     ${descLine}
+    ${caAiEmailHtml("rfi", rfi.aiReview)}
     <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
   `.trim();
 }
@@ -9451,6 +9580,7 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
     <p><strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
        <strong>From:</strong> ${esc(sub.from || "—")}</p>
     ${descLine}
+    ${caAiEmailHtml("sub", sub.aiReview)}
     <p>Thanks,<br>${esc(msalAccount?.name || "")}</p>
   `.trim();
 }
@@ -11661,14 +11791,25 @@ function showArtifactDone(d, fallbackMsg) {
         : "") +
       `<span style="font-size:11px;color:var(--text-soft);">${d.assignDraft
         ? "Policy: 🤖 “Send to Claude” below first, then email the assignees so they open it with the review on it."
-        : "🤖 “Send to Claude” below drafts the " + (d.kind === "rfi" ? "response" : "review") + "."}</span>` +
+        : "🤖 “Send to Claude” below drafts the " + (d.kind === "rfi" ? "response" : "review") + ", then ✉ Assign… hands it to an engineer."}</span>` +
     `</div>`;
   el.style.display = "block";
   // The assignment draft is prepared at log time but opened only on request
   // (Claude review first). Stays on the done block until the next log.
   const emailBtn = document.getElementById("artifactDoneEmailBtn");
   if (emailBtn && d.assignDraft) emailBtn.onclick = () => {
-    const ok = openComposeDraft(d.assignDraft);
+    // Rebuilt at click time: the draft was prepared at log time, before the
+    // Claude review, and the policy is to email after the review lands.
+    let draft = d.assignDraft;
+    try {
+      const rec = (selectedProject && selectedProject.id === d.projectId)
+        ? ((selectedProject[d.kind === "rfi" ? "rfis" : "submittals"] || []).find(x => x.number === d.number) || null) : null;
+      if (rec && rec.aiReview) {
+        const args = { project: selectedProject, assignee: draft.toList[0], inFolderUrl: d.folderUrl || rec.spFolderUrl };
+        draft = { ...draft, htmlBody: d.kind === "rfi" ? buildRfiAssignmentEmailHtml({ rfi: rec, ...args }) : buildSubAssignmentEmailHtml({ sub: rec, ...args }) };
+      }
+    } catch (e) { console.warn("[assign-draft] rebuild failed:", e.message); }
+    const ok = openComposeDraft(draft);
     emailBtn.disabled = true;
     emailBtn.textContent = ok ? "✉ Draft opened" : "✉ Could not open a draft";
   };
