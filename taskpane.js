@@ -77,6 +77,48 @@ let itemContextGeneration = 0;
 // Save in-flight flag — prevents double-clicks on save buttons from launching
 // parallel save paths that race the version counter and produce phantom errors.
 let saveInFlight = false;
+// When and why the lock was taken, so a stuck save can be named and, after
+// SAVE_LOCK_STALE_MS, released instead of locking the user out of every
+// save until they close the pane (a hung network call or an Office callback
+// that never fires keeps the awaiting function — and the lock — alive forever).
+let saveInFlightSince = 0;
+let saveInFlightName = "";
+const SAVE_LOCK_STALE_MS = 3 * 60 * 1000;
+function _takeSaveLock(name) { saveInFlight = true; saveInFlightSince = Date.now(); saveInFlightName = name || "another save"; }
+function _releaseSaveLock() { saveInFlight = false; saveInFlightSince = 0; saveInFlightName = ""; }
+// Gate for every save entry point. True = still busy, caller returns. A lock
+// older than SAVE_LOCK_STALE_MS is treated as stuck and cleared so the new
+// save can run (the stuck one, if it ever finishes, still goes through the
+// version guard like any other save). After 20 s the busy message offers a
+// manual reset for the user who can see it is stuck.
+function saveLockBusy(statusElId) {
+  if (!saveInFlight) return false;
+  const ageMs = Date.now() - (saveInFlightSince || Date.now());
+  const what = saveInFlightName || "another save";
+  if (ageMs >= SAVE_LOCK_STALE_MS) {
+    console.warn("[save-lock] " + what + " held the save lock for " + Math.round(ageMs / 1000) + "s — treating it as stuck and releasing it.");
+    _releaseSaveLock();
+    return false;
+  }
+  const ago = ageMs < 60000 ? Math.round(ageMs / 1000) + " s ago" : Math.round(ageMs / 60000) + " min ago";
+  setStatus(statusElId, "info", "⏳ Still busy with " + what + " (started " + ago + "). Wait a moment and try again.");
+  if (ageMs > 20000) {
+    const el = document.getElementById(statusElId);
+    if (el) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Stuck? Reset and try again";
+      btn.style.cssText = "margin-left:8px;background:none;border:1px solid var(--border-strong);border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;cursor:pointer;color:var(--primary);";
+      btn.onclick = () => {
+        console.warn("[save-lock] user reset the save lock held by " + what + " for " + Math.round((Date.now() - saveInFlightSince) / 1000) + "s");
+        _releaseSaveLock();
+        setStatus(statusElId, "info", "Cleared. Click the save button again.");
+      };
+      el.appendChild(btn);
+    }
+  }
+  return true;
+}
 // Hardcoded SharePoint IDs — eliminates Sites.Read.All (the only admin-consent scope).
 // Retrieved once via https://setty.sharepoint.com/sites/NYCProjects/_api/v2.0/drives
 const SP_SITE_ID_HARDCODED  = "setty.sharepoint.com,aa580464-13e9-4eb4-8ad4-ca6ff5b9e001,c97a67e8-fb1b-4a23-a29a-753a5d57d410";
@@ -1520,8 +1562,8 @@ function refreshOpenActionItemChips() {
 }
 async function markActionItemDone(noteId) {
   if (!selectedProject || !noteId) return;
-  if (saveInFlight) { setStatus("actionStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  saveInFlight = true;
+  if (saveLockBusy("actionStatus")) return;
+  _takeSaveLock("closing an action item");
   setStatus("actionStatus", "info", "⏳ Closing action item…");
   try {
     await applyLocalChangeAndSave(selectedProject.id, fresh => ({
@@ -1536,7 +1578,7 @@ async function markActionItemDone(noteId) {
   } catch (e) {
     setStatus("actionStatus", "error", "✗ " + humanizeError(e));
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 
@@ -4093,9 +4135,9 @@ async function autoSaveEmailToRecord() {
     if (!selectedProject) return;
     if (findSavedEmailRecord(selectedProject, msgId)) return; // the save we waited on logged it
     _autoSavingMsgId = msgId;
-    saveInFlight = true; // hold the lock so a user click can't race US either
+    _takeSaveLock("the automatic filing of this email"); // hold the lock so a user click can't race US either
     try { await _doSaveToProjectRecordOnly(true); }            // quiet — no celebrate/status
-    finally { saveInFlight = false; _autoSavingMsgId = null; }
+    finally { _releaseSaveLock(); _autoSavingMsgId = null; }
     void backfillCurrentConversationOutbound(selectedProject); // catch our sent replies too
   } catch (e) {
     console.warn("auto-save failed:", e);
@@ -4173,7 +4215,7 @@ async function backfillConversationOutbound(project, conversationId) {
       await new Promise(r => setTimeout(r, 500));
     }
     if (saveInFlight) { _backfilledConvos.delete(guardKey); return; }
-    saveInFlight = true;
+    _takeSaveLock("filing your sent replies on this thread");
     try {
       await applyLocalChangeAndSave(project.id, fresh => {
         const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
@@ -4186,7 +4228,7 @@ async function backfillConversationOutbound(project, conversationId) {
         try { await saveProjectEmailRow(project.id, r, false, conversationId); }
         catch (e) { console.warn("[backfill] index write failed:", e?.message || e); }
       }
-    } finally { saveInFlight = false; }
+    } finally { _releaseSaveLock(); }
     console.log("[backfill] filed " + records.length + " sent message(s) from this thread to " + (project.name || project.id));
     setStatus("actionStatus", "success",
       "✓ Also logged " + records.length + " sent repl" + (records.length === 1 ? "y" : "ies") + " from this thread.");
@@ -4302,8 +4344,8 @@ function renderMilestoneEventCard() {
 }
 
 async function completeMilestoneFromEvent(projectId, mid) {
-  if (saveInFlight) { setStatus("milestoneEventStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  saveInFlight = true;
+  if (saveLockBusy("milestoneEventStatus")) return;
+  _takeSaveLock("marking a milestone complete");
   setStatus("milestoneEventStatus", "info", "⏳ Marking complete…");
   let flaggedInvoice = false;
   try {
@@ -4332,7 +4374,7 @@ async function completeMilestoneFromEvent(projectId, mid) {
   } catch (e) {
     setStatus("milestoneEventStatus", "error", "✗ " + humanizeError(e));
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 async function restoreProjectSelectionForCurrentEmail() {
@@ -6703,23 +6745,25 @@ function updatePeopleButtonBadge() {
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
 // 503, 504. Honors Retry-After if Graph or Supabase provides it. Capped at
 // 15s per wait so the taskpane never appears hung.
-// A stalled connection (VPN hiccup, laptop waking up) never rejects on its own:
-// the browser can sit on it for minutes, and the retry loop below never gets a
-// turn. timeoutMs aborts the attempt (headers AND body read) so it does.
-// Opt-in per call site — byte uploads/downloads legitimately run long.
-async function _fetchWithTimeout(url, init, timeoutMs) {
-  if (!timeoutMs || typeof AbortController !== "function") return fetch(url, init);
-  const ctl = new AbortController();
-  // Deliberately NOT cleared on success: the timer also bounds the caller's
-  // res.json()/text() body read. Aborting an already-consumed response is a no-op.
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+// A request that never completes (dropped VPN, proxy black hole) used to hang
+// the awaiting save — and the process-wide save lock — forever. Abort each
+// attempt after timeoutMs (default 2 min; chunk uploads pass more) so it
+// becomes a retry, then an error the user can see and act on.
+function _timeoutSignal(ms) {
   try {
-    return await fetch(url, { ...init, signal: ctl.signal });
-  } catch (e) {
-    clearTimeout(timer);
-    if (e?.name === "AbortError") throw new Error("request timed out after " + Math.round(timeoutMs / 1000) + "s");
-    throw e;
-  }
+    if (typeof AbortController === "undefined") return undefined;
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(new Error("timed out after " + Math.max(1, Math.round(ms / 1000)) + " s")), ms);
+    return ac.signal;
+  } catch { return undefined; }
+}
+// Promise wrapper for Office.js callbacks that occasionally never fire
+// (getAsync / getAttachmentsAsync / getAllInternetHeadersAsync): resolve with
+// the fallback after ms so a save degrades to the Graph path instead of hanging.
+function withTimeout(promise, ms, fallback) {
+  let t;
+  const timer = new Promise(resolve => { t = setTimeout(() => resolve(fallback), ms); });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(t));
 }
 // Bound a best-effort step. Rejects on timeout; the step itself keeps running
 // in the background (nothing here is cancellable) but no longer blocks the save.
@@ -6734,10 +6778,12 @@ function _withTimeLimit(promise, ms, label) {
 async function fetchWithRetry(url, init, opts = {}) {
   const maxAttempts = opts.maxAttempts ?? 3;
   const label = opts.label || "fetch";
+  const timeoutMs = opts.timeoutMs ?? 120000;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await _fetchWithTimeout(url, init, opts.timeoutMs);
+      const signal = (init && init.signal) || _timeoutSignal(timeoutMs);
+      const res = await fetch(url, signal ? { ...init, signal } : init);
       if (res.status === 429 || res.status === 503 || res.status === 504) {
         if (attempt === maxAttempts) return res;
         const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
@@ -6802,8 +6848,7 @@ function clearEmailBodyCache() { _emailBodyCache.clear(); }
 // archive-copy time (a 2021 email can read as 2023), so prefer the internet "Date:"
 // header — the real send date Outlook shows. Falls back to dateTimeCreated.
 async function getEmailDateReliable() {
-  const headerDate = await new Promise(resolve => {
-    setTimeout(() => resolve(""), 4000); // never hang a save on a stuck header fetch
+  const headerDate = await withTimeout(new Promise(resolve => {
     try {
       if (!emailItem?.getAllInternetHeadersAsync) return resolve("");
       emailItem.getAllInternetHeadersAsync(r => {
@@ -6812,7 +6857,7 @@ async function getEmailDateReliable() {
         resolve(m ? m[1].trim() : "");
       });
     } catch { resolve(""); }
-  });
+  }), 6000, "");
   if (headerDate) {
     const d = new Date(headerDate);
     if (!isNaN(d.getTime())) return d.toISOString();
@@ -6843,13 +6888,12 @@ async function getEmailBodyHtml(token, itemSnapshot) {
   //    right after an item opens, so retry with short backoff.
   if (!body && item?.body?.getAsync) {
     for (let i = 0; i < 3 && !body; i++) {
-      body = await new Promise(resolve => {
-        setTimeout(() => resolve(""), 6000); // Office.js sometimes never calls back
+      body = await withTimeout(new Promise(resolve => {
         try {
           item.body.getAsync(Office.CoercionType.Html, r =>
             resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : ""));
         } catch { resolve(""); }
-      });
+      }), 8000, "");
       if (!body && i < 2) await new Promise(res => setTimeout(res, 300 * (i + 1)));
     }
   }
@@ -7087,13 +7131,13 @@ async function rewriteCidToOneNoteParts(html, imgs) {
 // route failed; "" is a genuinely empty body.
 async function getBodyTextReliable(item, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
-    const text = await new Promise(resolve => {
+    const text = await withTimeout(new Promise(resolve => {
       try {
         if (!item?.body?.getAsync) return resolve(null);
         item.body.getAsync(Office.CoercionType.Text, r =>
           resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : null));
       } catch { resolve(null); }
-    });
+    }), 8000, null);
     if (text !== null) return text;
     if (i < attempts - 1) await new Promise(res => setTimeout(res, 300 * (i + 1)));
   }
@@ -7907,8 +7951,7 @@ async function getAttachmentNamesOnly(item, token) {
   item = item || emailItem;
   // Try Office.js first
   if (item?.getAttachmentsAsync) {
-    const officeNames = await new Promise((resolve) => {
-      setTimeout(() => resolve([]), 6000); // Office.js sometimes never calls back; Graph fallback below
+    const officeNames = await withTimeout(new Promise((resolve) => {
       item.getAttachmentsAsync((res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) {
           const names = (res.value || [])
@@ -7920,7 +7963,7 @@ async function getAttachmentNamesOnly(item, token) {
           resolve([]);
         }
       });
-    });
+    }), 8000, []);
     if (officeNames.length > 0) return officeNames;
   }
   // Graph fallback — only if Office.js gave us nothing AND caller provided a token
@@ -7943,12 +7986,12 @@ async function getAttachmentNamesOnly(item, token) {
 async function getOfficeFileAttachments(item) {
   item = item || emailItem;
   if (!item?.getAttachmentsAsync || !item?.getAttachmentContentAsync) return [];
-  const atts = await new Promise((resolve, reject) => {
+  const atts = await withTimeout(new Promise((resolve, reject) => {
     item.getAttachmentsAsync((res) => {
       if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value || []);
       else reject(new Error(res.error?.message || "getAttachmentsAsync failed"));
     });
-  });
+  }), 10000, Promise.reject(new Error("getAttachmentsAsync did not answer in 10 s")));
   const fileAtts = atts.filter(att => att.attachmentType === Office.MailboxEnums.AttachmentType.File);
   // Fetch attachment bytes with bounded concurrency. This used to be a serial
   // for..await loop — with several attachments (esp. in Outlook on the web,
@@ -7960,13 +8003,13 @@ async function getOfficeFileAttachments(item) {
   const contents = new Array(fileAtts.length).fill(null);
   for (let i = 0; i < fileAtts.length; i += FETCH_CONCURRENCY) {
     const batch = fileAtts.slice(i, i + FETCH_CONCURRENCY);
-    await Promise.all(batch.map((att, bi) => new Promise((resolve, reject) => {
+    await Promise.all(batch.map((att, bi) => withTimeout(new Promise((resolve, reject) => {
       // CRITICAL: use the captured `item`, not the live module global.
       item.getAttachmentContentAsync(att.id, (res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) resolve(res.value);
         else reject(new Error(res.error?.message || "getAttachmentContentAsync failed"));
       });
-    }).then(content => { contents[i + bi] = content; })
+    }), 90000, null).then(content => { if (content === null) throw new Error("getAttachmentContentAsync did not answer in 90 s"); contents[i + bi] = content; })
       .catch((e) => { console.warn("Office attachment content failed:", att.name, e.message); })));
   }
   const out = [];
@@ -8187,7 +8230,7 @@ async function uploadLargeAttachmentToSharePoint(driveId, token, targetPath, saf
           "Content-Range": range,
         },
         body: chunk,
-      }, { label: `large upload ${safeName} ${offset}-${end - 1}` });
+      }, { label: `large upload ${safeName} ${offset}-${end - 1}`, timeoutMs: 300000 });
     } catch (e) {
       console.warn("Chunked upload network error at", range, "for", safeName, "—", e.message);
       // Best-effort cancel so we don't leave a half-built file on SharePoint
@@ -8239,18 +8282,15 @@ async function uploadLargeAttachmentToSharePoint(driveId, token, targetPath, saf
 // type can run at a time, since they all go through applyLocalChangeAndSave
 // and would otherwise race on selectedProject's version.
 async function withSaveGuard(name, fn, buttonIds = []) {
-  if (saveInFlight) {
-    setStatus("actionStatus", "info", "⏳ Another save is in progress; please wait.");
-    return;
-  }
-  saveInFlight = true;
+  if (saveLockBusy("actionStatus")) return;
+  _takeSaveLock(name || "a save");
   const buttons = buttonIds.map(id => document.getElementById(id)).filter(Boolean);
   const wasDisabled = buttons.map(b => b.disabled);
   buttons.forEach(b => { b.disabled = true; });
   try {
     return await fn();
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
     buttons.forEach((b, i) => { if (!wasDisabled[i]) b.disabled = false; });
   }
 }
@@ -8299,10 +8339,7 @@ async function withFilingScaffold(opts, runUpload) {
     setStatus(statusElement, "error", "No project selected.");
     return;
   }
-  if (!holdsLock && saveInFlight) {
-    setStatus(statusElement, "info", "⏳ Another save is in progress; please wait.");
-    return;
-  }
+  if (!holdsLock && saveLockBusy(statusElement)) return;
   // Snapshot BEFORE any await — protects against item-switch races. The project
   // is snapshotted too: the audit row must name the project the save ran
   // against even if the user switches projects while it is in flight.
@@ -8317,7 +8354,7 @@ async function withFilingScaffold(opts, runUpload) {
     operation,
     email_subject: emailSubject,
   });
-  if (!holdsLock) saveInFlight = true;
+  if (!holdsLock) _takeSaveLock("filing this email (" + operation + ")");
   const stopBeat = startFilingHeartbeat(queueId);
   setStatus(statusElement, "info", startMessage);
   try {
@@ -8356,7 +8393,7 @@ async function withFilingScaffold(opts, runUpload) {
     // a previous-save-did-not-complete banner.
   } finally {
     stopBeat();
-    if (!holdsLock) saveInFlight = false;
+    if (!holdsLock) _releaseSaveLock();
   }
 }
 
@@ -9221,7 +9258,7 @@ async function createAddinOneNotePage(project, title, body, category, dateStr, e
 
 async function doSaveNote() {
   if (!selectedProject) { setStatus("noteStatus", "error", "No project selected."); return; }
-  if (saveInFlight) { setStatus("noteStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  if (saveLockBusy("noteStatus")) return;
   const category = document.getElementById("noteCategory").value;
   let body = document.getElementById("noteBody").value.trim();
   const isMeeting = isMeetingNoteCategory(category);
@@ -9257,7 +9294,7 @@ async function doSaveNote() {
   // Disable immediately so a slow OneNote round-trip can't trigger a double-save.
   const saveNoteBtn = document.getElementById("saveNoteBtn");
   if (saveNoteBtn) saveNoteBtn.disabled = true;
-  saveInFlight = true;
+  _takeSaveLock("saving a note");
 
   // Create a OneNote page for every logged note when a notebook is linked
   let oneNoteUrl = "";
@@ -9357,7 +9394,7 @@ async function doSaveNote() {
     // Re-enable the button so the user can retry after fixing the error.
     if (saveNoteBtn) saveNoteBtn.disabled = false;
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 
@@ -9415,7 +9452,7 @@ function prefillActionItem() {
 
 async function doSaveActionItem() {
   if (!selectedProject) { setStatus("actionItemStatus", "error", "No project selected."); return; }
-  if (saveInFlight) { setStatus("actionItemStatus", "info", "⏳ Another save is in progress; please wait."); return; }
+  if (saveLockBusy("actionItemStatus")) return;
   const teamMembers = getProjectTeamMembers(selectedProject);
   const body = document.getElementById("actionItemBody").value.trim();
   const owner = document.getElementById("actionItemOwner").value.trim();
@@ -9431,7 +9468,7 @@ async function doSaveActionItem() {
 
   const saveBtn = document.getElementById("saveActionItemBtn");
   if (saveBtn) saveBtn.disabled = true;
-  saveInFlight = true;
+  _takeSaveLock("saving an action item");
   setStatus("actionItemStatus", "info", "⏳ Saving…");
 
   try {
@@ -9473,7 +9510,7 @@ async function doSaveActionItem() {
     setStatus("actionItemStatus", "error", "✗ " + humanizeError(e));
     if (saveBtn) saveBtn.disabled = false;
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 // ─── RFI MODE TOGGLE ─────────────────────────────────────────────────────────
@@ -10727,7 +10764,7 @@ async function doSaveRfi() {
       try {
         const res = await fetch(
           SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
-          { headers: SB_HEADERS }
+          { headers: SB_HEADERS, signal: _timeoutSignal(20000) }
         );
         if (res.ok) {
           const rows = await res.json();
@@ -11713,7 +11750,7 @@ async function doSaveSub() {
       try {
         const res = await fetch(
           SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(selectedProject.id) + "&select=project",
-          { headers: SB_HEADERS }
+          { headers: SB_HEADERS, signal: _timeoutSignal(20000) }
         );
         if (res.ok) {
           const rows = await res.json();
@@ -12583,8 +12620,8 @@ function renderBillableSchedule() {
 }
 async function saveBillableMilestoneField(mid, field, value) {
   if (!selectedProject || !mid) return;
-  if (saveInFlight) { setStatus("billableScheduleStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  saveInFlight = true;
+  if (saveLockBusy("billableScheduleStatus")) return;
+  _takeSaveLock("saving the billing schedule");
   setStatus("billableScheduleStatus", "info", "⏳ Saving…");
   try {
     // Save the field FIRST, then sync the calendar. The old order created the
@@ -12623,7 +12660,7 @@ async function saveBillableMilestoneField(mid, field, value) {
     setStatus("billableScheduleStatus", "error", "✗ " + humanizeError(e));
     renderBillableSchedule(); // revert inputs to last saved state
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 function toggleBillableSchedule() {
@@ -12660,8 +12697,8 @@ async function doSaveMilestone() {
   if (!name)    { setStatus("milestoneStatus", "error", "Please enter a milestone name."); return; }
   if (!dueDate) { setStatus("milestoneStatus", "error", "Please select a date."); return; }
   if (!selectedProject) { setStatus("milestoneStatus", "error", "Select a project first (go back)."); return; }
-  if (saveInFlight) { setStatus("milestoneStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  saveInFlight = true;
+  if (saveLockBusy("milestoneStatus")) return;
+  _takeSaveLock("saving a milestone");
   setStatus("milestoneStatus", "info", "⏳ Saving…");
   try {
     // Build the milestone first; sync calendar; then save via V2 path.
@@ -12727,7 +12764,7 @@ async function doSaveMilestone() {
   } catch(e) {
     setStatus("milestoneStatus", "error", "✗ " + humanizeError(e));
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 // ─── PEOPLE PICKER ────────────────────────────────────────────────────────────
@@ -13247,8 +13284,8 @@ async function doSaveContact() {
   const phone   = document.getElementById("contactPhone").value.trim();
   const saveTo  = document.getElementById("contactSaveTo").value;
   if (!name && !email) { setStatus("contactStatus", "error", "Name or email required."); return; }
-  if (saveInFlight) { setStatus("contactStatus", "info", "⏳ Another save is in progress; please wait."); return; }
-  saveInFlight = true;
+  if (saveLockBusy("contactStatus")) return;
+  _takeSaveLock("saving a contact");
   setStatus("contactStatus", "info", "⏳ Saving…");
   let resolvedCompany = ""; // which company the contact actually landed under (for the success message)
   try {
@@ -13473,7 +13510,7 @@ async function doSaveContact() {
     }
     setStatus("contactStatus", "error", "✗ " + humanizeError(e));
   } finally {
-    saveInFlight = false;
+    _releaseSaveLock();
   }
 }
 // ─── PMS METADATA HELPERS (mirrors SettyPMS.html metadata schema) ─────────────
