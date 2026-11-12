@@ -2484,7 +2484,7 @@ const _projectVersionCache = new Map();
 
 async function fetchFreshProjectV2(projectId) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(projectId) + "&select=project,version";
-  const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb fetchFreshProject" });
+  const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb fetchFreshProject", timeoutMs: 45000 });
   if (!res.ok) throw new Error("pms_projects GET HTTP " + res.status);
   const rows = await res.json();
   if (!rows || rows.length === 0) return null; // not migrated yet
@@ -2524,9 +2524,17 @@ async function saveProjectRowV2(project, expectedVersion) {
       version: expectedVersion + 1,
       updated_at: new Date().toISOString(),
     }),
-  }, { label: "sb saveProjectRow" });
+  }, { label: "sb saveProjectRow", timeoutMs: 60000 });
   if (!res.ok) throw new Error("pms_projects PATCH HTTP " + res.status);
-  const result = await res.json();
+  // A 2xx whose BODY then fails to arrive (stall past the request timeout,
+  // dropped connection) means the PATCH committed but we can't read the echo.
+  // The read happens outside fetchWithRetry, so it is not retried; treat it as
+  // "no rows echoed" and let the re-fetch-and-compare below decide, instead of
+  // reporting a failed save for a write that landed.
+  const result = await res.json().catch(e => {
+    console.warn("[saveProjectRow] response body unreadable after " + res.status + ":", e?.message || e);
+    return [];
+  });
   if (!result || result.length === 0) {
     // version mismatch — re-fetch to give caller something to merge
     const fresh = await fetchFreshProjectV2(project.id);
@@ -2731,7 +2739,7 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     method: "POST",
     headers: { ...SB_HEADERS, Prefer: "return=minimal" },
     body: JSON.stringify(row),
-  }, { label: "sb project_emails insert" });
+  }, { label: "sb project_emails insert", timeoutMs: 45000 });
   if (!res.ok) {
     const errText = await res.text();
     throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
@@ -4216,6 +4224,8 @@ async function backfillConversationOutbound(project, conversationId) {
     }
     if (saveInFlight) { _backfilledConvos.delete(guardKey); return; }
     _takeSaveLock("filing your sent replies on this thread");
+    const tel = telemetryBegin("email-backfill-sent", { project_id: project.id, detail: { messages: records.length } });
+    let telErr = null;
     try {
       await applyLocalChangeAndSave(project.id, fresh => {
         const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
@@ -4228,7 +4238,8 @@ async function backfillConversationOutbound(project, conversationId) {
         try { await saveProjectEmailRow(project.id, r, false, conversationId); }
         catch (e) { console.warn("[backfill] index write failed:", e?.message || e); }
       }
-    } finally { _releaseSaveLock(); }
+    } catch (e) { telErr = e; throw e; }
+    finally { _releaseSaveLock(); telemetryEnd(tel, telErr ? "failed" : "success", telErr); }
     console.log("[backfill] filed " + records.length + " sent message(s) from this thread to " + (project.name || project.id));
     setStatus("actionStatus", "success",
       "✓ Also logged " + records.length + " sent repl" + (records.length === 1 ? "y" : "ies") + " from this thread.");
@@ -6765,7 +6776,93 @@ function withTimeout(promise, ms, fallback) {
   const timer = new Promise(resolve => { t = setTimeout(() => resolve(fallback), ms); });
   return Promise.race([promise, timer]).finally(() => clearTimeout(t));
 }
+// Bound a best-effort step. Rejects on timeout; the step itself keeps running
+// in the background (nothing here is cancellable) but no longer blocks the save.
+function _withTimeLimit(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + " timed out after " + Math.round(ms / 1000) + "s")), ms);
+    Promise.resolve(promise).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); });
+  });
+}
+// ─── PANE TELEMETRY ──────────────────────────────────────────────────────────
+// How long each save in the pane took and where the time went, written to
+// pms_addin_telemetry. Before this, a slow or failed log left no trace beyond
+// the user's memory of it (the filing log records WHAT was filed, not how
+// long it took). One row per operation:
+//   steps  named phases the flow timed itself (auto-log only, so far)
+//   calls  every fetchWithRetry call made while the op was active, by label —
+//          this is what gives RFI / submittal / SharePoint saves step-level
+//          timing without instrumenting each flow by hand
+// Calls are attributed to the most recently started active op, so a
+// background fetch that overlaps a save can show up in its list; read the
+// labels. Strictly fire-and-forget: telemetry must never slow, block or fail
+// a save, and a missing table (migration not applied) turns it off quietly.
+const ADDIN_TELEMETRY_TABLE = "pms_addin_telemetry";
+const _telemetryOps = [];
+let _telemetryOff = false;
+function telemetryBegin(operation, ctx = {}) {
+  const op = {
+    operation, t0: Date.now(), steps: [], calls: [], done: false,
+    project_id: ctx.project_id || null, msg_id: ctx.msg_id || null, detail: ctx.detail || {},
+  };
+  _telemetryOps.push(op);
+  return op;
+}
+function _telemetryNoteCall(label, ms, status) {
+  const op = _telemetryOps[_telemetryOps.length - 1];
+  if (!op || op.calls.length >= 80) return;
+  op.calls.push({ label: String(label || "fetch").slice(0, 80), ms, status });
+}
+function _telemetryClose(op) {
+  if (!op || op.done) return false;
+  op.done = true;
+  const i = _telemetryOps.indexOf(op);
+  if (i >= 0) _telemetryOps.splice(i, 1);
+  return true;
+}
+// Drop an op without writing a row (deliberate no-op saves).
+function telemetryCancel(op) { _telemetryClose(op); }
+function telemetryEnd(op, outcome, error) {
+  if (!_telemetryClose(op) || _telemetryOff) return;
+  try {
+    const row = {
+      operation: op.operation,
+      outcome,
+      total_ms: Date.now() - op.t0,
+      steps: op.steps,
+      calls: op.calls,
+      project_id: op.project_id,
+      msg_id: op.msg_id ? String(op.msg_id).slice(0, 400) : null,
+      detail: op.detail,
+      error: error ? String(error.message || error).slice(0, 500) : null,
+      client_version: CLIENT_VERSION_STRING,
+    };
+    // Plain fetch, not fetchWithRetry: no retries for telemetry, and it must
+    // not record itself as a call on whatever op is active next.
+    fetch(SUPABASE_URL + "/rest/v1/" + ADDIN_TELEMETRY_TABLE, {
+      method: "POST",
+      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+      body: JSON.stringify(row),
+      signal: _timeoutSignal(15000),
+    }).then(res => {
+      if (res.status === 404) { _telemetryOff = true; console.warn("[telemetry] table not found — off for this session"); }
+    }).catch(() => {});
+  } catch (e) { console.warn("[telemetry] dropped:", e?.message || e); }
+}
 async function fetchWithRetry(url, init, opts = {}) {
+  const t0 = Date.now();
+  let status = -1; // -1 = threw (network error / timeout after all attempts)
+  try {
+    const res = await _fetchWithRetryInner(url, init, opts);
+    status = res.status;
+    return res;
+  } finally {
+    _telemetryNoteCall(opts.label, Date.now() - t0, status);
+  }
+}
+async function _fetchWithRetryInner(url, init, opts = {}) {
   const maxAttempts = opts.maxAttempts ?? 3;
   const label = opts.label || "fetch";
   const timeoutMs = opts.timeoutMs ?? 120000;
@@ -6797,7 +6894,7 @@ async function fetchWithRetry(url, init, opts = {}) {
 }
 
 // ─── GRAPH HELPERS ────────────────────────────────────────────────────────────
-async function graphFetch(method, path, body, token) {
+async function graphFetch(method, path, body, token, opts = {}) {
   const t = token || await getToken();
   const makeReq = (tok) => fetchWithRetry("https://graph.microsoft.com/v1.0" + path, {
     method,
@@ -6806,7 +6903,7 @@ async function graphFetch(method, path, body, token) {
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
-  }, { label: "graph " + method });
+  }, { label: "graph " + method, timeoutMs: opts.timeoutMs });
 
   let res = await makeReq(t);
   // 401 → force-refresh token + retry once. Long-running saves (slow VPN,
@@ -6868,7 +6965,7 @@ async function getEmailBodyHtml(token, itemSnapshot) {
   // 1) Graph — full-fidelity HTML body.
   try {
     const restId = Office.context.mailbox.convertToRestId(msgId, Office.MailboxEnums.RestVersion.v2_0);
-    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token);
+    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token, { timeoutMs: 30000 });
     body = data?.body?.content || "";
   } catch { /* fall through to the Office.js route */ }
 
@@ -7960,7 +8057,7 @@ async function getAttachmentNamesOnly(item, token) {
   if (token && item?.itemId) {
     try {
       const restId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
-      const data = await graphFetch("GET", "/me/messages/" + restId + "/attachments?$select=name,contentType,size", null, token);
+      const data = await graphFetch("GET", "/me/messages/" + restId + "/attachments?$select=name,contentType,size", null, token, { timeoutMs: 30000 });
       return (data?.value || [])
         .filter(a => a["@odata.type"] === "#microsoft.graph.fileAttachment")
         .map(a => a.name)
@@ -8347,12 +8444,20 @@ async function withFilingScaffold(opts, runUpload) {
   if (!holdsLock) _takeSaveLock("filing this email (" + operation + ")");
   const stopBeat = startFilingHeartbeat(queueId);
   setStatus(statusElement, "info", startMessage);
+  const tel = telemetryBegin(operation, { project_id: project.id, msg_id: msgId });
+  let telOutcome = "failed", telErr = null;
   try {
     const result = await runUpload({ snapItem, statusElement, project });
     if (result?.skip) {
+      telOutcome = "skip";
       dequeueFilingIntent(queueId);
       return result;
     }
+    // The upload is what the user waited on; the audit-row write below is
+    // counted in total_ms too, and shows as its own entry in calls.
+    telOutcome = result?.status === "partial" || result?.status === "failed" ? result.status : "success";
+    telErr = result?.error || null;
+    tel.detail.files = Array.isArray(result?.files) ? result.files.length : (lastAttachmentUploadStats?.uploadedFiles || []).length;
     if (result?.successMessage != null) {
       setStatus(statusElement, "success", result.successMessage);
     }
@@ -8369,6 +8474,7 @@ async function withFilingScaffold(opts, runUpload) {
     });
     return result;
   } catch (e) {
+    telOutcome = "failed"; telErr = e;
     setStatus(statusElement, "error", "✗ " + humanizeError(e));
     console.error("[filing:" + operation + "]", e);
     void logFilingOp({
@@ -8384,6 +8490,7 @@ async function withFilingScaffold(opts, runUpload) {
   } finally {
     stopBeat();
     if (!holdsLock) _releaseSaveLock();
+    if (telOutcome === "skip") telemetryCancel(tel); else telemetryEnd(tel, telOutcome, telErr);
   }
 }
 
@@ -8714,6 +8821,43 @@ if (existingRecord) {
     return filingOutcome;
   });
 }
+// Step tracker for the record-only save. The quiet auto-log used to show one
+// unchanging "Logging email to project…" line for as long as it took, so a slow
+// save and a hung one looked identical. This names the step in the status once
+// the save passes 8s, and keeps per-step timings so a slow save reports where
+// the time went instead of leaving everyone guessing.
+const LOG_SLOW_MS = 15000;
+function _startLogSteps() {
+  const t0 = Date.now();
+  const timings = [];
+  let current = "";
+  const ticker = setInterval(() => {
+    const el = document.getElementById("actionStatus");
+    // Only touch the status while OUR in-progress line is still the one showing.
+    if (!current || !el || !(el.textContent || "").includes("Logging email to project")) return;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (secs >= 8) setStatus("actionStatus", "info", "⏳ Logging email to project… still working (" + current + ", " + secs + "s)");
+  }, 2000);
+  return {
+    async run(label, fn) {
+      const s0 = Date.now();
+      current = label;
+      try { return await fn(); }
+      finally { timings.push({ label, ms: Date.now() - s0 }); }
+    },
+    stop() {
+      clearInterval(ticker);
+      current = "";
+      const totalMs = Date.now() - t0;
+      const slowest = timings.slice().sort((a, b) => b.ms - a.ms)[0] || null;
+      if (totalMs >= LOG_SLOW_MS) {
+        console.warn("[log-email] slow save: " + Math.round(totalMs / 1000) + "s — " +
+          timings.map(t => t.label + " " + (t.ms / 1000).toFixed(1) + "s").join(", "));
+      }
+      return { totalMs, slowest, timings };
+    },
+  };
+}
 async function doSaveToProjectRecordOnly() {
   return withSaveGuard("save-record", _doSaveToProjectRecordOnly, ["saveSpBtn", "saveRecordBtn"]);
 }
@@ -8733,27 +8877,40 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // click off the email mid-capture. Quiet only suppresses the celebration.
   setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
   let ok = false;
+  let failErr = null;
+  const steps = _startLogSteps();
+  const tel = telemetryBegin(quiet ? "email-autolog" : "email-record", { project_id: selectedProject.id, msg_id: msgId });
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
-    const token = await getToken();
-    let bodyHtml = await getEmailBodyHtml(token);
+    const token = await steps.run("signing in to Microsoft", () => getToken());
+    let bodyHtml = await steps.run("reading the email body", () => getEmailBodyHtml(token));
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     // Inline images arrive as cid: refs (bytes live as inline attachments) and
     // don't render in the PMS log — re-embed them as downscaled data: URIs so they
     // show. Best-effort; on failure the original body is kept (SharePoint has the
     // full-res originals regardless).
     if (bodyHtml) {
-      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      // Time-boxed: pictures are a nicety, the log entry is not. On timeout the
+      // original body (cid: refs) is kept, same as any other embed failure.
+      try {
+        const srcHtml = bodyHtml;
+        bodyHtml = await steps.run("embedding inline images", () =>
+          _withTimeLimit(embedInlineImagesAsDataUris(srcHtml, token), 25000, "inline images"));
+      }
       catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
     }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
+    // Sizes explain most slow logs (big inline images ride in the body).
+    tel.detail.body_chars = bodyHtml ? bodyHtml.length : 0;
+    tel.detail.body_compressed_chars = compressedBody.length;
     const from = emailItem.from;
     const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
     const cc = (emailItem.cc || []).map(r => r.emailAddress).filter(Boolean).join(", ");
     // Lightweight metadata fetch — names only, no byte download. Tries
     // Office.js first, falls back to Graph if Office.js reports 0 attachments
     // (which it sometimes silently does even when attachments exist).
-    const attachmentNames = await getAttachmentNamesOnly(emailItem, token);
+    const attachmentNames = await steps.run("listing attachments", () => getAttachmentNamesOnly(emailItem, token));
+    const emailDate = await steps.run("reading the send date", () => getEmailDateReliable());
     const emailRecord = {
       id: uid(), msgId,
       subject: emailItem.subject || "",
@@ -8761,7 +8918,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       fromAddress: from?.emailAddress || "",
       to,
       cc,
-      date: await getEmailDateReliable(),
+      date: emailDate,
       bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
@@ -8773,16 +8930,16 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       savedToSharePoint: false,
     };
     const projAtSave = selectedProject; // pin the target; selectedProject can change during the awaits below
-    await applyLocalChangeAndSave(projAtSave.id, fresh => {
+    await steps.run("saving to the project", () => applyLocalChangeAndSave(projAtSave.id, fresh => {
       // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
       // uniqueness: if this email was filed here since our pane last synced
       // (another user, or a prior auto-save), don't append a second copy.
       if ((fresh.emails || []).some(e => e.msgId && e.msgId === emailRecord.msgId)) return fresh;
       return { ...fresh, emails: [...(fresh.emails || []), emailRecord] };
-    });
+    }));
     let indexSaveFailed = false;
     try {
-      await saveProjectEmailRow(projAtSave.id, emailRecord, false);
+      await steps.run("updating the email index", () => saveProjectEmailRow(projAtSave.id, emailRecord, false));
     } catch (idxErr) {
       console.warn("saveProjectEmailRow failed:", idxErr);
       indexSaveFailed = true;
@@ -8800,6 +8957,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     ok = true;
     if (quiet) _autoFiledLog[msgId] = { projectId: projAtSave.id, projectName: projAtSave.name || "", at: Date.now() };
   } catch (e) {
+    failErr = e;
     if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     else console.warn("auto-save record failed:", e);
   } finally {
@@ -8809,9 +8967,18 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     // versions), or a post-save refresh that didn't find the record — resolve it:
     // clear on success, or point at the manual Save button on failure. Guarded on
     // the in-progress text, so real "Saved"/"Logged"/"Auto-tagged" messages survive.
+    const took = steps.stop();
+    tel.steps = took.timings;
+    telemetryEnd(tel, ok ? "success" : "failed", failErr);
     const el = document.getElementById("actionStatus");
     if (el && (el.textContent || "").includes("Logging email to project")) {
-      if (ok) setStatus("actionStatus", "", "");
+      // A slow-but-successful log says so, and names the step that ate the
+      // time — otherwise the only trace of a 3-minute save is a user's memory.
+      if (ok && took.totalMs >= LOG_SLOW_MS) {
+        setStatus("actionStatus", "info", "✓ Logged to project — slower than usual (" + Math.round(took.totalMs / 1000) + "s" +
+          (took.slowest ? "; slowest step: " + took.slowest.label + ", " + Math.round(took.slowest.ms / 1000) + "s" : "") + ").");
+      }
+      else if (ok) setStatus("actionStatus", "", "");
       else setStatus("actionStatus", "info", "Couldn't auto-log this email — reopen it or use 🗂️ Save to Project.");
     }
   }
