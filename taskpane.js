@@ -2526,7 +2526,15 @@ async function saveProjectRowV2(project, expectedVersion) {
     }),
   }, { label: "sb saveProjectRow", timeoutMs: 60000 });
   if (!res.ok) throw new Error("pms_projects PATCH HTTP " + res.status);
-  const result = await res.json();
+  // A 2xx whose BODY then fails to arrive (stall past the request timeout,
+  // dropped connection) means the PATCH committed but we can't read the echo.
+  // The read happens outside fetchWithRetry, so it is not retried; treat it as
+  // "no rows echoed" and let the re-fetch-and-compare below decide, instead of
+  // reporting a failed save for a write that landed.
+  const result = await res.json().catch(e => {
+    console.warn("[saveProjectRow] response body unreadable after " + res.status + ":", e?.message || e);
+    return [];
+  });
   if (!result || result.length === 0) {
     // version mismatch — re-fetch to give caller something to merge
     const fresh = await fetchFreshProjectV2(project.id);
@@ -4216,6 +4224,8 @@ async function backfillConversationOutbound(project, conversationId) {
     }
     if (saveInFlight) { _backfilledConvos.delete(guardKey); return; }
     _takeSaveLock("filing your sent replies on this thread");
+    const tel = telemetryBegin("email-backfill-sent", { project_id: project.id, detail: { messages: records.length } });
+    let telErr = null;
     try {
       await applyLocalChangeAndSave(project.id, fresh => {
         const have = new Set((fresh.emails || []).map(e => e.msgId).filter(Boolean));
@@ -4228,7 +4238,8 @@ async function backfillConversationOutbound(project, conversationId) {
         try { await saveProjectEmailRow(project.id, r, false, conversationId); }
         catch (e) { console.warn("[backfill] index write failed:", e?.message || e); }
       }
-    } finally { _releaseSaveLock(); }
+    } catch (e) { telErr = e; throw e; }
+    finally { _releaseSaveLock(); telemetryEnd(tel, telErr ? "failed" : "success", telErr); }
     console.log("[backfill] filed " + records.length + " sent message(s) from this thread to " + (project.name || project.id));
     setStatus("actionStatus", "success",
       "✓ Also logged " + records.length + " sent repl" + (records.length === 1 ? "y" : "ies") + " from this thread.");
@@ -6775,7 +6786,83 @@ function _withTimeLimit(promise, ms, label) {
       e => { clearTimeout(timer); reject(e); });
   });
 }
+// ─── PANE TELEMETRY ──────────────────────────────────────────────────────────
+// How long each save in the pane took and where the time went, written to
+// pms_addin_telemetry. Before this, a slow or failed log left no trace beyond
+// the user's memory of it (the filing log records WHAT was filed, not how
+// long it took). One row per operation:
+//   steps  named phases the flow timed itself (auto-log only, so far)
+//   calls  every fetchWithRetry call made while the op was active, by label —
+//          this is what gives RFI / submittal / SharePoint saves step-level
+//          timing without instrumenting each flow by hand
+// Calls are attributed to the most recently started active op, so a
+// background fetch that overlaps a save can show up in its list; read the
+// labels. Strictly fire-and-forget: telemetry must never slow, block or fail
+// a save, and a missing table (migration not applied) turns it off quietly.
+const ADDIN_TELEMETRY_TABLE = "pms_addin_telemetry";
+const _telemetryOps = [];
+let _telemetryOff = false;
+function telemetryBegin(operation, ctx = {}) {
+  const op = {
+    operation, t0: Date.now(), steps: [], calls: [], done: false,
+    project_id: ctx.project_id || null, msg_id: ctx.msg_id || null, detail: ctx.detail || {},
+  };
+  _telemetryOps.push(op);
+  return op;
+}
+function _telemetryNoteCall(label, ms, status) {
+  const op = _telemetryOps[_telemetryOps.length - 1];
+  if (!op || op.calls.length >= 80) return;
+  op.calls.push({ label: String(label || "fetch").slice(0, 80), ms, status });
+}
+function _telemetryClose(op) {
+  if (!op || op.done) return false;
+  op.done = true;
+  const i = _telemetryOps.indexOf(op);
+  if (i >= 0) _telemetryOps.splice(i, 1);
+  return true;
+}
+// Drop an op without writing a row (deliberate no-op saves).
+function telemetryCancel(op) { _telemetryClose(op); }
+function telemetryEnd(op, outcome, error) {
+  if (!_telemetryClose(op) || _telemetryOff) return;
+  try {
+    const row = {
+      operation: op.operation,
+      outcome,
+      total_ms: Date.now() - op.t0,
+      steps: op.steps,
+      calls: op.calls,
+      project_id: op.project_id,
+      msg_id: op.msg_id ? String(op.msg_id).slice(0, 400) : null,
+      detail: op.detail,
+      error: error ? String(error.message || error).slice(0, 500) : null,
+      client_version: CLIENT_VERSION_STRING,
+    };
+    // Plain fetch, not fetchWithRetry: no retries for telemetry, and it must
+    // not record itself as a call on whatever op is active next.
+    fetch(SUPABASE_URL + "/rest/v1/" + ADDIN_TELEMETRY_TABLE, {
+      method: "POST",
+      headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+      body: JSON.stringify(row),
+      signal: _timeoutSignal(15000),
+    }).then(res => {
+      if (res.status === 404) { _telemetryOff = true; console.warn("[telemetry] table not found — off for this session"); }
+    }).catch(() => {});
+  } catch (e) { console.warn("[telemetry] dropped:", e?.message || e); }
+}
 async function fetchWithRetry(url, init, opts = {}) {
+  const t0 = Date.now();
+  let status = -1; // -1 = threw (network error / timeout after all attempts)
+  try {
+    const res = await _fetchWithRetryInner(url, init, opts);
+    status = res.status;
+    return res;
+  } finally {
+    _telemetryNoteCall(opts.label, Date.now() - t0, status);
+  }
+}
+async function _fetchWithRetryInner(url, init, opts = {}) {
   const maxAttempts = opts.maxAttempts ?? 3;
   const label = opts.label || "fetch";
   const timeoutMs = opts.timeoutMs ?? 120000;
@@ -8357,12 +8444,20 @@ async function withFilingScaffold(opts, runUpload) {
   if (!holdsLock) _takeSaveLock("filing this email (" + operation + ")");
   const stopBeat = startFilingHeartbeat(queueId);
   setStatus(statusElement, "info", startMessage);
+  const tel = telemetryBegin(operation, { project_id: project.id, msg_id: msgId });
+  let telOutcome = "failed", telErr = null;
   try {
     const result = await runUpload({ snapItem, statusElement, project });
     if (result?.skip) {
+      telOutcome = "skip";
       dequeueFilingIntent(queueId);
       return result;
     }
+    // The upload is what the user waited on; the audit-row write below is
+    // counted in total_ms too, and shows as its own entry in calls.
+    telOutcome = result?.status === "partial" || result?.status === "failed" ? result.status : "success";
+    telErr = result?.error || null;
+    tel.detail.files = Array.isArray(result?.files) ? result.files.length : (lastAttachmentUploadStats?.uploadedFiles || []).length;
     if (result?.successMessage != null) {
       setStatus(statusElement, "success", result.successMessage);
     }
@@ -8379,6 +8474,7 @@ async function withFilingScaffold(opts, runUpload) {
     });
     return result;
   } catch (e) {
+    telOutcome = "failed"; telErr = e;
     setStatus(statusElement, "error", "✗ " + humanizeError(e));
     console.error("[filing:" + operation + "]", e);
     void logFilingOp({
@@ -8394,6 +8490,7 @@ async function withFilingScaffold(opts, runUpload) {
   } finally {
     stopBeat();
     if (!holdsLock) _releaseSaveLock();
+    if (telOutcome === "skip") telemetryCancel(tel); else telemetryEnd(tel, telOutcome, telErr);
   }
 }
 
@@ -8757,7 +8854,7 @@ function _startLogSteps() {
         console.warn("[log-email] slow save: " + Math.round(totalMs / 1000) + "s — " +
           timings.map(t => t.label + " " + (t.ms / 1000).toFixed(1) + "s").join(", "));
       }
-      return { totalMs, slowest };
+      return { totalMs, slowest, timings };
     },
   };
 }
@@ -8780,7 +8877,9 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // click off the email mid-capture. Quiet only suppresses the celebration.
   setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
   let ok = false;
+  let failErr = null;
   const steps = _startLogSteps();
+  const tel = telemetryBegin(quiet ? "email-autolog" : "email-record", { project_id: selectedProject.id, msg_id: msgId });
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
     const token = await steps.run("signing in to Microsoft", () => getToken());
@@ -8801,6 +8900,9 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
     }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
+    // Sizes explain most slow logs (big inline images ride in the body).
+    tel.detail.body_chars = bodyHtml ? bodyHtml.length : 0;
+    tel.detail.body_compressed_chars = compressedBody.length;
     const from = emailItem.from;
     const to = (emailItem.to || []).map(r => r.emailAddress).filter(Boolean).join(", ");
     const cc = (emailItem.cc || []).map(r => r.emailAddress).filter(Boolean).join(", ");
@@ -8855,6 +8957,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     ok = true;
     if (quiet) _autoFiledLog[msgId] = { projectId: projAtSave.id, projectName: projAtSave.name || "", at: Date.now() };
   } catch (e) {
+    failErr = e;
     if (!quiet) setStatus("actionStatus", "error", "✗ " + humanizeError(e));
     else console.warn("auto-save record failed:", e);
   } finally {
@@ -8865,6 +8968,8 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     // clear on success, or point at the manual Save button on failure. Guarded on
     // the in-progress text, so real "Saved"/"Logged"/"Auto-tagged" messages survive.
     const took = steps.stop();
+    tel.steps = took.timings;
+    telemetryEnd(tel, ok ? "success" : "failed", failErr);
     const el = document.getElementById("actionStatus");
     if (el && (el.textContent || "").includes("Logging email to project")) {
       // A slow-but-successful log says so, and names the step that ate the
