@@ -2442,7 +2442,7 @@ const _projectVersionCache = new Map();
 
 async function fetchFreshProjectV2(projectId) {
   const url = SUPABASE_URL + "/rest/v1/pms_projects?id=eq." + encodeURIComponent(projectId) + "&select=project,version";
-  const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb fetchFreshProject" });
+  const res = await fetchWithRetry(url, { headers: SB_HEADERS }, { label: "sb fetchFreshProject", timeoutMs: 45000 });
   if (!res.ok) throw new Error("pms_projects GET HTTP " + res.status);
   const rows = await res.json();
   if (!rows || rows.length === 0) return null; // not migrated yet
@@ -2482,7 +2482,7 @@ async function saveProjectRowV2(project, expectedVersion) {
       version: expectedVersion + 1,
       updated_at: new Date().toISOString(),
     }),
-  }, { label: "sb saveProjectRow" });
+  }, { label: "sb saveProjectRow", timeoutMs: 60000 });
   if (!res.ok) throw new Error("pms_projects PATCH HTTP " + res.status);
   const result = await res.json();
   if (!result || result.length === 0) {
@@ -2689,7 +2689,7 @@ async function saveProjectEmailRow(projectId, emailRecord, savedToSharePoint, co
     method: "POST",
     headers: { ...SB_HEADERS, Prefer: "return=minimal" },
     body: JSON.stringify(row),
-  }, { label: "sb project_emails insert" });
+  }, { label: "sb project_emails insert", timeoutMs: 45000 });
   if (!res.ok) {
     const errText = await res.text();
     throw new Error("pms_project_emails POST HTTP " + res.status + ": " + errText.slice(0, 150));
@@ -6703,13 +6703,41 @@ function updatePeopleButtonBadge() {
 // Single shared exponential-backoff wrapper. Retries network failures, 429,
 // 503, 504. Honors Retry-After if Graph or Supabase provides it. Capped at
 // 15s per wait so the taskpane never appears hung.
+// A stalled connection (VPN hiccup, laptop waking up) never rejects on its own:
+// the browser can sit on it for minutes, and the retry loop below never gets a
+// turn. timeoutMs aborts the attempt (headers AND body read) so it does.
+// Opt-in per call site — byte uploads/downloads legitimately run long.
+async function _fetchWithTimeout(url, init, timeoutMs) {
+  if (!timeoutMs || typeof AbortController !== "function") return fetch(url, init);
+  const ctl = new AbortController();
+  // Deliberately NOT cleared on success: the timer also bounds the caller's
+  // res.json()/text() body read. Aborting an already-consumed response is a no-op.
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e?.name === "AbortError") throw new Error("request timed out after " + Math.round(timeoutMs / 1000) + "s");
+    throw e;
+  }
+}
+// Bound a best-effort step. Rejects on timeout; the step itself keeps running
+// in the background (nothing here is cancellable) but no longer blocks the save.
+function _withTimeLimit(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + " timed out after " + Math.round(ms / 1000) + "s")), ms);
+    Promise.resolve(promise).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); });
+  });
+}
 async function fetchWithRetry(url, init, opts = {}) {
   const maxAttempts = opts.maxAttempts ?? 3;
   const label = opts.label || "fetch";
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(url, init);
+      const res = await _fetchWithTimeout(url, init, opts.timeoutMs);
       if (res.status === 429 || res.status === 503 || res.status === 504) {
         if (attempt === maxAttempts) return res;
         const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
@@ -6733,7 +6761,7 @@ async function fetchWithRetry(url, init, opts = {}) {
 }
 
 // ─── GRAPH HELPERS ────────────────────────────────────────────────────────────
-async function graphFetch(method, path, body, token) {
+async function graphFetch(method, path, body, token, opts = {}) {
   const t = token || await getToken();
   const makeReq = (tok) => fetchWithRetry("https://graph.microsoft.com/v1.0" + path, {
     method,
@@ -6742,7 +6770,7 @@ async function graphFetch(method, path, body, token) {
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
-  }, { label: "graph " + method });
+  }, { label: "graph " + method, timeoutMs: opts.timeoutMs });
 
   let res = await makeReq(t);
   // 401 → force-refresh token + retry once. Long-running saves (slow VPN,
@@ -6775,6 +6803,7 @@ function clearEmailBodyCache() { _emailBodyCache.clear(); }
 // header — the real send date Outlook shows. Falls back to dateTimeCreated.
 async function getEmailDateReliable() {
   const headerDate = await new Promise(resolve => {
+    setTimeout(() => resolve(""), 4000); // never hang a save on a stuck header fetch
     try {
       if (!emailItem?.getAllInternetHeadersAsync) return resolve("");
       emailItem.getAllInternetHeadersAsync(r => {
@@ -6804,7 +6833,7 @@ async function getEmailBodyHtml(token, itemSnapshot) {
   // 1) Graph — full-fidelity HTML body.
   try {
     const restId = Office.context.mailbox.convertToRestId(msgId, Office.MailboxEnums.RestVersion.v2_0);
-    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token);
+    const data = await graphFetch("GET", "/me/messages/" + restId + "?$select=body", null, token, { timeoutMs: 30000 });
     body = data?.body?.content || "";
   } catch { /* fall through to the Office.js route */ }
 
@@ -6815,6 +6844,7 @@ async function getEmailBodyHtml(token, itemSnapshot) {
   if (!body && item?.body?.getAsync) {
     for (let i = 0; i < 3 && !body; i++) {
       body = await new Promise(resolve => {
+        setTimeout(() => resolve(""), 6000); // Office.js sometimes never calls back
         try {
           item.body.getAsync(Office.CoercionType.Html, r =>
             resolve(r.status === Office.AsyncResultStatus.Succeeded ? (r.value || "") : ""));
@@ -7878,6 +7908,7 @@ async function getAttachmentNamesOnly(item, token) {
   // Try Office.js first
   if (item?.getAttachmentsAsync) {
     const officeNames = await new Promise((resolve) => {
+      setTimeout(() => resolve([]), 6000); // Office.js sometimes never calls back; Graph fallback below
       item.getAttachmentsAsync((res) => {
         if (res.status === Office.AsyncResultStatus.Succeeded) {
           const names = (res.value || [])
@@ -7896,7 +7927,7 @@ async function getAttachmentNamesOnly(item, token) {
   if (token && item?.itemId) {
     try {
       const restId = Office.context.mailbox.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0);
-      const data = await graphFetch("GET", "/me/messages/" + restId + "/attachments?$select=name,contentType,size", null, token);
+      const data = await graphFetch("GET", "/me/messages/" + restId + "/attachments?$select=name,contentType,size", null, token, { timeoutMs: 30000 });
       return (data?.value || [])
         .filter(a => a["@odata.type"] === "#microsoft.graph.fileAttachment")
         .map(a => a.name)
@@ -8656,6 +8687,43 @@ if (existingRecord) {
     return filingOutcome;
   });
 }
+// Step tracker for the record-only save. The quiet auto-log used to show one
+// unchanging "Logging email to project…" line for as long as it took, so a slow
+// save and a hung one looked identical. This names the step in the status once
+// the save passes 8s, and keeps per-step timings so a slow save reports where
+// the time went instead of leaving everyone guessing.
+const LOG_SLOW_MS = 15000;
+function _startLogSteps() {
+  const t0 = Date.now();
+  const timings = [];
+  let current = "";
+  const ticker = setInterval(() => {
+    const el = document.getElementById("actionStatus");
+    // Only touch the status while OUR in-progress line is still the one showing.
+    if (!current || !el || !(el.textContent || "").includes("Logging email to project")) return;
+    const secs = Math.round((Date.now() - t0) / 1000);
+    if (secs >= 8) setStatus("actionStatus", "info", "⏳ Logging email to project… still working (" + current + ", " + secs + "s)");
+  }, 2000);
+  return {
+    async run(label, fn) {
+      const s0 = Date.now();
+      current = label;
+      try { return await fn(); }
+      finally { timings.push({ label, ms: Date.now() - s0 }); }
+    },
+    stop() {
+      clearInterval(ticker);
+      current = "";
+      const totalMs = Date.now() - t0;
+      const slowest = timings.slice().sort((a, b) => b.ms - a.ms)[0] || null;
+      if (totalMs >= LOG_SLOW_MS) {
+        console.warn("[log-email] slow save: " + Math.round(totalMs / 1000) + "s — " +
+          timings.map(t => t.label + " " + (t.ms / 1000).toFixed(1) + "s").join(", "));
+      }
+      return { totalMs, slowest };
+    },
+  };
+}
 async function doSaveToProjectRecordOnly() {
   return withSaveGuard("save-record", _doSaveToProjectRecordOnly, ["saveSpBtn", "saveRecordBtn"]);
 }
@@ -8675,17 +8743,24 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
   // click off the email mid-capture. Quiet only suppresses the celebration.
   setStatus("actionStatus", "info", quiet ? "⏳ Logging email to project…" : "⏳ " + pickSavingMessage());
   let ok = false;
+  const steps = _startLogSteps();
   try {
     // Phase 3: capture and compress body so PMS can render it without a Graph round-trip.
-    const token = await getToken();
-    let bodyHtml = await getEmailBodyHtml(token);
+    const token = await steps.run("signing in to Microsoft", () => getToken());
+    let bodyHtml = await steps.run("reading the email body", () => getEmailBodyHtml(token));
     const bodyFetchFailed = !bodyHtml || bodyHtml.length === 0;
     // Inline images arrive as cid: refs (bytes live as inline attachments) and
     // don't render in the PMS log — re-embed them as downscaled data: URIs so they
     // show. Best-effort; on failure the original body is kept (SharePoint has the
     // full-res originals regardless).
     if (bodyHtml) {
-      try { bodyHtml = await embedInlineImagesAsDataUris(bodyHtml, token); }
+      // Time-boxed: pictures are a nicety, the log entry is not. On timeout the
+      // original body (cid: refs) is kept, same as any other embed failure.
+      try {
+        const srcHtml = bodyHtml;
+        bodyHtml = await steps.run("embedding inline images", () =>
+          _withTimeLimit(embedInlineImagesAsDataUris(srcHtml, token), 25000, "inline images"));
+      }
       catch (e) { console.warn("[inline-img] log embed failed:", e.message); }
     }
     const compressedBody = bodyHtml ? compressHtmlAddin(bodyHtml) : "";
@@ -8695,7 +8770,8 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     // Lightweight metadata fetch — names only, no byte download. Tries
     // Office.js first, falls back to Graph if Office.js reports 0 attachments
     // (which it sometimes silently does even when attachments exist).
-    const attachmentNames = await getAttachmentNamesOnly(emailItem, token);
+    const attachmentNames = await steps.run("listing attachments", () => getAttachmentNamesOnly(emailItem, token));
+    const emailDate = await steps.run("reading the send date", () => getEmailDateReliable());
     const emailRecord = {
       id: uid(), msgId,
       subject: emailItem.subject || "",
@@ -8703,7 +8779,7 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       fromAddress: from?.emailAddress || "",
       to,
       cc,
-      date: await getEmailDateReliable(),
+      date: emailDate,
       bodyText: bodyHtml ? stripHtmlToText(bodyHtml) : "",
       bodyHtmlCompressed: compressedBody,
       bodyHtmlSize: bodyHtml.length,
@@ -8715,16 +8791,16 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
       savedToSharePoint: false,
     };
     const projAtSave = selectedProject; // pin the target; selectedProject can change during the awaits below
-    await applyLocalChangeAndSave(projAtSave.id, fresh => {
+    await steps.run("saving to the project", () => applyLocalChangeAndSave(projAtSave.id, fresh => {
       // Dedup against FRESH data, mirroring the DB's (project_id, msg_id)
       // uniqueness: if this email was filed here since our pane last synced
       // (another user, or a prior auto-save), don't append a second copy.
       if ((fresh.emails || []).some(e => e.msgId && e.msgId === emailRecord.msgId)) return fresh;
       return { ...fresh, emails: [...(fresh.emails || []), emailRecord] };
-    });
+    }));
     let indexSaveFailed = false;
     try {
-      await saveProjectEmailRow(projAtSave.id, emailRecord, false);
+      await steps.run("updating the email index", () => saveProjectEmailRow(projAtSave.id, emailRecord, false));
     } catch (idxErr) {
       console.warn("saveProjectEmailRow failed:", idxErr);
       indexSaveFailed = true;
@@ -8751,9 +8827,16 @@ async function _doSaveToProjectRecordOnly(quiet = false) {
     // versions), or a post-save refresh that didn't find the record — resolve it:
     // clear on success, or point at the manual Save button on failure. Guarded on
     // the in-progress text, so real "Saved"/"Logged"/"Auto-tagged" messages survive.
+    const took = steps.stop();
     const el = document.getElementById("actionStatus");
     if (el && (el.textContent || "").includes("Logging email to project")) {
-      if (ok) setStatus("actionStatus", "", "");
+      // A slow-but-successful log says so, and names the step that ate the
+      // time — otherwise the only trace of a 3-minute save is a user's memory.
+      if (ok && took.totalMs >= LOG_SLOW_MS) {
+        setStatus("actionStatus", "info", "✓ Logged to project — slower than usual (" + Math.round(took.totalMs / 1000) + "s" +
+          (took.slowest ? "; slowest step: " + took.slowest.label + ", " + Math.round(took.slowest.ms / 1000) + "s" : "") + ").");
+      }
+      else if (ok) setStatus("actionStatus", "", "");
       else setStatus("actionStatus", "info", "Couldn't auto-log this email — reopen it or use 🗂️ Save to Project.");
     }
   }
