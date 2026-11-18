@@ -2318,7 +2318,45 @@ async function sbFetchAllRows(pathQuery, label) {
   return out;
 }
 
+// ─── "Can't reach the PMS database" banner ────────────────────────────────────
+// Everything the pane shows about a project comes from Supabase. When Supabase
+// is down or slow (Nov 18 2026: the project went unhealthy and every request
+// hung ~90 s before a 522), the pane used to sit on "Loading…" with no
+// explanation. loadProjects() drives this banner: "slow" after a few seconds
+// without an answer, "down" once the read has actually failed, hidden again on
+// the next successful read (the silent refresh on email switch retries).
+const DB_SLOW_BANNER_MS = 8000;
+function setDbStatusBanner(state, hasCache) {
+  const el = document.getElementById("dbStatusBanner");
+  const msg = document.getElementById("dbStatusBannerMsg");
+  if (!el || !msg) return;
+  el.classList.toggle("show", state === "slow" || state === "down");
+  el.classList.toggle("slow", state === "slow");
+  if (state === "slow") {
+    msg.textContent = "⏳ Still trying to reach the PMS database…";
+  } else if (state === "down") {
+    msg.textContent = "⚠ Can't reach the PMS database. " +
+      (hasCache
+        ? "Showing the project list saved on this computer; saving and filing may fail until it is back."
+        : "Projects can't load and saving won't work until it is back.") +
+      " This is not a problem with your sign-in or this email.";
+  }
+}
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("dbStatusBannerBtn");
+  if (btn) btn.onclick = () => { refreshProjectData(); };
+});
 async function loadProjects() {
+  const slowTimer = setTimeout(() => setDbStatusBanner("slow"), DB_SLOW_BANNER_MS);
+  try {
+    const state = await _loadProjectsInner();
+    setDbStatusBanner(state.ok ? "ok" : "down", state.hasCache);
+  } finally {
+    clearTimeout(slowTimer);
+  }
+}
+// Resolves { ok, hasCache }: ok = Supabase answered a project read this call.
+async function _loadProjectsInner() {
   await settyAuthReady;   // session header set before the first Supabase read
   // Hydrate from cache instantly (if available) so the pane is responsive
   // even before the fresh fetch returns. The cache holds the *projects array*
@@ -2373,7 +2411,7 @@ async function loadProjects() {
         // Milestone-event card may have rendered from the slim cache (or not at
         // all, on a first-ever pane open) — re-render from the fresh rows.
         try { renderMilestoneEventCard(); } catch {}
-        return;
+        return { ok: true, hasCache: renderedFromCache };
       }
     }
   } catch (e) {
@@ -2382,7 +2420,7 @@ async function loadProjects() {
     // populated and surface a soft warning rather than blowing away the UI.
     if (renderedFromCache) {
       console.info("Working from cached projects (offline or transient error). Saves will revalidate.");
-      return;
+      return { ok: false, hasCache: true };
     }
   }
   // Legacy fallback
@@ -2390,13 +2428,16 @@ async function loadProjects() {
     const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_data?id=eq.singleton&select=projects,clients", {
       headers: SB_HEADERS,
     }, { label: "sb loadProjects legacy" });
+    if (!res.ok) throw new Error("sb loadProjects legacy HTTP " + res.status);
     const rows = await res.json();
-    if (!rows || !rows[0]) return;
+    if (!rows || !rows[0]) return { ok: true, hasCache: renderedFromCache };
     allProjects = (rows[0].projects || []).filter(p => !p.archived);
     allClients = rows[0].clients || [];
     renderCompanySuggestions();
+    return { ok: true, hasCache: renderedFromCache };
   } catch (e) {
     console.error("Failed to load projects:", e);
+    return { ok: false, hasCache: renderedFromCache };
   }
 }
 
@@ -9769,7 +9810,20 @@ function caAiEmailHtml(kind, ai) {
   const flags = Array.isArray(ai.redFlags) ? ai.redFlags.filter(Boolean) : [];
   let h = `<div style="font-size:11px;font-weight:700;color:#1F3864;letter-spacing:1px;margin:14px 0 6px">CLAUDE REVIEW (suggestions pending your sign-off in the PMS)</div>`;
   if (ai.reviewedAgainstSet) h += `<p style="margin:0 0 6px"><strong>Reviewed against:</strong> ${esc(ai.reviewedAgainstSet)}</p>`;
-  if (flags.length) h += `<p style="margin:0 0 4px"><strong>Red flags:</strong></p><ul style="margin:0 0 8px 18px">${flags.map(f => `<li>${nl(typeof f === "string" ? f : (f.text || f.note || JSON.stringify(f)))}</li>`).join("")}</ul>`;
+  // A red flag is a string (old reviews) or { title, action, sheets, evidence,
+  // severity } (current). Never dump the object: render each part as text.
+  const flagHtml = (f) => {
+    if (typeof f === "string") return nl(f);
+    const head = f.title || f.text || f.note || "";
+    if (!head && !f.action && !f.evidence) return nl(JSON.stringify(f));
+    const sheets = Array.isArray(f.sheets) ? f.sheets.filter(Boolean).join(", ") : "";
+    const tag = [f.severity, sheets].filter(Boolean).map(esc).join(" · ");
+    return (tag ? `<span style="font-size:10px;font-weight:700;text-transform:uppercase;color:#64748b">${tag}</span><br>` : "") +
+      nl(head) +
+      (f.evidence ? `<br><span style="color:#64748b">Evidence: ${nl(f.evidence)}</span>` : "") +
+      (f.action ? `<br><span style="color:#64748b">Suggested: ${nl(f.action)}</span>` : "");
+  };
+  if (flags.length) h += `<p style="margin:0 0 4px"><strong>Red flags:</strong></p><ul style="margin:0 0 8px 18px">${flags.map(f => `<li style="margin:0 0 6px">${flagHtml(f)}</li>`).join("")}</ul>`;
   if (!isRFI && ai.suggestedStamp) h += `<p style="margin:0 0 6px"><strong>Suggested stamp:</strong> ${esc(ai.suggestedStamp)}</p>`;
   if (ai.suggestedResponse) h += `<p style="margin:0 0 4px"><strong>Suggested ${isRFI ? "response" : "review comments"}:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.suggestedResponse)}</p>`;
   if (ai.internalNotes) h += `<p style="margin:0 0 4px"><strong>Internal notes — verify before returning:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.internalNotes)}</p>`;
@@ -13719,6 +13773,10 @@ function humanizeError(err) {
     return "You're signed out — click Sign in in the yellow banner at the top of the pane, then retry.";
   if (m.includes("save conflict") || m.includes("modified by someone else"))
     return "Someone else updated this project at the same moment. Retry — the add-in re-reads the latest version before saving.";
+  // Supabase down: Cloudflare answers 52x (often with a whole HTML error page
+  // as the body). Never show that page to the user.
+  if (/\bhttp 5\d\d\b/.test(m) || /error code 5\d\d|<!doctype html|<html/.test(m))
+    return "Can't reach the PMS database right now — wait a few minutes and retry. This is not a problem with your sign-in.";
   if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))
     return "Network hiccup — check your connection (VPN?) and retry.";
   if (m.includes("quota"))
