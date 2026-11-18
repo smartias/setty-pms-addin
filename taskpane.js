@@ -9769,7 +9769,20 @@ function caAiEmailHtml(kind, ai) {
   const flags = Array.isArray(ai.redFlags) ? ai.redFlags.filter(Boolean) : [];
   let h = `<div style="font-size:11px;font-weight:700;color:#1F3864;letter-spacing:1px;margin:14px 0 6px">CLAUDE REVIEW (suggestions pending your sign-off in the PMS)</div>`;
   if (ai.reviewedAgainstSet) h += `<p style="margin:0 0 6px"><strong>Reviewed against:</strong> ${esc(ai.reviewedAgainstSet)}</p>`;
-  if (flags.length) h += `<p style="margin:0 0 4px"><strong>Red flags:</strong></p><ul style="margin:0 0 8px 18px">${flags.map(f => `<li>${nl(typeof f === "string" ? f : (f.text || f.note || JSON.stringify(f)))}</li>`).join("")}</ul>`;
+  // A red flag is a string (old reviews) or { title, action, sheets, evidence,
+  // severity } (current). Never dump the object: render each part as text.
+  const flagHtml = (f) => {
+    if (typeof f === "string") return nl(f);
+    const head = f.title || f.text || f.note || "";
+    if (!head && !f.action && !f.evidence) return nl(JSON.stringify(f));
+    const sheets = Array.isArray(f.sheets) ? f.sheets.filter(Boolean).join(", ") : "";
+    const tag = [f.severity, sheets].filter(Boolean).map(esc).join(" · ");
+    return (tag ? `<span style="font-size:10px;font-weight:700;text-transform:uppercase;color:#64748b">${tag}</span><br>` : "") +
+      nl(head) +
+      (f.evidence ? `<br><span style="color:#64748b">Evidence: ${nl(f.evidence)}</span>` : "") +
+      (f.action ? `<br><span style="color:#64748b">Suggested: ${nl(f.action)}</span>` : "");
+  };
+  if (flags.length) h += `<p style="margin:0 0 4px"><strong>Red flags:</strong></p><ul style="margin:0 0 8px 18px">${flags.map(f => `<li style="margin:0 0 6px">${flagHtml(f)}</li>`).join("")}</ul>`;
   if (!isRFI && ai.suggestedStamp) h += `<p style="margin:0 0 6px"><strong>Suggested stamp:</strong> ${esc(ai.suggestedStamp)}</p>`;
   if (ai.suggestedResponse) h += `<p style="margin:0 0 4px"><strong>Suggested ${isRFI ? "response" : "review comments"}:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.suggestedResponse)}</p>`;
   if (ai.internalNotes) h += `<p style="margin:0 0 4px"><strong>Internal notes — verify before returning:</strong></p><p style="margin:0 0 8px 12px">${nl(ai.internalNotes)}</p>`;
