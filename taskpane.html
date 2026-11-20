@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-11-18-db-unreachable-banner";</script>
+  <script>window.__appVersion = "2026-11-19-cdn-integrity";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -24,12 +24,12 @@
       .catch(e => console.warn("[caIntake] not loaded:", e && e.message));
   </script>
   <!-- pako: zlib in JS — compresses email HTML bodies before storing in Supabase -->
-  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js" integrity="sha384-rNlaE5fs9dGIjmxWDALQh/RBAaGRYT5ChrzHo6tRfgrZ36iRFAiquP5g41Jsv+0j" crossorigin="anonymous"></script>
   <!-- docx: generates DOCX cover sheets for RFI Responses and Submittal Reviews
        (matches the library transmittal.html uses, same version). The blob is
        uploaded directly to SharePoint /OUT — we don't need file-saver since
        we're not offering a local download. -->
-  <script src="https://unpkg.com/docx@8.2.3/build/index.umd.js"></script>
+  <script src="https://unpkg.com/docx@8.2.3/build/index.umd.js" integrity="sha384-Q0Ynt576ix2KycMPIjsvrko1+xjN6y6M7dIfqwUIfTFptvoJjT17+gci4Ano9r+K" crossorigin="anonymous"></script>
   <!-- canvas-confetti is loaded lazily on first celebration (see loadConfetti
        in taskpane.js) so it doesn't slow down pane open. ~5KB on first
        celebration, then browser-cached. -->
@@ -1691,6 +1691,6 @@
   cached one. Without this, even a full Outlook restart can keep loading
   stale JS until the WebView2 cache naturally expires.
 -->
-<script src="taskpane.js?v=2026-11-18-db-unreachable-banner"></script>
+<script src="taskpane.js?v=2026-11-19-cdn-integrity"></script>
 </body>
 </html>
