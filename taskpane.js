@@ -7861,7 +7861,9 @@ function encodeDrivePath(path) {
     .map(p => encodeURIComponent(p))
     .join("/");
 }
-// Create a folder idempotently (conflictBehavior:replace is a no-op on existing folders).
+// Create a folder if it is missing. conflictBehavior is "fail": an existing
+// folder answers 409 and is left exactly as it is. Never "replace" here: on
+// current Graph that can delete the folder and recreate it empty.
 // Retries transient failures and logs non-OK responses — a silently failed
 // create used to surface later as confusing 404s on the uploads into it.
 // Still never throws: the subsequent upload is the authoritative failure signal.
@@ -7870,7 +7872,7 @@ async function ensureSpFolder(driveId, token, parentPath, name) {
     const res = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
-      body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "replace" }),
+      body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
     }, { label: "graph ensure folder" });
     if (!res.ok && res.status !== 409) {
       console.warn("[sp-folder] create HTTP", res.status, "for", parentPath + "/" + name);
@@ -7912,7 +7914,9 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
   // uploadedFiles[]: per-file metadata for the audit log. Each successful upload
   // appends { name, size, sha256, contentType, verified }. Phase 2 will populate
   // sha256 + verified once read-back lands.
-  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [] };
+  // emailHtmlOk: null until the email.html PUT answers, then true / false.
+  lastAttachmentUploadStats = { attempted: 0, uploaded: 0, failed: [], uploadedFiles: [], attemptedNames: [], emailHtmlOk: null };
+  const stats = lastAttachmentUploadStats;
   const bodyHtml = await getEmailBodyHtml(token, item); // snapshot — see header comment
   // Kick off the email.html upload in parallel with the attachment loop —
   // they don't depend on each other, so why serialize them.
@@ -7923,6 +7927,9 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
       headers: { "Authorization": "Bearer " + token, "Content-Type": "text/html" },
       body: buildEmailHtml(bodyHtml, item),
     }
+  ).then(
+    (r) => { stats.emailHtmlOk = !!r.ok; if (!r.ok) console.warn("[email.html] upload HTTP", r.status); return r; },
+    (e) => { stats.emailHtmlOk = false; console.warn("[email.html] upload failed:", e?.message); return null; }
   );
 
   // Quick-Win #3: parallelize attachment uploads with bounded concurrency.
@@ -8050,6 +8057,33 @@ async function uploadEmailAndAttachments(driveId, token, targetPath, itemSnapsho
     try { await emailHtmlPromise; } catch {}
     return 0;
   }
+}
+// What did NOT reach SharePoint in the last uploadEmailAndAttachments run, as
+// one line for the user ("" when everything landed). The RFI / submittal
+// flows used to say "filed to SharePoint" without looking at this.
+function uploadShortfallNote() {
+  const s = lastAttachmentUploadStats;
+  if (!s) return "";
+  const parts = [];
+  const attempted = s.attempted || 0;
+  const uploaded = s.uploaded || 0;
+  const names = (s.failed || []).slice(0, 2).join("; ");
+  if (attempted > uploaded) {
+    parts.push((attempted - uploaded) + " of " + attempted + " attachment" + (attempted > 1 ? "s" : "") + " did not upload" + (names ? " (" + names + ")" : ""));
+  } else if ((s.failed || []).length) {
+    parts.push("the attachments could not be read" + (names ? " (" + names + ")" : ""));
+  }
+  if (s.emailHtmlOk === false) parts.push("the copy of the email did not upload");
+  if (!parts.length) return "";
+  const line = parts.join("; ");
+  return "⚠ " + line.charAt(0).toUpperCase() + line.slice(1) + ". Open the folder and add what is missing.";
+}
+// True when `number` is already used by an item in the log (case and spacing
+// ignored), so a typed or portal number cannot be issued twice.
+function caNumberTaken(items, number) {
+  const norm = (v) => String(v || "").replace(/\s+/g, "").toLowerCase();
+  const n = norm(number);
+  return !!n && (items || []).some((it) => norm(it && it.number) === n);
 }
 function toBytesFromBase64(base64) {
   const binary = atob(base64 || "");
@@ -8809,6 +8843,7 @@ if (existingRecord) {
       const failedNames = (lastAttachmentUploadStats?.failed || []).slice(0, 2).join("; ");
       warnings.push("⚠ Only " + attCount + "/" + attempted + " attachments uploaded" + (failedNames ? " (failed: " + failedNames + ")" : "") + ".");
     }
+    if (lastAttachmentUploadStats?.emailHtmlOk === false) warnings.push("⚠ The copy of the email (email.html) did not upload. Save again to retry.");
     if (indexSaveFailed) warnings.push("⚠ Email saved to project, but search-index write failed — it may not appear in PMS email searches until you resave or PMS is reloaded.");
     if (spLinkAttachFailed) warnings.push("⚠ Files are in SharePoint, but the project record link did not attach. Open the folder from the project in PMS, or re-save this email to retry the link.");
 
@@ -10873,7 +10908,7 @@ function prefillRfi() {
   // getResolvedItemSubject guards against the compose-mode async Subject object
   // (a raw emailItem.subject here saved "[object Object]" as the RFI title).
   document.getElementById("rfiTitle").value = getResolvedItemSubject();
-  document.getElementById("rfiNumber").value = nextAutoRfiNumber();
+  { const n = document.getElementById("rfiNumber"); n.value = n.dataset.auto = nextAutoRfiNumber(); }
   document.getElementById("rfiDescription").value = "";
   document.getElementById("rfiNotes").value = "";
   // Reset to Email default — most add-in-filed RFIs come via email since the
@@ -10913,7 +10948,8 @@ async function doSaveRfi() {
   const picked = readAssignees("rfi");
   const assignedToStaff = picked.staff;
   const subAssigned = picked.sub;
-  return withFilingScaffold(
+  const numberUntouched = !userEnteredNumber || userEnteredNumber === (document.getElementById("rfiNumber")?.dataset.auto || "");
+  const filed = await withFilingScaffold(
     { operation: "rfi-new", statusElement: "rfiStatus" },
     async ({ snapItem }) => {
       // Re-fetch fresh project data so the auto-number (if the user didn't
@@ -10933,7 +10969,14 @@ async function doSaveRfi() {
 
       const existingRfis = freshProject.rfis || [];
       const autoNum = caNextNumber(existingRfis, "rfi", (freshProject.caNumberHighWater || {}).rfi);
-      const rfiNumber = userEnteredNumber || autoNum;
+      // An untouched auto number follows the cloud (someone may have logged
+      // one since the form opened). A typed or portal number is kept, but
+      // never issued twice: both items would file into one SharePoint folder.
+      const rfiNumber = numberUntouched ? autoNum : userEnteredNumber;
+      if (!numberUntouched && caNumberTaken(existingRfis, rfiNumber)) {
+        setStatus("rfiStatus", "error", rfiNumber + " is already in this project's RFI log. To add this email to it, use \"File to existing RFI\" above. To log a new RFI, change the number.");
+        return { skip: true };
+      }
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
 
@@ -10945,6 +10988,7 @@ async function doSaveRfi() {
       let inFolderWebUrl = ""; // /IN folder URL (for the assignment email body link)
       let emailFolderUrl = ""; // specific per-email subfolder (for audit log)
       let spUploadError = "";
+      let uploadWarning = "";  // attachments / email copy that did not land
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
@@ -10963,6 +11007,7 @@ async function doSaveRfi() {
           spFolderUrl    = SP_BASE_URL + "/" + rfiPath.split("/").map(encodeURIComponent).join("/");
           inFolderWebUrl = uploadResult.inFolderUrl;
           emailFolderUrl = uploadResult.emailFolderUrl;
+          uploadWarning  = uploadShortfallNote();
         } catch (e) {
           console.warn("RFI SP upload failed:", e.message);
           spUploadError = e.message;
@@ -11031,20 +11076,21 @@ async function doSaveRfi() {
 
       const baseMsg = "✓ " + rfiNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = assignee?.email ? "" : (assignee ? " · ⚠ assignee has no email on file" : "");
-      const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
+      const errMsg = (spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "") + (uploadWarning ? " · " + uploadWarning : "");
       return {
         // sp_folder_url points at the per-email subfolder so the reconcile
         // sweep checks the right place. Falls back to the RFI root, then null,
         // depending on which step succeeded.
         sp_folder_url:  emailFolderUrl || spFolderUrl || null,
-        status:         emailFolderUrl ? "success" : (spFolderUrl ? "partial" : "partial"),
-        error:          emailFolderUrl ? null : (spUploadError || "RFI logged without SharePoint upload"),
+        status:         emailFolderUrl && !uploadWarning ? "success" : "partial",
+        error:          emailFolderUrl ? (uploadWarning || null) : (spUploadError || "RFI logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
         // For the done block on the main view (showArtifactDone).
-        done: { kind: "rfi", number: rfiNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
+        done: { kind: "rfi", number: rfiNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, uploadWarning, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
+  return filed && filed.skip ? undefined : filed;
 }
 // Upload an email + its attachments INTO an RFI/Submittal's /IN folder, using
 // a per-email subfolder so multiple emails coexist without colliding on
@@ -11583,6 +11629,7 @@ async function submitRfiResponse() {
     // its spFolderUrl points at the RFI root; if it predates the new structure
     // the folder will simply be flat — either way, OUT is created inside.
     let outFolderWebUrl = "";
+    let docxUploaded = true; // false when the cover sheet PUT to /OUT failed
     let inFolderWebUrl = "";
     if (selectedProject?.projectFolderUrl) {
       const token = await getToken();
@@ -11609,11 +11656,11 @@ async function submitRfiResponse() {
       // same integrity guarantees as everything else.
       const safeName = `${(rfi.number || "RFI").replace(/[\\/:*?"<>|]/g, "-")}_Response.docx`;
       const bytes = new Uint8Array(await docxBlob.arrayBuffer());
-      await uploadAttachmentToSharePoint(
+      docxUploaded = !!(await uploadAttachmentToSharePoint(
         driveId, token, outPath, safeName,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         bytes
-      );
+      ));
 
       outFolderWebUrl = SP_BASE_URL + "/" + outPath.split("/").map(encodeURIComponent).join("/");
       inFolderWebUrl  = SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/");
@@ -11642,9 +11689,9 @@ async function submitRfiResponse() {
     // can verify the docx is there.
     const filingOutcome = {
       sp_folder_url: outFolderWebUrl || null,
-      files:         [{ name: `${rfi.number}_Response.docx`, verified: true, distributionKind: "save-sp" }],
-      status:        outFolderWebUrl ? "success" : "partial",
-      error:         outFolderWebUrl ? null : "RFI response logged without SharePoint upload",
+      files:         docxUploaded ? [{ name: `${rfi.number}_Response.docx`, verified: true, distributionKind: "save-sp" }] : [],
+      status:        outFolderWebUrl && docxUploaded ? "success" : "partial",
+      error:         !outFolderWebUrl ? "RFI response logged without SharePoint upload" : (docxUploaded ? null : "Cover sheet DOCX did not upload to OUT"),
     };
 
     // 6. Open the draft to the recipients shown in the form (the user saw and
@@ -11657,7 +11704,7 @@ async function submitRfiResponse() {
 
     setStatus("rfiResponseStatusMsg", "success",
       `✓ ${rfi.number} response logged (status: ${newStatus})` +
-      (outFolderWebUrl ? " · DOCX in /OUT" : "") +
+      (outFolderWebUrl ? (docxUploaded ? " · DOCX in /OUT" : " · ⚠ DOCX did not upload") : "") +
       (draftOpened ? " · ✉️ Draft opened" : ""));
 
     // Refresh the main view's chip so it reflects the new status (Responded).
@@ -11666,6 +11713,9 @@ async function submitRfiResponse() {
       try { refreshLoggedArtifactChips(); } catch {}
     try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
+      // This view is about to disappear, so a failed cover sheet is repeated
+      // on the main view where it stays.
+      if (outFolderWebUrl && !docxUploaded) setStatus("actionStatus", "error", "⚠ " + rfi.number + " response is logged, but the cover sheet did not upload to the OUT folder. The draft email links to that folder, so check the folder before you send it.");
     }, 1500);
     return filingOutcome;
   }).finally(() => {
@@ -11839,6 +11889,7 @@ async function doFileToExistingRfi() {
       }
       const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
       const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const shortfall = uploadShortfallNote();
       const status =
         (attempted > 0 && attCount === 0)       ? "failed" :
         (attempted > 0 && attCount < attempted) ? "partial" :
@@ -11847,9 +11898,9 @@ async function doFileToExistingRfi() {
         // sp_folder_url points at the per-email subfolder so reconcile finds
         // the files in the right place.
         sp_folder_url:  uploadResult.emailFolderUrl,
-        status,
-        error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
-        successMessage: "✓ Filed to " + rfi.number + " · IN" + attMsg,
+        status:         status === "success" && shortfall ? "partial" : status,
+        error:          shortfall || null,
+        successMessage: "✓ Filed to " + rfi.number + " · IN" + attMsg + (shortfall ? " · " + shortfall : ""),
       };
     }
   );
@@ -11867,7 +11918,7 @@ function nextAutoSubNumber() {
 function prefillSub() {
   // Same compose-mode guard as prefillRfi.
   document.getElementById("subDesc").value = getResolvedItemSubject();
-  document.getElementById("subNumber").value = nextAutoSubNumber();
+  { const n = document.getElementById("subNumber"); n.value = n.dataset.auto = nextAutoSubNumber(); }
   document.getElementById("subFullDescription").value = "";
   document.getElementById("subNotes").value = "";
   document.getElementById("subReceivedVia").value = "Email";
@@ -11901,7 +11952,8 @@ async function doSaveSub() {
   const picked = readAssignees("sub");
   const assignedToStaff = picked.staff;
   const subAssigned = picked.sub;
-  return withFilingScaffold(
+  const numberUntouched = !userEnteredNumber || userEnteredNumber === (document.getElementById("subNumber")?.dataset.auto || "");
+  const filed = await withFilingScaffold(
     { operation: "sub-new", statusElement: "subStatus" },
     async ({ snapItem }) => {
       // Re-fetch so submittal numbering reflects current cloud state.
@@ -11919,7 +11971,13 @@ async function doSaveSub() {
 
       const existing = freshProject.submittals || [];
       const autoNum = caNextNumber(existing, "submittal", (freshProject.caNumberHighWater || {}).submittal);
-      const subNumber = userEnteredNumber || autoNum;
+      // Same rule as doSaveRfi: untouched auto number follows the cloud, a
+      // typed or portal number is never issued twice.
+      const subNumber = numberUntouched ? autoNum : userEnteredNumber;
+      if (!numberUntouched && caNumberTaken(existing, subNumber)) {
+        setStatus("subStatus", "error", subNumber + " is already in this project's submittal log. To add this email to it, use \"File to existing submittal\" above. To log a new submittal, change the number.");
+        return { skip: true };
+      }
       const discCode = getDisciplineCode(discipline);
       const received = new Date();
 
@@ -11928,6 +11986,7 @@ async function doSaveSub() {
       let inFolderWebUrl = "";
       let emailFolderUrl = "";
       let spUploadError = "";
+      let uploadWarning = "";
       if (freshProject.projectFolderUrl) {
         try {
           const token = await getToken();
@@ -11944,6 +12003,7 @@ async function doSaveSub() {
           spFolderUrl    = SP_BASE_URL + "/" + subPath.split("/").map(encodeURIComponent).join("/");
           inFolderWebUrl = uploadResult.inFolderUrl;
           emailFolderUrl = uploadResult.emailFolderUrl;
+          uploadWarning  = uploadShortfallNote();
         } catch (e) {
           console.warn("Submittal SP upload failed:", e.message);
           spUploadError = e.message;
@@ -12007,16 +12067,17 @@ async function doSaveSub() {
 
       const baseMsg = "✓ " + subNumber + " logged" + (spFolderUrl ? " · filed to SharePoint" : "");
       const draftMsg = assignee && !assignee.email ? " · ⚠ assignee has no email on file" : "";
-      const errMsg = spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "";
+      const errMsg = (spUploadError ? ` · ⚠ SP upload failed: ${spUploadError.slice(0, 120)}` : "") + (uploadWarning ? " · " + uploadWarning : "");
       return {
         sp_folder_url:  emailFolderUrl || spFolderUrl || null,
-        status:         emailFolderUrl ? "success" : "partial",
-        error:          emailFolderUrl ? null : (spUploadError || "Submittal logged without SharePoint upload"),
+        status:         emailFolderUrl && !uploadWarning ? "success" : "partial",
+        error:          emailFolderUrl ? (uploadWarning || null) : (spUploadError || "Submittal logged without SharePoint upload"),
         successMessage: baseMsg + draftMsg + errMsg,
-        done: { kind: "submittal", number: subNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, projectId: freshProject.id || selectedProject.id },
+        done: { kind: "submittal", number: subNumber, folderUrl: spFolderUrl, assignDraft, assigneeNoEmail: !!(assignee && !assignee.email), spUploadError, uploadWarning, projectId: freshProject.id || selectedProject.id },
       };
     }
   );
+  return filed && filed.skip ? undefined : filed;
 }
 
 // "Log" vs "Log & add another": a single transmittal email often carries several
@@ -12030,7 +12091,7 @@ async function saveArtifactThen(kind, another) {
   if (!r) return; // validation failed or save errored — stay on the form, keep input
   if (another) {
     const numEl = document.getElementById(isRfi ? "rfiNumber" : "subNumber");
-    if (numEl) numEl.value = isRfi ? nextAutoRfiNumber() : nextAutoSubNumber();
+    if (numEl) numEl.value = numEl.dataset.auto = isRfi ? nextAutoRfiNumber() : nextAutoSubNumber();
     const statusId = isRfi ? "rfiStatus" : "subStatus";
     const noun = isRfi ? "RFI" : "submittal";
     setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
@@ -12060,6 +12121,7 @@ function showArtifactDone(d, fallbackMsg) {
       `<div style="min-width:0;">` +
         `<div style="font-size:13px;font-weight:700;color:var(--success);">${/^(RFI|SUB)-/i.test(d.number || "") ? "" : escHtml(noun) + " "}${escHtml(d.number || "")} logged</div>` +
         `<div style="font-size:11px;color:var(--text-soft);">${escHtml(bits.join(" · "))}${d.spUploadError ? " — " + escHtml(String(d.spUploadError).slice(0, 120)) : ""}</div>` +
+        (d.uploadWarning ? `<div style="font-size:11px;color:#b45309;font-weight:600;margin-top:2px;">${escHtml(d.uploadWarning)}</div>` : "") +
       `</div>` +
     `</div>` +
     `<div style="margin-top:6px;">` +
@@ -12149,6 +12211,7 @@ async function submitSubReview() {
     });
 
     let outFolderWebUrl = "";
+    let docxUploaded = true; // false when the cover sheet PUT to /OUT failed
     let inFolderWebUrl = "";
     if (selectedProject?.projectFolderUrl) {
       const token = await getToken();
@@ -12167,11 +12230,11 @@ async function submitSubReview() {
 
       const safeName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
       const bytes = new Uint8Array(await docxBlob.arrayBuffer());
-      await uploadAttachmentToSharePoint(
+      docxUploaded = !!(await uploadAttachmentToSharePoint(
         driveId, token, outPath, safeName,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         bytes
-      );
+      ));
 
       outFolderWebUrl = SP_BASE_URL + "/" + outPath.split("/").map(encodeURIComponent).join("/");
       inFolderWebUrl  = SP_BASE_URL + "/" + inPath.split("/").map(encodeURIComponent).join("/");
@@ -12192,9 +12255,9 @@ async function submitSubReview() {
 
     const filingOutcome = {
       sp_folder_url: outFolderWebUrl || null,
-      files:         [{ name: `${sub.number}_Review.docx`, verified: true, distributionKind: "save-sp" }],
-      status:        outFolderWebUrl ? "success" : "partial",
-      error:         outFolderWebUrl ? null : "Submittal review logged without SharePoint upload",
+      files:         docxUploaded ? [{ name: `${sub.number}_Review.docx`, verified: true, distributionKind: "save-sp" }] : [],
+      status:        outFolderWebUrl && docxUploaded ? "success" : "partial",
+      error:         !outFolderWebUrl ? "Submittal review logged without SharePoint upload" : (docxUploaded ? null : "Cover sheet DOCX did not upload to OUT"),
     };
 
     // The draft opens to the recipients shown in the form (seen and editable
@@ -12209,13 +12272,15 @@ async function submitSubReview() {
 
     setStatus("subReviewStatusMsg", "success",
       `✓ ${sub.number} review logged (stamp: ${stamp})` +
-      (outFolderWebUrl ? " · DOCX in /OUT" : "") +
+      (outFolderWebUrl ? (docxUploaded ? " · DOCX in /OUT" : " · ⚠ DOCX did not upload") : "") +
       (draftOpened ? " · ✉️ Draft opened" : ""));
 
     setTimeout(() => {
       try { refreshLoggedArtifactChips(); } catch {}
     try { refreshLinkToTargetDropdown(); } catch {}
       showView("mainView");
+      // See submitRfiResponse: repeat a failed cover sheet where it stays.
+      if (outFolderWebUrl && !docxUploaded) setStatus("actionStatus", "error", "⚠ " + sub.number + " review is logged, but the cover sheet did not upload to the OUT folder. The draft email links to that folder, so check the folder before you send it.");
     }, 1500);
     return filingOutcome;
   }).finally(() => {
@@ -12360,6 +12425,7 @@ async function doFileToExistingSub() {
       }
       const attMsg = attCount ? " + " + attCount + " attachment" + (attCount > 1 ? "s" : "") : "";
       const attempted = lastAttachmentUploadStats?.attempted || 0;
+      const shortfall = uploadShortfallNote();
       const status =
         (attempted > 0 && attCount === 0)       ? "failed" :
         (attempted > 0 && attCount < attempted) ? "partial" :
@@ -12367,9 +12433,9 @@ async function doFileToExistingSub() {
       return {
         // Audit log points at the per-email subfolder so reconcile finds files there.
         sp_folder_url:  uploadResult.emailFolderUrl,
-        status,
-        error:          status === "success" ? null : `${attCount}/${attempted} uploaded`,
-        successMessage: "✓ Filed to " + sub.number + " · IN" + attMsg,
+        status:         status === "success" && shortfall ? "partial" : status,
+        error:          shortfall || null,
+        successMessage: "✓ Filed to " + sub.number + " · IN" + attMsg + (shortfall ? " · " + shortfall : ""),
       };
     }
   );
