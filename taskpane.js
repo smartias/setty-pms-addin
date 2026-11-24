@@ -9828,7 +9828,7 @@ function caAssignmentSteps({ kind, item, project, folderUrl }) {
        `. Start with the Claude review box at the top: red flags first, then the suggested ${isRFI ? "answer" : "stamp and comments"} and the sheets it checked. Verify against the current set before you trust it.`) +
     li(`The contractor's ${isRFI ? "question" : "submittal"} and attachments are in ` + (folderUrl ? `<a href="${esc(folderUrl)}">the SharePoint folder</a>` : `the SharePoint folder (no link yet; ask ${esc(pm) || "the sender"})`) + ".") +
     li(isRFI ? `Write your answer in the <b>Response</b> field. <i>Copy into Response</i> takes the Claude suggestion if it is right; edit it until it is yours. Anything internal goes in <b>Internal notes</b>, which never leave the office.`
-             : `Pick the <b>Stamp</b> and write the <b>Review comments</b> that go back to the contractor. The status follows the stamp. Anything internal goes in <b>Internal notes</b>, which never leave the office.`) +
+             : `Pick the <b>Stamp</b> and write the <b>Review comments</b> that go back to the contractor. When the return is sent the status follows the stamp (Revise and Resubmit or Rejected becomes Resubmittal Required). Anything internal goes in <b>Internal notes</b>, which never leave the office.`) +
     li(`When your answer is final, either issue it yourself — the item's <b>Issue it</b> panel in the PMS shows how for this job (${esc(caIssueGuide(project.caPortal && project.caPortal.platform, isRFI).where)}) — or press <b>Answer ready — hand to CA</b> and ${esc(pm) || "the CA coordinator"} issues it. Issuing sets the status to ${isRFI ? "Responded" : "Returned"}.`) +
     li(`If this is not yours, or you cannot meet the date, tell ${esc(pm) || "the project manager"} today rather than on the due date.`) +
     `</ol>`;
@@ -10693,6 +10693,8 @@ function caDueDays(project, kind) {
   return kind === "rfi" ? (+(project && project.rfiDueDays) || 5) : (+(project && project.submittalDueDays) || 10);
 }
 // A stamp that sends the submittal back means the ball is in the contractor's court.
+// Same rule as statusForStamp in setty-pms caStatus.js (the PMS and Tracker
+// use that file): change both together.
 function subStatusForStamp(stamp) {
   return (stamp === "Revise and Resubmit" || stamp === "Rejected") ? "Resubmittal Required" : "Returned";
 }
@@ -11675,7 +11677,9 @@ async function submitRfiResponse() {
       rfis: (fresh.rfis || []).map(r => r.id === rfi.id ? {
         ...r,
         response: responseText,
-        dateResponded,
+        // Routed to a sub: nothing has gone back to the contractor yet, so no
+        // responded date (it is set when the answer is actually issued).
+        ...(newStatus === "Pending Sub Response" ? {} : { dateResponded }),
         status: newStatus,
         ...routing,
       } : r),
