@@ -77,3 +77,46 @@ test("sub due date: 2 working days before the contractor's, never before tomorro
   assert.equal(rules.subDueDefault("2026-11-04", "2026-11-03"), "2026-11-04"); // floor: next working day
   assert.equal(rules.subDueDefault("", "2026-11-06"), "2026-11-09");          // no contractor date → next working day (Mon)
 });
+
+// ── assignee suggestion ─────────────────────────────────────────────────────
+{
+  const a2 = src.indexOf("// ── ASSIGNEE SUGGESTION (begin)"), b2 = src.indexOf("// ── ASSIGNEE SUGGESTION (end)");
+  assert.ok(a2 > 0 && b2 > a2, "assignee-suggestion markers must exist in taskpane.js");
+  const { suggestAssignees } = new Function(src.slice(a2, b2) + "\nreturn { suggestAssignees };")();
+  const team = [
+    { id: "pm", name: "Pat Manager", role: "Project Manager", disciplines: ["Mechanical", "Electrical", "Plumbing"] },
+    { id: "dpm", name: "Dee Deputy", role: "Deputy Project Manager", disciplines: ["Electrical"] },
+    { id: "e1", name: "Eli", role: "Engineer", disciplines: ["Electrical"] },
+    { id: "m1", name: "Mo", role: "Sr. Mechanical Engineer" },
+    { id: "p1", name: "Pia", role: "Engineer", discipline: "Plumbing" },
+    { id: "p2", name: "Paz", role: "Plumbing Engineer", disciplines: ["Plumbing", "Fire Protection"] },
+  ];
+  const project = { settyPm: "pat manager", teamMembers: team };
+
+  test("the engineer for the discipline is suggested, not the PM who lists every discipline", () => {
+    assert.deepEqual(suggestAssignees(project, "Electrical"), { ids: ["e1"], basis: "discipline", matches: 1 });
+  });
+  test("a role that names the discipline counts, and so does the older single discipline field", () => {
+    assert.deepEqual(suggestAssignees(project, "Mechanical").ids, ["m1"]);
+    assert.deepEqual(suggestAssignees(project, "Plumbing").ids, ["p1", "p2"]);
+    assert.deepEqual(suggestAssignees(project, "Fire Protection").ids, ["p2"]);
+  });
+  test("no match, no discipline, or Multi-Discipline falls back to the PM", () => {
+    assert.deepEqual(suggestAssignees(project, "Technology"), { ids: ["pm"], basis: "pm-no-match", matches: 0 });
+    assert.deepEqual(suggestAssignees(project, ""), { ids: ["pm"], basis: "pm", matches: 0 });
+    assert.deepEqual(suggestAssignees(project, "Multi-Discipline").basis, "pm");
+  });
+  test("three or more matches are left for the person to pick", () => {
+    const big = { ...project, teamMembers: [...team, { id: "e2", role: "Electrical Engineer" }, { id: "e3", role: "Engineer", disciplines: ["Electrical"] }] };
+    assert.deepEqual(suggestAssignees(big, "Electrical"), { ids: [], basis: "many", matches: 3 });
+  });
+  test("no PM on the team list and no match ticks nobody", () => {
+    assert.deepEqual(suggestAssignees({ settyPm: "Someone Else", teamMembers: team }, "Technology"), { ids: [], basis: "none", matches: 0 });
+    assert.deepEqual(suggestAssignees({}, "Electrical"), { ids: [], basis: "none", matches: 0 });
+  });
+  test("the forms use the suggestion and stop once someone is ticked by hand", () => {
+    assert.ok(!src.includes("defaultAssigneeToPm"), "the PM-only default is gone");
+    assert.match(src, /applyAssigneeSuggestion\("rfi", true\)/); assert.match(src, /applyAssigneeSuggestion\("sub", true\)/);
+    assert.match(src, /if \(box\.dataset\.touched\) return;/);
+  });
+}

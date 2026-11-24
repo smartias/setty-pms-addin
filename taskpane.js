@@ -401,9 +401,16 @@ function setupEventListeners() {
   // Review view: the stamp decides the status unless the user overrides it.
   { const st = document.getElementById("subReviewStamp"), ss = document.getElementById("subReviewStatus");
     if (st && ss) st.onchange = () => { ss.value = subStatusForStamp(st.value); }; }
+  // Assignee suggestion follows the discipline until the person ticks someone themselves.
+  for (const kind of ["rfi", "sub"]) {
+    const d = document.getElementById(kind === "rfi" ? "rfiDiscipline" : "subDiscipline");
+    const box = document.getElementById(kind === "rfi" ? "rfiAssignedTo" : "subAssignedTo");
+    if (d) d.addEventListener("change", () => applyAssigneeSuggestion(kind));
+    if (box) box.addEventListener("change", () => { box.dataset.touched = "1"; });
+  }
   // Spec section typed by hand → guess the discipline (same rules as the Tracker) while it is still unset.
   { const sp = document.getElementById("subSpec"), sd = document.getElementById("subDiscipline");
-    if (sp && sd) sp.oninput = () => { const CI = window.CaIntake; if (!sd.value && CI && CI.inferDiscipline) { const g = CI.inferDiscipline({ specSection: sp.value, title: document.getElementById("subDesc")?.value || "" }, "submittal"); if (g) sd.value = g; } }; }
+    if (sp && sd) sp.oninput = () => { const CI = window.CaIntake; if (!sd.value && CI && CI.inferDiscipline) { const g = CI.inferDiscipline({ specSection: sp.value, title: document.getElementById("subDesc")?.value || "" }, "submittal"); if (g) { sd.value = g; applyAssigneeSuggestion("sub"); } } }; }
   document.getElementById("saveContactBtn").onclick = doSaveContact;
   document.getElementById("openPmsBtn").onclick = openSelectedProjectInPms;
   document.getElementById("openSpFolderBtn").onclick = openSelectedProjectSpFolder;
@@ -10861,7 +10868,7 @@ function applyPortalPrefill(kind) {
     set("rfiDescription", (item.question || "").trim());
     set("rfiDue", item.dueDate);
     set("rfiReceivedVia", PORTAL_VIA[vendor] || "Other");
-    if (guess) set("rfiDiscipline", guess);
+    if (guess) { set("rfiDiscipline", guess); applyAssigneeSuggestion("rfi"); }
     const hint = document.getElementById("rfiDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
     { const m = document.getElementById("rfiMore"); if (m) m.open = true; }
   } else {
@@ -10871,7 +10878,7 @@ function applyPortalPrefill(kind) {
     set("subFrom", item.ballInCourt);
     set("subDue", item.dueDate);
     set("subReceivedVia", PORTAL_VIA[vendor] || "Other");
-    if (guess) set("subDiscipline", guess);
+    if (guess) { set("subDiscipline", guess); applyAssigneeSuggestion("sub"); }
     const hint = document.getElementById("subDueHint"); if (hint && item.dueDate) hint.textContent = "(from the " + vendor + " notification)";
     { const m = document.getElementById("subMore"); if (m) m.open = true; }
   }
@@ -10924,18 +10931,59 @@ function seedDescriptionFromEmailBody(fieldId, maxChars = 600) {
   })();
 }
 
-// Default an assignee <select> to the project's Setty PM when they're on the
-// team roster — the most common routing for incoming RFIs/submittals. The
-// dropdown options are "staff:<member.id>", so match the PM by name.
-function defaultAssigneeToPm(boxId) {
-  const pmName = (selectedProject?.settyPm || "").trim().toLowerCase();
-  if (!pmName) return;
-  const pm = (selectedProject?.teamMembers || []).find(m =>
-    m?.id && (m.name || "").trim().toLowerCase() === pmName
-  );
-  const box = document.getElementById(boxId);
-  const cb = pm && box && [...box.querySelectorAll('input[type="checkbox"]')].find(c => c.value === pm.id);
-  if (cb) cb.checked = true;
+// ── ASSIGNEE SUGGESTION (begin) ─────────────────────────────────────────────
+// Who to tick when an RFI / submittal form opens. The CA team logs the item
+// and assigns it to the engineer for its discipline, so the suggestion is the
+// team member(s) whose discipline matches the item's:
+//   - a member matches when `disciplines` (or the older single `discipline`)
+//     lists it, or their role names it ("Electrical Engineer");
+//   - managers (PM, deputy PM, director, president, CA specialist) are not
+//     suggested by discipline: on most teams they carry every discipline;
+//   - one or two matches are ticked; three or more are left for the person to
+//     pick (ticking a whole department assigns it to nobody);
+//   - no match falls back to the project's PM, as before.
+// Pure: caIntakeRules.test.mjs slices this block out and checks it.
+const ASSIGN_DISCIPLINE_WORDS = {
+  "mechanical": /mech|hvac/i, "electrical": /elec/i, "plumbing": /plumb/i,
+  "fire protection": /fire/i, "technology": /technolog|low.?voltage|telecom|\bav\b/i,
+};
+const ASSIGN_MANAGER_ROLE = /project manager|director|president|principal|ca specialist/i;
+function suggestAssignees(project, discipline) {
+  const team = ((project && project.teamMembers) || []).filter(m => m && m.id);
+  const want = String(discipline || "").trim().toLowerCase();
+  const pmName = String((project && project.settyPm) || "").trim().toLowerCase();
+  const pm = pmName ? team.find(m => String(m.name || "").trim().toLowerCase() === pmName) : null;
+  const fallback = (basis) => ({ ids: pm ? [pm.id] : [], basis: pm ? basis : "none", matches: 0 });
+  const word = ASSIGN_DISCIPLINE_WORDS[want];
+  if (!want || !word) return fallback("pm");   // no discipline yet, or Multi-Discipline / Other
+  const listed = (m) => [...(Array.isArray(m.disciplines) ? m.disciplines : []), m.discipline].some(d => String(d || "").trim().toLowerCase() === want);
+  const matches = team.filter(m => !ASSIGN_MANAGER_ROLE.test(String(m.role || "")) && (listed(m) || word.test(String(m.role || ""))));
+  if (!matches.length) return fallback("pm-no-match");
+  if (matches.length > 2) return { ids: [], basis: "many", matches: matches.length };
+  return { ids: matches.map(m => m.id), basis: "discipline", matches: matches.length };
+}
+// ── ASSIGNEE SUGGESTION (end) ───────────────────────────────────────────────
+
+// Tick the suggestion for the form's current discipline and say where it came
+// from. Runs when the form opens and again when the discipline changes, but
+// never once the person has ticked or unticked someone themselves.
+function applyAssigneeSuggestion(kind, reset) {
+  const box = document.getElementById(kind === "rfi" ? "rfiAssignedTo" : "subAssignedTo");
+  const hint = document.getElementById(kind === "rfi" ? "rfiAssignHint" : "subAssignHint");
+  if (!box) return;
+  if (reset) box.dataset.touched = "";
+  if (box.dataset.touched) return;
+  const discipline = document.getElementById(kind === "rfi" ? "rfiDiscipline" : "subDiscipline")?.value || "";
+  const s = suggestAssignees(selectedProject, discipline);
+  const boxes = [...box.querySelectorAll('input[type="checkbox"]')];
+  boxes.forEach(c => { c.checked = s.ids.includes(c.value); });
+  if (!hint || !boxes.length) return;
+  hint.textContent =
+    s.basis === "discipline" ? `(suggested for ${discipline}: change if wrong)` :
+    s.basis === "many" ? `(${s.matches} ${discipline} people on this team: tick who owns it)` :
+    s.basis === "pm-no-match" ? `(no ${discipline} engineer on the team list: PM ticked)` :
+    s.basis === "pm" ? "(PM ticked: pick a discipline for a suggestion, or tick who owns it)" :
+    (kind === "rfi" ? "(tick everyone who owns the answer)" : "(tick everyone who reviews it)");
 }
 
 function prefillRfi() {
@@ -10960,7 +11008,7 @@ function prefillRfi() {
     d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "rfi") || "") : ""; }
   populateRfiAssigneeDropdown();
   clearAssignees("rfi");
-  defaultAssigneeToPm("rfiAssignedTo");
+  applyAssigneeSuggestion("rfi", true);
   seedDescriptionFromEmailBody("rfiDescription");
   setRfiMode("new");
   renderRfiPicker();
@@ -11962,7 +12010,7 @@ function prefillSub() {
     d.value = (CI && CI.inferDiscipline) ? (CI.inferDiscipline({ title: getResolvedItemSubject() }, "submittal") || "") : ""; }
   populateSubAssigneeDropdown();
   clearAssignees("sub");
-  defaultAssigneeToPm("subAssignedTo");
+  applyAssigneeSuggestion("sub", true);
   seedDescriptionFromEmailBody("subFullDescription");
   setSubMode("new");
   renderSubPicker();
@@ -12123,6 +12171,7 @@ async function saveArtifactThen(kind, another) {
   if (another) {
     const numEl = document.getElementById(isRfi ? "rfiNumber" : "subNumber");
     if (numEl) numEl.value = numEl.dataset.auto = isRfi ? nextAutoRfiNumber() : nextAutoSubNumber();
+    applyAssigneeSuggestion(isRfi ? "rfi" : "sub", true);
     const statusId = isRfi ? "rfiStatus" : "subStatus";
     const noun = isRfi ? "RFI" : "submittal";
     setStatus(statusId, "success", (r.successMessage || "✓ Logged") + ` · enter the next ${noun}, or ← Back when done.`);
