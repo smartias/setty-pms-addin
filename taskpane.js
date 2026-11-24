@@ -1137,9 +1137,7 @@ async function linkEmailToArtifact({ linkValue, emailRecord, snapItem }) {
       const discCode = getDisciplineCode(target.discipline);
       const safeNumber = (target.number || (kind === "rfi" ? "RFI-???" : "SUB-???"))
         .replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-      const topPath = await ensureSpFolder(driveId, token, projFolderName, kind === "rfi" ? "RFIs" : "Submittals");
-      const discPath = await ensureSpFolder(driveId, token, topPath, discCode);
-      rootPath = await ensureSpFolder(driveId, token, discPath, safeNumber);
+      rootPath = await ensureSpFolderChain(driveId, token, projFolderName, [kind === "rfi" ? "RFIs" : "Submittals", discCode, safeNumber]);
     }
     // Per-email subfolder under /IN, so multiple emails linked to the same
     // RFI/Sub coexist without colliding on "email.html". Same pattern as the
@@ -7868,17 +7866,52 @@ function encodeDrivePath(path) {
 // create used to surface later as confusing 404s on the uploads into it.
 // Still never throws: the subsequent upload is the authoritative failure signal.
 async function ensureSpFolder(driveId, token, parentPath, name) {
+  await _createSpFolder(driveId, token, parentPath, name);
+  return parentPath + "/" + name;
+}
+// Folders this pane has seen exist (created, or answered 409) in the last ten
+// minutes. A save used to re-POST "RFIs" and the discipline folder every time,
+// about a second each; a second save in the same sitting now skips them.
+const _spFolderKnown = new Map(); // "<driveId>|<lower-case path>" -> time seen
+const SP_FOLDER_KNOWN_MS = 10 * 60 * 1000;
+function _spFolderKey(driveId, path) { return driveId + "|" + String(path).toLowerCase(); }
+function _spFolderIsKnown(driveId, path) {
+  const at = _spFolderKnown.get(_spFolderKey(driveId, path));
+  return !!at && Date.now() - at < SP_FOLDER_KNOWN_MS;
+}
+// One create call. Returns the HTTP status (201 created, 409 already there),
+// 0 when skipped because the folder is known to exist, -1 when the call threw.
+async function _createSpFolder(driveId, token, parentPath, name) {
+  const path = parentPath + "/" + name;
+  if (_spFolderIsKnown(driveId, path)) return 0;
   try {
     const res = await fetchWithRetry("https://graph.microsoft.com/v1.0/drives/" + driveId + "/root:/" + encodeDrivePath(parentPath) + ":/children", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
       body: JSON.stringify({ name, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
     }, { label: "graph ensure folder" });
-    if (!res.ok && res.status !== 409) {
-      console.warn("[sp-folder] create HTTP", res.status, "for", parentPath + "/" + name);
+    if (res.ok || res.status === 409) _spFolderKnown.set(_spFolderKey(driveId, path), Date.now());
+    else if (res.status !== 404) console.warn("[sp-folder] create HTTP", res.status, "for", path);
+    return res.status;
+  } catch (e) { console.warn("[sp-folder] create failed:", name, e.message); return -1; }
+}
+// Ensure nested folders basePath/names[0]/names[1]/… and return the full path.
+// Tries the DEEPEST folder first: on a job that already has RFIs/<discipline>,
+// creating RFIs/<discipline>/<number> is one call, not three. Graph answers
+// 404 when a parent is missing; then the chain is created top down as before.
+async function ensureSpFolderChain(driveId, token, basePath, names) {
+  if (names.length > 1) {
+    const parent = [basePath, ...names.slice(0, -1)].join("/");
+    const status = await _createSpFolder(driveId, token, parent, names[names.length - 1]);
+    if (status === 0 || status === 409 || (status >= 200 && status < 300)) {
+      let p = basePath;
+      for (const n of names) { p += "/" + n; _spFolderKnown.set(_spFolderKey(driveId, p), Date.now()); }
+      return p;
     }
-  } catch (e) { console.warn("[sp-folder] create failed:", name, e.message); }
-  return parentPath + "/" + name;
+  }
+  let p = basePath;
+  for (const n of names) p = await ensureSpFolder(driveId, token, p, n);
+  return p;
 }
 // Extract the drive-relative path from a full SharePoint web URL
 function spDrivePath(spFolderUrl) {
@@ -8719,8 +8752,7 @@ if (existingRecord) {
     const safeSubject = (snapSubject || "No Subject").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 70);
     const folderTail = customCleaned || safeSubject;
     const emailFolderName = d.getFullYear() + "_" + String(d.getMonth() + 1).padStart(2, "0") + "_" + String(d.getDate()).padStart(2, "0") + " " + folderTail;
-    const emailsPath  = await ensureSpFolder(driveId, token, projFolderName, "Emails");
-    const targetPath  = await ensureSpFolder(driveId, token, emailsPath, emailFolderName);
+    const targetPath  = await ensureSpFolderChain(driveId, token, projFolderName, ["Emails", emailFolderName]);
     // Re-check generation right before destructive writes. If the user has
     // switched to a different item during folder-resolution, abort cleanly
     // rather than continuing with a mix of old-item folder + new-item body.
@@ -10997,15 +11029,15 @@ async function doSaveRfi() {
           const { driveId } = await resolveSpIds();
           const projFolderName = safeDecodeFolderUrl(freshProject.projectFolderUrl.split("/").pop());
           const safeRfiNumber = rfiNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-          const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-          const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
-          const rfiPath  = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
-          await writeSpMetadataSidecar(driveId, token, rfiPath, buildAddinMetadata(freshProject, "rfi"));
+          const rfiPath  = await ensureSpFolderChain(driveId, token, projFolderName, ["RFIs", discCode, safeRfiNumber]);
+          // The sidecar rides alongside the upload instead of ahead of it (it never throws).
+          const sidecar = writeSpMetadataSidecar(driveId, token, rfiPath, buildAddinMetadata(freshProject, "rfi"));
           // Upload via the shared helper — per-email subfolder, real error
           // propagation. Throws on actual upload failure so we know.
           const uploadResult = await uploadEmailToArtifactInFolder({
             driveId, token, artifactRootPath: rfiPath, snapItem,
           });
+          await sidecar;
           spFolderUrl    = SP_BASE_URL + "/" + rfiPath.split("/").map(encodeURIComponent).join("/");
           inFolderWebUrl = uploadResult.inFolderUrl;
           emailFolderUrl = uploadResult.emailFolderUrl;
@@ -11645,10 +11677,8 @@ async function submitRfiResponse() {
       const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
       const discCode = getDisciplineCode(rfi.discipline);
       const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-      const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-      const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
-      const rfiRootPath = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
-      const outPath = await ensureSpFolder(driveId, token, rfiRootPath, "OUT");
+      const outPath = await ensureSpFolderChain(driveId, token, projFolderName, ["RFIs", discCode, safeRfiNumber, "OUT"]);
+      const rfiRootPath = outPath.slice(0, -"/OUT".length);
       // /IN is referenced for the email link, not created here — if no IN
       // folder exists yet (e.g. PMS-only filings), the chip link 404s, which
       // is the honest signal.
@@ -11874,9 +11904,7 @@ async function doFileToExistingRfi() {
         const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
         const discCode = getDisciplineCode(rfi.discipline);
         const safeRfiNumber = (rfi.number || "RFI-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        const rfisPath = await ensureSpFolder(driveId, token, projFolderName, "RFIs");
-        const discPath = await ensureSpFolder(driveId, token, rfisPath, discCode);
-        rfiRootPath    = await ensureSpFolder(driveId, token, discPath, safeRfiNumber);
+        rfiRootPath    = await ensureSpFolderChain(driveId, token, projFolderName, ["RFIs", discCode, safeRfiNumber]);
       }
       // Per-email subfolder under /IN so multiple filed emails coexist.
       const uploadResult = await uploadEmailToArtifactInFolder({
@@ -11997,13 +12025,12 @@ async function doSaveSub() {
           const { driveId } = await resolveSpIds();
           const projFolderName = safeDecodeFolderUrl(freshProject.projectFolderUrl.split("/").pop());
           const safeSubNumber = subNumber.replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-          const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-          const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
-          const subPath  = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
-          await writeSpMetadataSidecar(driveId, token, subPath, buildAddinMetadata(freshProject, "submittal"));
+          const subPath  = await ensureSpFolderChain(driveId, token, projFolderName, ["Submittals", discCode, safeSubNumber]);
+          const sidecar = writeSpMetadataSidecar(driveId, token, subPath, buildAddinMetadata(freshProject, "submittal"));
           const uploadResult = await uploadEmailToArtifactInFolder({
             driveId, token, artifactRootPath: subPath, snapItem,
           });
+          await sidecar;
           spFolderUrl    = SP_BASE_URL + "/" + subPath.split("/").map(encodeURIComponent).join("/");
           inFolderWebUrl = uploadResult.inFolderUrl;
           emailFolderUrl = uploadResult.emailFolderUrl;
@@ -12226,10 +12253,8 @@ async function submitSubReview() {
       const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
       const discCode = getDisciplineCode(sub.discipline);
       const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-      const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-      const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
-      const subRootPath = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
-      const outPath = await ensureSpFolder(driveId, token, subRootPath, "OUT");
+      const outPath = await ensureSpFolderChain(driveId, token, projFolderName, ["Submittals", discCode, safeSubNumber, "OUT"]);
+      const subRootPath = outPath.slice(0, -"/OUT".length);
       const inPath  = subRootPath + "/IN";
 
       const safeName = `${(sub.number || "SUB").replace(/[\\/:*?"<>|]/g, "-")}_Review.docx`;
@@ -12410,9 +12435,7 @@ async function doFileToExistingSub() {
         const projFolderName = safeDecodeFolderUrl(selectedProject.projectFolderUrl.split("/").pop());
         const discCode = getDisciplineCode(sub.discipline);
         const safeSubNumber = (sub.number || "SUB-???").replace(/[\\/:*?"<>|]/g, "-").trim().slice(0, 80);
-        const subsPath = await ensureSpFolder(driveId, token, projFolderName, "Submittals");
-        const discPath = await ensureSpFolder(driveId, token, subsPath, discCode);
-        subRootPath    = await ensureSpFolder(driveId, token, discPath, safeSubNumber);
+        subRootPath    = await ensureSpFolderChain(driveId, token, projFolderName, ["Submittals", discCode, safeSubNumber]);
       }
       // Per-email subfolder under /IN so multiple filed emails coexist.
       const uploadResult = await uploadEmailToArtifactInFolder({
