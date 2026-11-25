@@ -231,6 +231,7 @@ function applyComposeModeUiGuard() {
     // hidden behavior. NOTE: in read mode this guard resets display to "";
     // updatePeopleButtonBadge runs after and applies the real visibility.
     "addParticipantBtn",
+    "accoladeBlock",
   ];
   // Hide in Read: templates only make sense while composing a reply.
   const hiddenInRead = ["quickTemplatesSection"];
@@ -294,6 +295,7 @@ function setupEventListeners() {
   if (sweepMoreBtn) sweepMoreBtn.onclick = () => { void sweepRunAndFile(false); };
   // A previous session's review queue may be waiting in localStorage — offer a resume.
   sweepCheckStoredReview();
+  wireAccoladeForm();
   document.getElementById("saveSpBtn").onclick     = doSaveToSharePoint;
   document.getElementById("saveRecordBtn").onclick = doSaveToProjectRecordOnly;
   const linkArtifactBtn = document.getElementById("linkArtifactBtn");
@@ -557,6 +559,7 @@ function loadItemContext() {
   itemContextGeneration++;
   const myGen = itemContextGeneration;
   emailItem = Office.context.mailbox.item;
+  try { closeAccoladeForm(); } catch {}   // a half-filled accolade belongs to the previous email
   // Portal state belongs to one email: clear it before either branch below so
   // an appointment opened after a Procore notification never shows that
   // email's banner (setSelectedProject re-renders it for any item kind).
@@ -14469,4 +14472,179 @@ async function fuSyncFlagged(userClicked) {
   } catch (e) {
     setStatus("followupsStatus", "error", "✗ " + humanizeError(e));
   }
+}
+
+// ─── SAVE AS ACCOLADE ─────────────────────────────────────────────────────────
+// Turns a thank-you email into an entry on the Accolade-O-Meter wall
+// (Accolades.html in setty-pms; table pms_accolades). It saves the same row the
+// page's own form does, as the signed-in person (the insert policy checks
+// created_by against the Setty sign-in), with source "manual" so the person
+// saving it gets the spotter points. The email's conversation id goes in
+// email_thread_key: the table allows one accolade per thread, so the page's
+// filed-email review won't offer it again, and saving the same thread twice is
+// refused (409) rather than doubled. The people named get the instant email
+// from the database trigger, exactly as from the page.
+const ACCOLADES_PAGE_URL = "https://smartias.github.io/setty-pms/Accolades.html";
+
+// The praise itself: the newest message only, without quoted history or a
+// trailing signature dash line, whitespace collapsed, capped for the wall.
+function accoladeQuoteFrom(text) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^(from|sent|to|subject):\s/i.test(t) && out.length) break;
+    if (/^-{2,}\s*(original message)?\s*-*$/i.test(t) && out.length) break;
+    if (/^_{5,}$/.test(t) && out.length) break;
+    if (/^on .+ wrote:$/i.test(t)) break;
+    if (t.startsWith(">")) continue;
+    out.push(t);
+  }
+  const q = out.join(" ").replace(/\s+/g, " ").trim();
+  return q.length > 1200 ? q.slice(0, 1197).trimEnd() + "…" : q;
+}
+
+// Who the praise was probably for: the staff on the To line other than the
+// sender (then Cc when nobody on To is staff), else the person saving it.
+// A starting guess the person edits, never saved without them pressing Save.
+function accoladeGuessPeople(to, cc, fromEmail, staff, me) {
+  const byEmail = new Map();
+  for (const p of staff || []) {
+    const e = String(p?.email || "").trim().toLowerCase();
+    if (e && p.name && !p.inactive) byEmail.set(e, String(p.name).trim());
+  }
+  const from = String(fromEmail || "").trim().toLowerCase();
+  const pick = (list) => {
+    const out = [], seen = new Set();
+    for (const r of list || []) {
+      const e = String(r?.emailAddress || "").trim().toLowerCase();
+      if (!e || e === from || seen.has(e) || !byEmail.has(e)) continue;
+      seen.add(e); out.push(byEmail.get(e));
+    }
+    return out;
+  };
+  let names = pick(to);
+  if (!names.length) names = pick(cc);
+  if (!names.length && me && me.name) names = [me.name];
+  return names.slice(0, 8);
+}
+
+// The names typed in the box, matched to the staff list by name
+// (case-insensitive). A name not on the list is kept with no email, which the
+// wall accepts (it scores under the typed name and gets no email).
+function accoladeResolvePeople(text, staff) {
+  const byName = new Map();
+  for (const p of staff || []) {
+    const n = String(p?.name || "").trim();
+    if (n && p.email) byName.set(n.toLowerCase(), { name: n, email: String(p.email).trim().toLowerCase() });
+  }
+  const out = [], seen = new Set();
+  for (const raw of String(text || "").split(/[,;\n]/)) {
+    const n = raw.trim();
+    if (!n || seen.has(n.toLowerCase())) continue;
+    seen.add(n.toLowerCase());
+    out.push(byName.get(n.toLowerCase()) || { name: n, email: "" });
+  }
+  return out.slice(0, 25);
+}
+
+function closeAccoladeForm() {
+  const form = document.getElementById("accoladeForm");
+  if (form) form.style.display = "none";
+  setStatus("accoladeStatus", "", "");
+}
+
+async function openAccoladeForm() {
+  const form = document.getElementById("accoladeForm");
+  if (!form) return;
+  if (form.style.display !== "none") { closeAccoladeForm(); return; }
+  form.style.display = "";
+  setStatus("accoladeStatus", "", "");
+  const item = emailItem || Office.context.mailbox.item;
+  const quoteEl = document.getElementById("accoladeQuote");
+  const peopleEl = document.getElementById("accoladePeople");
+  quoteEl.value = ""; peopleEl.value = "";
+  const [text, staff] = await Promise.all([
+    getBodyTextReliable(item).catch(() => null),
+    ensureStaffDirectory().catch(() => undefined),
+  ]);
+  if ((emailItem || Office.context.mailbox.item) !== item) return;   // moved to another email meanwhile
+  quoteEl.value = accoladeQuoteFrom(text || "");
+  const list = document.getElementById("accoladeStaffList");
+  if (list) {
+    list.textContent = "";
+    for (const p of staff || []) {
+      if (!p?.name || p.inactive) continue;
+      const o = document.createElement("option"); o.value = String(p.name).trim(); list.appendChild(o);
+    }
+  }
+  peopleEl.value = accoladeGuessPeople(item?.to, item?.cc, item?.from?.emailAddress, staff, myStaffIdentity()).join(", ");
+  quoteEl.focus();
+}
+
+async function saveAccolade() {
+  const btn = document.getElementById("accoladeSave");
+  const item = emailItem || Office.context.mailbox.item;
+  if (_signedOutForSaves()) { setStatus("accoladeStatus", "error", SIGNED_OUT_SAVE_MSG); return; }
+  // The insert policy checks created_by against the Setty sign-in's email, so
+  // take it from there; the Outlook account is only the fallback.
+  const me = myStaffIdentity();
+  try { const e = (_settyAuth.email && _settyAuth.email()) || ""; if (e) me.email = e; } catch {}
+  const quote = document.getElementById("accoladeQuote").value.trim();
+  const staff = await ensureStaffDirectory().catch(() => undefined);
+  const people = accoladeResolvePeople(document.getElementById("accoladePeople").value, staff);
+  if (quote.length < 3) { setStatus("accoladeStatus", "error", "Add what they said."); return; }
+  if (!people.length) { setStatus("accoladeStatus", "error", "Add who earned it."); return; }
+  if (!me.email) { setStatus("accoladeStatus", "error", "Couldn't tell who you are. Sign in again and retry."); return; }
+  const fromEmail = String(item?.from?.emailAddress || "").toLowerCase();
+  const internal = /@setty\.com$/.test(fromEmail);
+  const created = item?.dateTimeCreated ? new Date(item.dateTimeCreated) : new Date();
+  const day = created.getFullYear() + "-" + String(created.getMonth() + 1).padStart(2, "0") + "-" + String(created.getDate()).padStart(2, "0");
+  const row = {
+    kind: internal ? "internal" : "client",
+    quote,
+    recipients: people.map(p => p.name),
+    recipient_emails: people.map(p => p.email),
+    from_name: (item?.from?.displayName || "").trim() || null,
+    from_company: null,
+    project_number: selectedProject?.projectNumber || null,
+    project_name: selectedProject?.name || null,
+    received_on: day,
+    source: "manual",
+    email_thread_key: item?.conversationId || null,
+    created_by: me.email.toLowerCase(),
+    created_by_name: me.name || null,
+  };
+  btn.disabled = true;
+  setStatus("accoladeStatus", "info", "⏳ Saving…");
+  try {
+    await settyAuthReady;
+    const res = await fetch(SUPABASE_URL + "/rest/v1/pms_accolades", { method: "POST", headers: SB_HEADERS, body: JSON.stringify(row) });
+    if (res.status === 409) { setStatus("accoladeStatus", "info", "This email is already on the wall."); return; }
+    if (res.status === 401 || res.status === 403) { setStatus("accoladeStatus", "error", SIGNED_OUT_SAVE_MSG); return; }
+    if (!res.ok) throw new Error("HTTP " + res.status + " " + (await res.text()).slice(0, 160));
+    const first = people[0].name.split(/\s+/)[0];
+    setStatus("accoladeStatus", "success", "🏆 On the wall. " + (people.some(p => p.email) ? first + (people.length > 1 ? " and the others get" : " gets") + " an email." : ""));
+    const status = document.getElementById("accoladeStatus");
+    const link = document.createElement("a");
+    link.href = "#"; link.textContent = " See it →";
+    link.onclick = (ev) => {
+      ev.preventDefault();
+      if (Office?.context?.ui?.openBrowserWindow) Office.context.ui.openBrowserWindow(ACCOLADES_PAGE_URL);
+      else window.open(ACCOLADES_PAGE_URL, "_blank");
+    };
+    status.appendChild(link);
+  } catch (e) {
+    setStatus("accoladeStatus", "error", "Couldn't save it: " + (e?.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function wireAccoladeForm() {
+  const toggle = document.getElementById("accoladeToggle");
+  if (!toggle) return;
+  toggle.onclick = () => { void openAccoladeForm(); };
+  document.getElementById("accoladeCancel").onclick = closeAccoladeForm;
+  document.getElementById("accoladeSave").onclick = () => { void saveAccolade(); };
 }
