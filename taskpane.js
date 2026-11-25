@@ -686,6 +686,8 @@ function loadItemContext() {
       document.getElementById("emailMeta").textContent =
         "Organizer: " + (emailFrom || emailFromAddress || "(Unknown)") + (date ? "  ·  " + date : "");
     }
+    try { renderSenderFace(); } catch {}
+    void ensureStaffDirectory();
 
     // ── Participants ─────────────────────────────────────────────────────────
     emailParticipants = dedupeParticipants([
@@ -750,6 +752,8 @@ function loadItemContext() {
     }) : "";
     document.getElementById("emailMeta").textContent =
       "From: " + (emailFrom || emailFromAddress) + (date ? "  ·  " + date : "");
+    try { renderSenderFace(); } catch {}
+    void ensureStaffDirectory();
     // Build participants list from From / To / CC
     const toList = emailItem.to || [];
     const ccList = emailItem.cc || [];
@@ -1341,7 +1345,7 @@ function openChipAssignPanel(kind, id, force) {
     return;
   }
   const rows = team.length
-    ? team.map(m => `<label style="display:flex;align-items:center;gap:6px;margin:2px 0;cursor:pointer;"><input type="checkbox" value="${escHtml(m.id)}"${current.has(m.id) ? " checked" : ""}> ${escHtml(m.name || m.role || "Unnamed")}${m.role && m.name ? ` <span style="color:var(--text-soft);">· ${escHtml(m.role)}</span>` : ""}${m.email ? "" : ` <span style="color:var(--warn);font-size:10px;">(no email on file)</span>`}</label>`).join("")
+    ? team.map(m => `<label style="display:flex;align-items:center;gap:6px;margin:2px 0;cursor:pointer;"><input type="checkbox" value="${escHtml(m.id)}"${current.has(m.id) ? " checked" : ""}> ${staffFaceHtml(m, 20)} ${escHtml(m.name || m.role || "Unnamed")}${m.role && m.name ? ` <span style="color:var(--text-soft);">· ${escHtml(m.role)}</span>` : ""}${m.email ? "" : ` <span style="color:var(--warn);font-size:10px;">(no email on file)</span>`}</label>`).join("")
     : `<span style="color:var(--text-soft);">No team members on this project — add them in the PMS.</span>`;
   panel.innerHTML =
     `<div style="${box}">` +
@@ -1484,9 +1488,11 @@ function refreshLoggedArtifactChips() {
       const pmsUrl = selectedProject.id
         ? PMS_PROJECT_BASE_URL + encodeURIComponent(selectedProject.id) + ":" + (a.kind === "rfi" ? "rfi" : "submittal") + ":" + encodeURIComponent(a.number || "")
         : "";
-      const names = (a.assignedTo || []).map(id => (selectedProject.teamMembers || []).find(m => m.id === id)).filter(Boolean)
-        .map(m => m.name || m.role || "").filter(Boolean);
-      const who = names.length ? `<span style="font-size:11px;color:var(--text-soft);">→ ${escHtml(names.join(", "))}</span>` : "";
+      const assignees = (a.assignedTo || []).map(id => (selectedProject.teamMembers || []).find(m => m.id === id)).filter(Boolean);
+      const names = assignees.map(m => m.name || m.role || "").filter(Boolean);
+      const who = names.length
+        ? `<span style="font-size:11px;color:var(--text-soft);display:inline-flex;align-items:center;gap:4px;">→ <span class="staff-faces">${assignees.slice(0, 4).map(m => staffFaceHtml(m, 18)).join("")}</span>${escHtml(names.join(", "))}</span>`
+        : "";
       assignHtml =
         `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-left:4px;">` +
           (pmsUrl ? `<a href="${escHtml(pmsUrl)}" target="_blank" rel="noreferrer" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none;">Open in PMS →</a>` : "") +
@@ -3579,6 +3585,127 @@ function myStaffIdentity() {
   if (!name) name = (msalAccount?.name || "").trim();
   return { email, name };
 }
+// ── Staff directory + staff photos ──────────────────────────────────────────
+// The whole PMS Staff directory (pms_meta.app_meta.staff), fetched once per
+// sign-in and shared by the join-team lookup and the staff photos. Resolves to
+// the array, or undefined on any failure (signed out, offline) so the next
+// call retries.
+let _staffDirPromise = null;
+let _staffDirEmail = "";
+function ensureStaffDirectory() {
+  const emailNow = (myStaffIdentity().email || "").toLowerCase();
+  if (_staffDirPromise && _staffDirEmail === emailNow) return _staffDirPromise;
+  _staffDirEmail = emailNow;
+  const p = (async () => {
+    try {
+      await settyAuthReady;
+      if (!window.settyAuth || _signedOutForSaves() || !emailNow) return undefined;
+      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.app_meta&select=data",
+        { headers: SB_HEADERS }, { label: "sb staff directory", maxAttempts: 2 });
+      if (!res.ok) return undefined;
+      const rows = await res.json();
+      const staff = rows?.[0]?.data?.staff;
+      return Array.isArray(staff) ? staff : undefined;
+    } catch { return undefined; }
+  })();
+  _staffDirPromise = p;
+  p.then(list => {
+    if (list === undefined) { if (_staffDirPromise === p) _staffDirPromise = null; return; }
+    _staffPhotoIndex = buildStaffPhotoIndex(list);
+    repaintStaffFaces();
+  });
+  return p;
+}
+
+// A person's photo lives in the public staff-photos bucket; the directory row
+// carries its photoPath. Project team rows are copies without one, so they are
+// matched back by email, then by name; a name match is refused when both sides
+// have an email and they differ. Same rules as staffPhotoPathFor in
+// SettyPMS.html (setty-pms repo, staffPhotos.test.mjs).
+let _staffPhotoIndex = { byEmail: new Map(), byName: new Map() };
+function buildStaffPhotoIndex(staff) {
+  const byEmail = new Map(), byName = new Map();
+  for (const s of staff || []) {
+    if (!s || !s.photoPath) continue;
+    const mail = String(s.email || "").trim().toLowerCase();
+    const name = String(s.name || "").trim().toLowerCase();
+    if (mail && !byEmail.has(mail)) byEmail.set(mail, s.photoPath);
+    if (name && !byName.has(name)) byName.set(name, { path: s.photoPath, mail });
+  }
+  return { byEmail, byName };
+}
+function staffPhotoPathFor(person, index) {
+  const ix = index || _staffPhotoIndex;
+  if (!person) return "";
+  if (person.photoPath) return person.photoPath;
+  const mail = String(person.email || "").trim().toLowerCase();
+  if (mail && ix.byEmail.has(mail)) return ix.byEmail.get(mail);
+  const hit = ix.byName.get(String(person.name || "").trim().toLowerCase());
+  if (!hit || (mail && hit.mail && hit.mail !== mail)) return "";
+  return hit.path;
+}
+function staffInitials(name) {
+  return String(name || "").trim().split(/\s+/).filter(Boolean).map(n => n[0]).slice(0, 2).join("").toUpperCase();
+}
+// HTML for one face: the photo, or initials. Decorative (aria-hidden): the
+// name is always written next to it or in the surrounding label.
+function staffFaceHtml(person, size) {
+  const px = size || 20;
+  const path = staffPhotoPathFor(person);
+  const initials = escHtml(staffInitials(person && person.name));
+  const style = `width:${px}px;height:${px}px;font-size:${Math.max(8, Math.round(px * 0.42))}px;`;
+  if (path) {
+    const url = SUPABASE_URL + "/storage/v1/object/public/staff-photos/" + String(path).split("/").map(encodeURIComponent).join("/");
+    return `<img class="staff-face" src="${escHtml(url)}" alt="" aria-hidden="true" loading="lazy" data-initials="${initials}" style="${style}">`;
+  }
+  return `<span class="staff-face" aria-hidden="true" style="${style}">${initials}</span>`;
+}
+// A photo that fails to load turns into the initials circle. One listener for
+// the whole pane (error events do not bubble, so it listens in the capture phase).
+document.addEventListener("error", (ev) => {
+  const img = ev.target;
+  if (!img || img.tagName !== "IMG" || !img.classList.contains("staff-face")) return;
+  const span = document.createElement("span");
+  span.className = "staff-face";
+  span.setAttribute("aria-hidden", "true");
+  span.setAttribute("style", img.getAttribute("style") || "");
+  span.textContent = img.dataset.initials || "";
+  img.replaceWith(span);
+}, true);
+
+// The project's team as a row of faces under the project name.
+function renderProjectTeamStrip() {
+  const el = document.getElementById("projectTeamStrip");
+  if (!el) return;
+  const team = (selectedProject?.teamMembers || []).filter(m => m && String(m.name || "").trim());
+  if (!team.length) { el.style.display = "none"; el.innerHTML = ""; return; }
+  const MAX = 10;
+  const shown = team.slice(0, MAX);
+  const names = team.map(m => m.name.trim() + (m.role ? " (" + m.role + ")" : "")).join(", ");
+  el.innerHTML =
+    `<span style="font-size:11px;color:var(--text-soft);">Team</span>` +
+    `<span class="staff-faces" role="img" aria-label="${escHtml("Project team: " + names)}" title="${escHtml(names)}">` +
+      shown.map(m => staffFaceHtml(m, 24)).join("") +
+    `</span>` +
+    (team.length > MAX ? `<span style="font-size:11px;color:var(--text-soft);">+${team.length - MAX}</span>` : "");
+  el.style.display = "flex";
+}
+// The sender's face when the email is from a colleague (@setty.com).
+function renderSenderFace() {
+  const el = document.getElementById("senderFace");
+  if (!el) return;
+  const mail = String(emailFromAddress || "").trim().toLowerCase();
+  if (!/@setty\.com$/.test(mail)) { el.style.display = "none"; el.innerHTML = ""; return; }
+  el.innerHTML = staffFaceHtml({ name: emailFrom || mail.split("@")[0].replace(/[._]+/g, " "), email: mail }, 22);
+  el.style.display = "inline-flex";
+}
+// Repaint everything that shows faces, once the directory (and its photos) lands.
+function repaintStaffFaces() {
+  try { renderProjectTeamStrip(); } catch (e) { console.warn("[staff-photos] team strip:", e.message); }
+  try { renderSenderFace(); } catch (e) { console.warn("[staff-photos] sender:", e.message); }
+  try { refreshLoggedArtifactChips(); } catch (e) { console.warn("[staff-photos] chips:", e.message); }
+}
+
 // My row in the Staff directory, looked up once per session by sign-in email.
 // pms_meta is readable by any authenticated user (pms_meta_select). Any failure
 // (signed out, offline) resolves to undefined so the next refresh retries; "not
@@ -3594,15 +3721,9 @@ function ensureMyStaffRecord() {
   _myStaffPromiseEmail = emailNow;
   _myStaffPromise = (async () => {
     try {
-      await settyAuthReady;
-      if (!window.settyAuth || _signedOutForSaves()) return undefined;
       const emailLc = emailNow;
       if (!emailLc) return undefined;
-      const res = await fetchWithRetry(SUPABASE_URL + "/rest/v1/pms_meta?id=eq.app_meta&select=data",
-        { headers: SB_HEADERS }, { label: "sb staff directory", maxAttempts: 2 });
-      if (!res.ok) return undefined;
-      const rows = await res.json();
-      const staff = rows?.[0]?.data?.staff;
+      const staff = await ensureStaffDirectory();
       if (!Array.isArray(staff)) return undefined;
       return staff.find(s => s && (s.email || "").trim().toLowerCase() === emailLc) || null;
     } catch { return undefined; }
@@ -4082,6 +4203,7 @@ function setSelectedProject(project, persistForEmail = false) {
   try { renderPortalIntakeBanner(); } catch (e) { console.warn("[portal-banner]", e.message); }
   // "N new" count depends on the selected project's directory.
   try { updatePeopleButtonBadge(); } catch {}
+  try { renderProjectTeamStrip(); } catch (e) { console.warn("[staff-photos] team strip:", e.message); }
   const badge = document.getElementById("selectedProjectBadge");
   const badgeText = document.getElementById("selectedProjectBadgeText");
   const clearBtn = document.getElementById("clearProjectTagBtn");
