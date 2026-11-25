@@ -6788,7 +6788,7 @@ function updatePeopleButtonBadge() {
   if (newCount > 0) {
     btn.textContent = "👥 Add Participant to Contacts (" + newCount + " new)";
   } else if (enrichOnly) {
-    const who = (enrichRec.name || "").trim().split(/\s+/)[0];
+    const who = greetingFirstName(enrichRec.name);
     btn.textContent = who
       ? "✍️ Complete " + who + "'s contact from signature"
       : "✍️ Complete a contact from its signature";
@@ -9826,13 +9826,13 @@ function resolveAssignee(dropdownValue, project) {
     const staffId = dropdownValue.slice("staff:".length);
     const m = (project.teamMembers || []).find(x => x.id === staffId);
     if (!m) return null;
-    return { email: m.email || "", name: m.name || m.role || "Team member" };
+    return { email: m.email || "", name: m.name || m.role || "Team member", first: greetingFirstName(m.name) };
   }
   if (dropdownValue.startsWith("sub:")) {
     const subId = dropdownValue.slice("sub:".length);
     const s = (project.subconsultants || []).find(x => x.id === subId);
     if (!s) return null;
-    return { email: s.email || "", name: s.contact || s.firm || "Subconsultant" };
+    return { email: s.email || "", name: s.contact || s.firm || "Subconsultant", first: greetingFirstName(s.contact) };
   }
   return null;
 }
@@ -9909,7 +9909,7 @@ function buildRfiAssignmentEmailHtml({ rfi, project, assignee, inFolderUrl }) {
   const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
   const descLine = rfi.description ? `<p><strong>Question:</strong></p><p style="margin-left:12px">${esc(rfi.description).replace(/\n/g, "<br>")}</p>` : "";
   return `
-    <p>Hi ${esc(assignee?.name || "")},</p>
+    <p>Hi${assignee?.first ? " " + esc(assignee.first) : ""},</p>
     <p>You have been assigned <b>${esc(rfi.number)}</b> — ${esc(rfi.title || "")} on ${esc(projLabel)}. Due back to the contractor <b>${esc(rfi.dueDate || "—")}</b>.</p>
     ${caAssignmentSteps({ kind: "rfi", item: rfi, project, folderUrl: inFolderUrl || rfi.spFolderUrl })}
     <p><strong>Discipline:</strong> ${esc(rfi.discipline || "—")}<br>
@@ -9927,7 +9927,7 @@ function buildSubAssignmentEmailHtml({ sub, project, assignee, inFolderUrl }) {
   const projLabel = [project.projectNumber, project.name].filter(Boolean).join(" — ");
   const descLine = sub.fullDescription || sub.description ? `<p><strong>Description:</strong></p><p style="margin-left:12px">${esc(sub.fullDescription || sub.description).replace(/\n/g, "<br>")}</p>` : "";
   return `
-    <p>Hi ${esc(assignee?.name || "")},</p>
+    <p>Hi${assignee?.first ? " " + esc(assignee.first) : ""},</p>
     <p>You have been assigned submittal <b>${esc(sub.number)}</b>${sub.specSection ? " (Spec " + esc(sub.specSection) + ")" : ""} — ${esc(sub.description || "")} on ${esc(projLabel)}. Due back to the contractor <b>${esc(sub.dueDate || "—")}</b>.</p>
     ${caAssignmentSteps({ kind: "sub", item: sub, project, folderUrl: inFolderUrl || sub.spFolderUrl })}
     <p><strong>Discipline:</strong> ${esc(sub.discipline || "—")}<br>
@@ -10695,7 +10695,7 @@ function clearAssignees(kind) {
 // Everyone ticked who has an email on file, for the assignment draft.
 function assigneeRecipients(staffIds, project) {
   return (staffIds || []).map(id => (project?.teamMembers || []).find(m => m.id === id)).filter(m => m && m.email)
-    .map(m => ({ email: m.email, name: m.name || m.role || "Team member" }));
+    .map(m => ({ email: m.email, name: m.name || m.role || "Team member", first: greetingFirstName(m.name) }));
 }
 
 // Tiny HTML-escape for the dropdown <option> labels. Subconsultant firm names
@@ -10930,6 +10930,25 @@ function seedDescriptionFromEmailBody(fieldId, maxChars = 600) {
     if (text) el.value = text;
   })();
 }
+
+// ── GREETING NAME (begin) ───────────────────────────────────────────────────
+// First name for "Hi …,". Mirrors greetingFirstName in setty-pms
+// (greetingName.js, used by SettyPMS.html, transmittal.html and Newsletter.html):
+// change both together. About a third of PMS contacts are stored "Last, First"
+// ("Rama, Monica", often "Bermudez , James"); credential/suffix comma parts
+// ("John Smith, PE", "Kurt Bedore, Jr.") are not names. Returns "" when there is
+// no usable name (or only an email address), so the caller picks the fallback.
+const NAME_SUFFIX_RE = /^(jr|sr|ii|iii|iv|pe|p\.?e|ra|r\.?a|aia|leed( ap)?|pmp|esq|ph\.?d|mba|ncarb|cem|cxa|bcxa|cpd|ccm|fpe|se|s\.?e)\.?$/i;
+function greetingFirstName(name) {
+  const s = String(name == null ? "" : name).replace(/<[^>]*>/g, " ").trim();
+  if (/@/.test(s)) return "";
+  const parts = s.split(",").map(x => x.trim()).filter(x => x && !NAME_SUFFIX_RE.test(x));
+  if (!parts.length) return "";
+  const given = parts.length >= 2 ? parts[1] : parts[0];
+  const words = given.replace(/^(mr|mrs|ms|miss|mx|dr)\.?\s+/i, "").split(/\s+/);
+  return (words[0] || "").replace(/[.,;:]+$/, "");
+}
+// ── GREETING NAME (end) ─────────────────────────────────────────────────────
 
 // ── ASSIGNEE SUGGESTION (begin) ─────────────────────────────────────────────
 // Who to tick when an RFI / submittal form opens. The CA team logs the item
