@@ -8,7 +8,7 @@
   <meta http-equiv="Pragma" content="no-cache"/>
   <meta http-equiv="Expires" content="0"/>
   <title>Setty PMS</title>
-  <script>window.__appVersion = "2026-11-25-greeting-first-name";</script>
+  <script>window.__appVersion = "2026-11-25-save-as-accolade";</script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script src="msal-browser.min.js"></script>
   <!-- Shared suite sign-in (Supabase session layer, served from the setty-pms
@@ -181,6 +181,20 @@
       cursor: pointer;
       white-space: nowrap;
     }
+    /* Save as accolade — small and last on purpose: a link, not a button row. */
+    #accoladeBlock { margin-top: 14px; font-size: 11px; }
+    .accolade-link {
+      background: none; border: none; padding: 0; cursor: pointer;
+      font-size: 11px; color: var(--text-faint); text-decoration: underline;
+    }
+    .accolade-link:hover { color: var(--primary); }
+    #accoladeForm { margin-top: 6px; }
+    #accoladeForm textarea, #accoladeForm input {
+      width: 100%; box-sizing: border-box; margin: 2px 0 6px; padding: 4px 6px;
+      font: inherit; font-size: 12px; border: 1px solid #ddd; border-radius: 3px;
+    }
+    #accoladeForm .accolade-hint { color: var(--text-faint); margin-bottom: 6px; }
+    #accoladeForm .accolade-row { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
     /* Version footer — faint, out of the way; hover for version, 5x click for credits */
     #versionFooter {
       margin-top: 14px;
@@ -1316,6 +1330,26 @@
       <button class="btn-quick" data-tpl="sitesurvey">✉ Site Survey Request</button>
     </div>
     <div id="quickTextStatus" class="status" style="display:none"></div>
+  </div>
+
+  <!-- Save as accolade: turn a thank-you email into an Accolade-O-Meter entry.
+       Read mode only (applyComposeModeUiGuard). Deliberately a small link at the
+       bottom so it doesn't crowd the filing buttons. -->
+  <div id="accoladeBlock">
+    <button type="button" id="accoladeToggle" class="accolade-link" title="Put the praise in this email on the Accolade-O-Meter wall">🏆 Save as accolade</button>
+    <div id="accoladeForm" style="display:none">
+      <div class="accolade-hint">Trim it to the part worth celebrating. The people named get an email.</div>
+      <label for="accoladeQuote">What they said</label>
+      <textarea id="accoladeQuote" rows="4" maxlength="2000"></textarea>
+      <label for="accoladePeople">Who earned it</label>
+      <input type="text" id="accoladePeople" list="accoladeStaffList" autocomplete="off" spellcheck="false" placeholder="Names, separated by commas" />
+      <datalist id="accoladeStaffList"></datalist>
+      <div class="accolade-row">
+        <button type="button" id="accoladeSave" class="btn-quick">Save to the wall</button>
+        <button type="button" id="accoladeCancel" class="accolade-link">Cancel</button>
+      </div>
+      <div id="accoladeStatus" class="status-msg"></div>
+    </div>
   </div>
 
   <!-- Version footer — inherits the logo's old jobs: hover shows the version
